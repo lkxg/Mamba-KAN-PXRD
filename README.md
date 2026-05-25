@@ -1,4 +1,4 @@
-# PXRD-MK: Crystal-System and Space-Group Classification from PXRD
+# Hybrid Mamba-KAN for PXRD-based Crystal Structure Classification
 
 **[English](README.md) | [中文](README_zh.md)**
 
@@ -6,67 +6,86 @@
 
 ## Abstract
 
-我们提出了一个基于深度学习的粉末 X 射线衍射（PXRD）模式分类框架，能够从晶体的 PXRD 图案预测其晶系（7 类）和空间群（230 类）。该框架基于 SIMPOD 数据集（467,861 个晶体）构建，采用一维残差网络（ResNet1D）作为基准模型。在空间群分类任务上，基准模型达到了 **XX% 的 Top-1 准确率**和 **XX% 的 Top-5 准确率**；在晶系分类任务上，模型达到了 **XX% 的 Top-1 准确率**。我们开源了完整的训练代码和预处理流程，以促进相关研究的发展。
-
+Powder X-ray diffraction (PXRD) is a fundamental technique in crystallography for determining crystal structures, but traditional methods rely on expert experience and are inefficient. Recent advances in deep learning have shown potential for PXRD analysis, yet two major challenges remain: long PXRD sequences (10,824 points) lead to high computational complexity with conventional CNNs, and extreme class imbalance (7/230 classes) makes effective learning difficult. This paper proposes a hybrid classification framework combining Mamba (Selective State Space Model) with KAN (Kolmogorov-Arnold Networks): Mamba captures long-range dependencies with linear complexity, while KAN enhances classification through learnable activation functions. 
 ---
 
 ## Introduction
 
-粉末 X 射线衍射（PXRD）是晶体学中确定物质结构的经典方法。传统上，晶系和空间群的确定需要专业知识和手动分析，这是一个耗时且依赖专家经验的过程。近年来，深度学习在材料科学领域展现出巨大潜力，但 PXRD 自动分类的研究相对较少。
+Powder X-ray diffraction (PXRD) is a classical method in crystallography for determining crystal structures. Traditionally, identifying crystal systems and space groups requires expert knowledge and manual analysis, which is time-consuming and dependent on experience.
 
-**本项目的主要贡献：**
-1. 发布了基于 SIMPOD 数据集的全流程 PXRD 分类代码框架
-2. 提供了处理严重类别不平衡问题的分层划分策略
-3. 构建了 MLP 和 ResNet1D 基准模型，为后续研究提供性能基线
-4. 开源了数据预处理、模型训练和评估的完整代码
+Recently, deep learning has shown great potential in materials science. However, research on automatic PXRD classification remains in its early stages. **Mamba**, as a selective state space model, offers linear-complexity advantages in long-range sequence modeling; **KAN**, as a novel neural architecture, demonstrates superior capability in symbolic function fitting compared to MLPs. Combining these two for PXRD analysis represents a promising research direction.
+
+**Main Contributions:**
+
+1. Propose the first deep learning framework combining Mamba and KAN for PXRD classification
+2. Provide a stratified splitting strategy handling severe class imbalance
+3. Build performance comparisons between MLP, ResNet1D baselines and the Mamba-KAN hybrid
+4. Open-source complete code for data preprocessing, model training, and evaluation
 
 ---
 
 ## Related Work
 
-| 工作 | 方法 | 准确率 | 局限性 |
-|------|------|--------|--------|
-| 本项目 (ResNet1D) | 1D-CNN | **XX%** (Top-5) | 仅模拟数据 |
-| SIMPOD 原始论文 | - | 35% (真实数据) | 仅 Top-5 |
+| Work | Method | Accuracy | Limitation |
+|------|--------|----------|------------|
+| This work (Mamba-KAN) | SSM + KAN | **XX%** (Top-5) | Simulated data only |
+| This work (ResNet1D) | 1D-CNN | XX% (Top-5) | Baseline |
+| SIMPOD Original Paper | - | 35% (Real data) | Top-5 only |
 | ... | ... | ... | ... |
 
 ---
 
 ## Method
 
-### Model Architecture
+### Core Architecture: Mamba-KAN Hybrid
 
-我们采用两种基准模型架构：
+Our Mamba-KAN hybrid architecture combines the strengths of two cutting-edge models:
+
+**Mamba (Selective State Space Model)**
+- Advantage: Linear-complexity long-range dependency modeling, suitable for long-sequence PXRD signals
+- Mechanism: Selective scan mechanism for dynamic information filtering
+
+**KAN (Kolmogorov-Arnold Networks)**
+- Advantage: More parameter-efficient than MLP in fitting complex functions
+- Mechanism: Learnable activation functions based on linear combinations
+
+**Hybrid Strategy**
+- Mamba serves as sequence encoder, extracting multi-scale features from PXRD signals
+- KAN serves as classification head, leveraging powerful function fitting capability for classification decisions
+
+### Baseline Models
+
+For fair comparison, we implement the following baselines:
 
 **1. MLP Classifier**
-- 结构：Input(10824) → Linear(1024) → GELU → Dropout → Linear(512) → GELU → Dropout → Linear(230)
-- 特点：简单高效，适合作为基线
+- Structure: Input(10824) → Linear(1024) → GELU → Dropout → Linear(512) → GELU → Dropout → Linear(230)
+- Characteristics: Simple and efficient, suitable as baseline
 
 **2. ResNet1D**
-- 结构：Stem(Conv1D + BN + GELU + MaxPool) → 4 stages × 2 ResBlocks → AdaptiveAvgPool → Linear
-- 特点：残差连接缓解梯度消失，适合长序列
+- Structure: Stem(Conv1D + BN + GELU + MaxPool) → 4 stages × 2 ResBlocks → AdaptiveAvgPool → Linear
+- Characteristics: Residual connections mitigate gradient vanishing, suitable for long sequences
 
 ### Training Strategy
 
-- **损失函数**：交叉熵 / 加权交叉熵 / Focal Loss
-- **优化器**：AdamW (lr=1e-3, weight_decay=1e-4)
-- **学习率调度**：余弦退火 + 预热
-- **正则化**：Label Smoothing, Dropout, 梯度裁剪
-- **混合精度**：FP16/BF16 训练
+- **Loss Function**: Cross-Entropy / Weighted Cross-Entropy / Focal Loss
+- **Optimizer**: AdamW (lr=1e-3, weight_decay=1e-4)
+- **LR Schedule**: Cosine annealing + warmup
+- **Regularization**: Label Smoothing, Dropout, Gradient Clipping
+- **Mixed Precision**: FP16/BF16 training
 
 ---
 
 ## Dataset
 
-**数据来源**：SIMPOD 数据集 (Rincón et al., *Scientific Data* 12, 1186, 2025)
+**Source**: SIMPOD Dataset (Rincón et al., *Scientific Data* 12, 1186, 2025)
 
-每个晶体包含模拟的一维 PXRD 图案，参数如下：
-- **2θ 范围**：5° – 90°
-- **采样点数**：10,824
-- **辐射源**：Cu Kα (λ = 1.5406 Å)
-- **强度归一化**：每条曲线除以最大值，∈ [0, 1]
+Each crystal contains a simulated 1D PXRD pattern computed with:
+- **2θ range**: 5° – 90°
+- **Sampling points**: 10,824
+- **Source**: Cu Kα (λ = 1.5406 Å)
+- **Normalization**: Each pattern divided by its max → intensities ∈ [0, 1]
 
-### 晶系分布
+### Crystal System Distribution
 
 | Crystal System | Space Groups | Samples | Percentage |
 |----------------|--------------|---------|------------|
@@ -79,13 +98,13 @@
 | Hexagonal | 168-194 | 6,987 | 1.5% |
 | **Total** | **1-230** | **467,861** | **100%** |
 
-### 数据集划分
+### Dataset Split
 
-- **训练集**：80%（包括所有稀有空间群）
-- **验证集**：10%（按空间群分层抽样）
-- **测试集**：10%（按空间群分层抽样）
+- **Training set**: 80% (including all rare space groups)
+- **Validation set**: 10% (stratified by space group)
+- **Test set**: 10% (stratified by space group)
 
-**注意**：7 个空间群样本数少于 10 个，全部划入训练集以保证有效性。
+**Note**: 7 space groups have fewer than 10 samples; all are placed in the training set for validity.
 
 ---
 
@@ -105,72 +124,78 @@
 ### Reproducibility
 
 ```bash
-# 1. 环境安装
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. 数据预处理
+# 2. Preprocess data
 python analysis/preprocess.py
 
-# 3. 生成分划分
+# 3. Generate splits
 python make_splits.py
 
-# 4. 模型训练
+# 4. Train baseline models (ResNet1D / MLP)
 python train.py --config configs/default.yaml
 
-# 5. 模型评估
-python evaluate.py --checkpoint checkpoints/default/best.pt
+# 5. Train Mamba-KAN model
+python train.py --config configs/mamba_kan.yaml
+
+# 6. Evaluate
+python evaluate.py --checkpoint checkpoints/<run>/best.pt
 ```
 
 ---
 
 ## Results
 
-### 空间群分类 (230 classes)
+### Space Group Classification (230 classes)
 
 | Model | Top-1 Acc | Top-5 Acc | Params |
 |-------|-----------|-----------|--------|
 | Random Baseline | 0.43% | 2.17% | - |
 | MLP | XX% | XX% | X.XM |
 | ResNet1D | XX% | XX% | X.XM |
+| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
 
-### 晶系分类 (7 classes)
+### Crystal System Classification (7 classes)
 
 | Model | Top-1 Acc | Top-5 Acc | Params |
 |-------|-----------|-----------|--------|
 | Random Baseline | 14.3% | 57.1% | - |
 | MLP | XX% | XX% | X.XM |
 | ResNet1D | XX% | XX% | X.XM |
+| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
 
-> 注：XX% 表示待填写的实验结果
+> Note: XX% indicates pending experimental results
 
 ### Discussion
 
-1. **类别不平衡影响**：前 3 大空间群占 63% 样本，模型倾向于预测这些类别
-2. **模拟 vs 真实数据**：SIMPOD 数据无噪声、峰宽固定，真实数据表现预计下降
-3. **晶系 vs 空间群**：晶系分类（7 类）明显易于空间群分类（230 类）
+1. **Mamba-KAN vs Baselines**: Mamba-KAN improves/decreases by ~XX% on space group classification compared to ResNet1D
+2. **Class Imbalance Impact**: Top-3 space groups account for 63% of samples; model tends to predict these classes
+3. **Simulated vs Real Data**: SIMPOD data has no noise, fixed peak width; real data performance expected to decrease
+4. **Crystal System vs Space Group**: Crystal system classification (7 classes) is significantly easier than space group (230 classes)
 
 ---
 
 ## Limitations
 
-1. **模拟数据局限**：无背景噪声、固定峰宽、单一波长，与真实实验条件存在差异
-2. **类别不平衡**：稀有空间群样本极少，难以学习有效表示
-3. **泛化能力**：需要进一步在真实 PXRD 数据上验证模型效果
+1. **Simulated Data Limitations**: No background noise, fixed peak width, single wavelength; differs from real experimental conditions
+2. **Class Imbalance**: Rare space groups have very few samples, making effective learning difficult
+3. **Generalization**: Further validation on real PXRD data is needed
 
 ---
 
 ## Future Work
 
-- [ ] 探索 Mamba-KAN 等先进架构
-- [ ] 在真实 PXRD 数据上微调
-- [ ] 引入不确定性量化
-- [ ] 开发 Web 界面便于非专业用户使用
+- [ ] Fine-tune Mamba-KAN on real PXRD data
+- [ ] Explore more Mamba-KAN variants (e.g., Mamba2-KAN)
+- [ ] Introduce uncertainty quantification
+- [ ] Develop web interface for non-expert users
 
 ---
 
 ## Citation
 
-如果您在研究中使用本代码，请按以下格式引用：
+If you use this code in your research, please cite:
 
 ```bibtex
 @article{simPOD2025,
@@ -181,8 +206,8 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
   doi={10.57760/sciencedb.09755}
 }
 
-@misc{pxrdmk2025,
-  title={PXRD-MK: Crystal-System and Space-Group Classification from PXRD},
+@misc{mambakan2025,
+  title={Mamba-KAN: Hybrid Architecture for Crystal System and Space Group Classification from PXRD},
   author={[Your Name]},
   year={2025},
   url={https://github.com/[your-repo]}
@@ -193,20 +218,20 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 
 ## License
 
-本项目采用 [MIT License](LICENSE)。
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 
 ## Contact
 
-- **邮箱**: [your.email@example.com]
+- **Email**: [your.email@example.com]
 - **GitHub Issues**: [https://github.com/[your-repo]/issues]
 
 ---
 
 ## Acknowledgments
 
-感谢 [funding agency] 的支持，感谢 [SIMPOD team] 提供数据集。
+We thank [funding agency] for support and the [SIMPOD team] for providing the dataset.
 
 ---
 
@@ -215,3 +240,5 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 1. Rincón et al., *Scientific Data* 12, 1186 (2025) - [DOI: 10.57760/sciencedb.09755](https://doi.org/10.57760/sciencedb.09755)
 2. Dans Diffraction - [GitHub](https://github.com/DanPorter/Dans_Diffraction)
 3. Crystallography Open Database - [Website](https://www.crystallography.net/cod/)
+4. Mamba: Linear-Time Sequence Modeling with Selective State Spaces - [Paper](https://arxiv.org/abs/2312.00752)
+5. KAN: Kolmogorov-Arnold Networks - [Paper](https://arxiv.org/abs/2404.19756)
