@@ -1,0 +1,23 @@
+# Core ML stack
+torch>=2.1
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+
+# Data IO & utilities
+pyyaml>=6.0
+tqdm>=4.65
+scipy>=1.11
+
+# Plotting (used by analysis/ scripts)
+matplotlib>=3.7
+
+# Logging / monitoring
+tensorboard>=2.14
+
+# Optional: Mamba (uncomment when wiring the Mamba-KAN model)
+# mamba-ssm>=2.2
+# causal-conv1d>=1.2
+
+# Optional: KAN reference implementations
+# efficient-kan

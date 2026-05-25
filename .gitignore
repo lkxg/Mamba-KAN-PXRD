@@ -1,0 +1,36 @@
+# Large data artifacts
+dataset/*.npy
+dataset/*.npz
+Structures/
+
+# Outputs
+checkpoints/
+runs/
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Env
+.venv/
+venv/
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log

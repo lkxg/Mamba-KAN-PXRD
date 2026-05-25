@@ -1,0 +1,49 @@
+# Default training configuration.
+# Override per-experiment by copying this file and editing.
+
+experiment:
+  name: default
+  seed: 42
+
+data:
+  root: dataset                  # contains intensities.npy + labels.csv
+  splits_csv: splits/splits.csv  # produced by scripts/make_splits.py
+  task: space_group              # one of: space_group | crystal_system
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+
+model:
+  name: resnet1d                 # one of: mlp | resnet1d
+  # Per-architecture kwargs (passed through to the constructor)
+  resnet1d:
+    base_channels: 32
+    blocks_per_stage: [2, 2, 2, 2]
+  mlp:
+    hidden: [1024, 512]
+    dropout: 0.2
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine                   # cosine | none
+  warmup_epochs: 1
+
+train:
+  epochs: 20
+  amp: true                      # mixed-precision training
+  grad_clip: 1.0
+  log_every: 100                 # batch-step logging period
+
+loss:
+  name: ce                       # ce | weighted_ce | focal
+  label_smoothing: 0.0
+  focal_gamma: 2.0
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true                # save the model with best val top-1 acc
+  monitor: val_acc1
