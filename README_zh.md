@@ -1,20 +1,21 @@
-# PXRD-MK: Crystal-System and Space-Group Classification from PXRD
+# PXRD-MK：基于 PXRD 的晶系与空间群分类
 
-**[English](README.md) | [中文](README_zh.md)**
+**[English](README.md) | 中文**
 
 ---
 
-## Abstract
+## 摘要
 
 我们提出了一个基于深度学习的粉末 X 射线衍射（PXRD）模式分类框架，能够从晶体的 PXRD 图案预测其晶系（7 类）和空间群（230 类）。该框架基于 SIMPOD 数据集（467,861 个晶体）构建，采用一维残差网络（ResNet1D）作为基准模型。在空间群分类任务上，基准模型达到了 **XX% 的 Top-1 准确率**和 **XX% 的 Top-5 准确率**；在晶系分类任务上，模型达到了 **XX% 的 Top-1 准确率**。我们开源了完整的训练代码和预处理流程，以促进相关研究的发展。
 
 ---
 
-## Introduction
+## 研究背景与贡献
 
 粉末 X 射线衍射（PXRD）是晶体学中确定物质结构的经典方法。传统上，晶系和空间群的确定需要专业知识和手动分析，这是一个耗时且依赖专家经验的过程。近年来，深度学习在材料科学领域展现出巨大潜力，但 PXRD 自动分类的研究相对较少。
 
 **本项目的主要贡献：**
+
 1. 发布了基于 SIMPOD 数据集的全流程 PXRD 分类代码框架
 2. 提供了处理严重类别不平衡问题的分层划分策略
 3. 构建了 MLP 和 ResNet1D 基准模型，为后续研究提供性能基线
@@ -22,7 +23,7 @@
 
 ---
 
-## Related Work
+## 相关工作
 
 | 工作 | 方法 | 准确率 | 局限性 |
 |------|------|--------|--------|
@@ -32,13 +33,13 @@
 
 ---
 
-## Method
+## 方法
 
-### Model Architecture
+### 模型架构
 
 我们采用两种基准模型架构：
 
-**1. MLP Classifier**
+**1. MLP 分类器**
 - 结构：Input(10824) → Linear(1024) → GELU → Dropout → Linear(512) → GELU → Dropout → Linear(230)
 - 特点：简单高效，适合作为基线
 
@@ -46,7 +47,7 @@
 - 结构：Stem(Conv1D + BN + GELU + MaxPool) → 4 stages × 2 ResBlocks → AdaptiveAvgPool → Linear
 - 特点：残差连接缓解梯度消失，适合长序列
 
-### Training Strategy
+### 训练策略
 
 - **损失函数**：交叉熵 / 加权交叉熵 / Focal Loss
 - **优化器**：AdamW (lr=1e-3, weight_decay=1e-4)
@@ -56,7 +57,7 @@
 
 ---
 
-## Dataset
+## 数据集
 
 **数据来源**：SIMPOD 数据集 (Rincón et al., *Scientific Data* 12, 1186, 2025)
 
@@ -68,16 +69,16 @@
 
 ### 晶系分布
 
-| Crystal System | Space Groups | Samples | Percentage |
-|----------------|--------------|---------|------------|
-| Monoclinic | 3-15 | 228,011 | 48.7% |
-| Triclinic | 1-2 | 113,002 | 24.2% |
-| Orthorhombic | 16-74 | 79,990 | 17.1% |
-| Tetragonal | 75-142 | 16,335 | 3.5% |
-| Trigonal | 143-167 | 13,179 | 2.8% |
-| Cubic | 195-230 | 10,357 | 2.2% |
-| Hexagonal | 168-194 | 6,987 | 1.5% |
-| **Total** | **1-230** | **467,861** | **100%** |
+| 晶系 | 空间群编号 | 样本数 | 占比 |
+|------|-----------|--------|------|
+| 单斜（Monoclinic） | 3-15 | 228,011 | 48.7% |
+| 三斜（Triclinic） | 1-2 | 113,002 | 24.2% |
+| 正交（Orthorhombic） | 16-74 | 79,990 | 17.1% |
+| 四方（Tetragonal） | 75-142 | 16,335 | 3.5% |
+| 三方（Trigonal） | 143-167 | 13,179 | 2.8% |
+| 立方（Cubic） | 195-230 | 10,357 | 2.2% |
+| 六方（Hexagonal） | 168-194 | 6,987 | 1.5% |
+| **合计** | **1-230** | **467,861** | **100%** |
 
 ### 数据集划分
 
@@ -89,20 +90,20 @@
 
 ---
 
-## Experiments
+## 实验
 
-### Experimental Setup
+### 实验环境
 
-| Setting | Value |
-|---------|-------|
+| 设置 | 值 |
+|------|-----|
 | Python | ≥ 3.10 |
 | PyTorch | ≥ 2.1 |
 | GPU | RTX 3090/4090 (16GB VRAM) |
 | Batch Size | 128 |
 | Epochs | 20 |
-| Mixed Precision | FP16 |
+| 混合精度 | FP16 |
 
-### Reproducibility
+### 可复现性
 
 ```bash
 # 1. 环境安装
@@ -123,27 +124,27 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 
 ---
 
-## Results
+## 实验结果
 
-### 空间群分类 (230 classes)
+### 空间群分类 (230 类)
 
-| Model | Top-1 Acc | Top-5 Acc | Params |
-|-------|-----------|-----------|--------|
-| Random Baseline | 0.43% | 2.17% | - |
+| 模型 | Top-1 准确率 | Top-5 准确率 | 参数量 |
+|------|-------------|-------------|--------|
+| 随机基线 | 0.43% | 2.17% | - |
 | MLP | XX% | XX% | X.XM |
 | ResNet1D | XX% | XX% | X.XM |
 
-### 晶系分类 (7 classes)
+### 晶系分类 (7 类)
 
-| Model | Top-1 Acc | Top-5 Acc | Params |
-|-------|-----------|-----------|--------|
-| Random Baseline | 14.3% | 57.1% | - |
+| 模型 | Top-1 准确率 | Top-5 准确率 | 参数量 |
+|------|-------------|-------------|--------|
+| 随机基线 | 14.3% | 57.1% | - |
 | MLP | XX% | XX% | X.XM |
 | ResNet1D | XX% | XX% | X.XM |
 
 > 注：XX% 表示待填写的实验结果
 
-### Discussion
+### 结果分析
 
 1. **类别不平衡影响**：前 3 大空间群占 63% 样本，模型倾向于预测这些类别
 2. **模拟 vs 真实数据**：SIMPOD 数据无噪声、峰宽固定，真实数据表现预计下降
@@ -151,7 +152,7 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 
 ---
 
-## Limitations
+## 局限性
 
 1. **模拟数据局限**：无背景噪声、固定峰宽、单一波长，与真实实验条件存在差异
 2. **类别不平衡**：稀有空间群样本极少，难以学习有效表示
@@ -159,7 +160,7 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 
 ---
 
-## Future Work
+## 未来工作
 
 - [ ] 探索 Mamba-KAN 等先进架构
 - [ ] 在真实 PXRD 数据上微调
@@ -168,49 +169,20 @@ python evaluate.py --checkpoint checkpoints/default/best.pt
 
 ---
 
-## Citation
-
-如果您在研究中使用本代码，请按以下格式引用：
-
-```bibtex
-@article{simPOD2025,
-  title={SIMPOD: A Large-Scale Simulated PXRD Dataset for Crystal System and Space Group Classification},
-  author={Rincón et al.},
-  journal={Scientific Data},
-  year={2025},
-  doi={10.57760/sciencedb.09755}
-}
-
-@misc{pxrdmk2025,
-  title={PXRD-MK: Crystal-System and Space-Group Classification from PXRD},
-  author={[Your Name]},
-  year={2025},
-  url={https://github.com/[your-repo]}
-}
-```
-
----
-
-## License
+## 许可协议
 
 本项目采用 [MIT License](LICENSE)。
 
 ---
 
-## Contact
+## 联系方式
 
-- **邮箱**: [your.email@example.com]
-- **GitHub Issues**: [https://github.com/[your-repo]/issues]
-
----
-
-## Acknowledgments
-
-感谢 [funding agency] 的支持，感谢 [SIMPOD team] 提供数据集。
+- **邮箱**: [3193888648@qq.com]
+- **GitHub Issues**: [https://github.com/lkxg/PXRD-MK/issues]
 
 ---
 
-## References
+## 参考文献
 
 1. Rincón et al., *Scientific Data* 12, 1186 (2025) - [DOI: 10.57760/sciencedb.09755](https://doi.org/10.57760/sciencedb.09755)
 2. Dans Diffraction - [GitHub](https://github.com/DanPorter/Dans_Diffraction)

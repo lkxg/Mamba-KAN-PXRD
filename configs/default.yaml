@@ -1,49 +1,50 @@
-# Default training configuration.
-# Override per-experiment by copying this file and editing.
+# SimPOD 默认训练配置文件
+# 使用方法：python train.py --config configs/default.yaml
+# 可通过复制并修改此文件来创建实验特定的配置
 
 experiment:
-  name: default
-  seed: 42
+  name: default                  # 实验名称，用于日志和检查点目录命名
+  seed: 42                       # 随机种子，确保结果可复现
 
 data:
-  root: dataset                  # contains intensities.npy + labels.csv
-  splits_csv: splits/splits.csv  # produced by scripts/make_splits.py
-  task: space_group              # one of: space_group | crystal_system
-  batch_size: 128
-  num_workers: 4
-  pin_memory: true
+  root: dataset                  # 数据目录路径，包含 intensities.npy 和 labels.csv
+  splits_csv: splits/splits.csv  # 数据划分文件路径（由 make_splits.py 生成）
+  task: space_group               # 分类任务类型：space_group（230类）或 crystal_system（7类）
+  batch_size: 128                 # 训练时每个批次的样本数
+  num_workers: 4                 # 数据加载的线程/进程数
+  pin_memory: true               # 是否固定内存页，加快 GPU 数据传输
 
 model:
-  name: resnet1d                 # one of: mlp | resnet1d
-  # Per-architecture kwargs (passed through to the constructor)
+  name: resnet1d                 # 模型架构：mlp（多层感知机）或 resnet1d（一维残差网络）
+  # 以下是各模型的具体参数（根据 name 选择使用的配置块）
   resnet1d:
-    base_channels: 32
-    blocks_per_stage: [2, 2, 2, 2]
+    base_channels: 32           # ResNet 基础通道数
+    blocks_per_stage: [2, 2, 2, 2]  # 每个阶段的残差块数量
   mlp:
-    hidden: [1024, 512]
-    dropout: 0.2
+    hidden: [1024, 512]          # MLP 隐藏层维度
+    dropout: 0.2                 # Dropout 概率
 
 optim:
-  lr: 1.0e-3
-  weight_decay: 1.0e-4
-  betas: [0.9, 0.999]
+  lr: 1.0e-3                    # 初始学习率
+  weight_decay: 1.0e-4          # 权重衰减系数（L2 正则化）
+  betas: [0.9, 0.999]           # Adam 优化器的动量参数
 
 scheduler:
-  name: cosine                   # cosine | none
-  warmup_epochs: 1
+  name: cosine                   # 学习率调度器：cosine（余弦退火）或 none（固定学习率）
+  warmup_epochs: 1              # 预热阶段的 epoch 数
 
 train:
-  epochs: 20
-  amp: true                      # mixed-precision training
-  grad_clip: 1.0
-  log_every: 100                 # batch-step logging period
+  epochs: 20                     # 训练总轮数
+  amp: true                      # 是否启用混合精度训练（AMP），减少显存占用并加速
+  grad_clip: 1.0                 # 梯度裁剪阈值，防止梯度爆炸
+  log_every: 100                # 日志打印频率（每多少批次打印一次）
 
 loss:
-  name: ce                       # ce | weighted_ce | focal
-  label_smoothing: 0.0
-  focal_gamma: 2.0
+  name: ce                       # 损失函数：ce（交叉熵）、weighted_ce（加权交叉熵）、focal（Focal Loss）
+  label_smoothing: 0.0           # 标签平滑参数，用于防止过拟合
+  focal_gamma: 2.0              # Focal Loss 的聚焦参数
 
 checkpoint:
-  out_dir: checkpoints
-  save_best: true                # save the model with best val top-1 acc
-  monitor: val_acc1
+  out_dir: checkpoints           # 检查点保存目录
+  save_best: true                # 是否保存验证集上表现最佳的模型
+  monitor: val_acc1             # 监控指标，用于保存最佳模型
