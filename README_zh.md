@@ -148,25 +148,6 @@ python evaluate.py --checkpoint checkpoints/<run>/best.pt
 
 ## 实验结果
 
-### 空间群分类 (230 类)
-
-| 模型 | Top-1 准确率 | Top-5 准确率 | 参数量 |
-|------|-------------|-------------|--------|
-| 随机基线 | 0.43% | 2.17% | - |
-| MLP | XX% | XX% | X.XM |
-| ResNet1D | XX% | XX% | X.XM |
-| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
-
-### 晶系分类 (7 类)
-
-| 模型 | Top-1 准确率 | Top-5 准确率 | 参数量 |
-|------|-------------|-------------|--------|
-| 随机基线 | 14.3% | 57.1% | - |
-| MLP | XX% | XX% | X.XM |
-| ResNet1D | XX% | XX% | X.XM |
-| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
-
-> 注：XX% 表示待填写的实验结果
 
 ### 结果分析
 
@@ -220,13 +201,6 @@ python evaluate.py --checkpoint checkpoints/<run>/best.pt
 ## 许可协议
 
 本项目采用 [MIT License](LICENSE)。
-
----
-
-## 联系方式
-
-- **邮箱**: [your.email@example.com]
-- **GitHub Issues**: [https://github.com/[your-repo]/issues]
 
 ---
 

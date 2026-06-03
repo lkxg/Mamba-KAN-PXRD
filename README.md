@@ -149,23 +149,11 @@ python evaluate.py --checkpoint checkpoints/<run>/best.pt
 
 ### Space Group Classification (230 classes)
 
-| Model | Top-1 Acc | Top-5 Acc | Params |
-|-------|-----------|-----------|--------|
-| Random Baseline | 0.43% | 2.17% | - |
-| MLP | XX% | XX% | X.XM |
-| ResNet1D | XX% | XX% | X.XM |
-| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
+
 
 ### Crystal System Classification (7 classes)
 
-| Model | Top-1 Acc | Top-5 Acc | Params |
-|-------|-----------|-----------|--------|
-| Random Baseline | 14.3% | 57.1% | - |
-| MLP | XX% | XX% | X.XM |
-| ResNet1D | XX% | XX% | X.XM |
-| **Mamba-KAN** | **XX%** | **XX%** | **X.XM** |
 
-> Note: XX% indicates pending experimental results
 
 ### Discussion
 
@@ -219,13 +207,6 @@ If you use this code in your research, please cite:
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-
----
-
-## Contact
-
-- **Email**: [your.email@example.com]
-- **GitHub Issues**: [https://github.com/[your-repo]/issues]
 
 ---
 
