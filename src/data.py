@@ -2,7 +2,7 @@
 
 本模块提供两个主要功能：
 1. PXRDDataset 类：基于内存映射的 PyTorch Dataset，
-   用于加载预处理好的 intensities.npy + labels.csv 数据。
+   用于加载预处理好的 pxrd.npy + labels.csv 数据。
 2. make_stratified_split / load_splits 函数：
    分层划分生成器，确保每个空间群在各个划分中的比例一致。
    对于样本数过少的空间群（少于 min_per_class），全部划入训练集。
@@ -29,7 +29,7 @@ TaskType = Literal["space_group", "crystal_system"]
 class PXRDDataset(Dataset):
     """基于内存映射的 PXRD 数据集。
 
-    通过 mmap（内存映射）方式加载 intensities.npy 文件，
+    通过 mmap（内存映射）方式加载 pxrd.npy 文件，
     这样可以处理 10GB 以上的大文件，而不需要将整个文件加载到内存中。
     每个样本的强度数据在读取时动态转换为 float32 类型（原始存储为 float16）。
 
@@ -50,13 +50,13 @@ class PXRDDataset(Dataset):
         初始化 PXRD 数据集。
 
         参数:
-            data_dir: 数据目录路径，应包含 intensities.npy 和 labels.csv 文件
+            data_dir: 数据目录路径，应包含 pxrd.npy 和 labels.csv 文件
             rows: 要加载的样本行索引，None 表示加载所有有效样本
             task: 分类任务，"space_group" 或 "crystal_system"
             transform: 可选的数据变换函数，应用于每条 PXRD 曲线
         """
         data_dir = Path(data_dir)
-        npy_path = data_dir / "intensities.npy"
+        npy_path = data_dir / "pxrd.npy"
         csv_path = data_dir / "labels.csv"
 
         # 检查必要的文件是否存在

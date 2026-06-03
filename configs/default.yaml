@@ -7,7 +7,7 @@ experiment:
   seed: 42                       # 随机种子，确保结果可复现
 
 data:
-  root: dataset                  # 数据目录路径，包含 intensities.npy 和 labels.csv
+  root: dataset                  # 数据目录路径，包含 pxrd.npy 和 labels.csv
   splits_csv: splits/splits.csv  # 数据划分文件路径（由 make_splits.py 生成）
   task: space_group               # 分类任务类型：space_group（230类）或 crystal_system（7类）
   batch_size: 128                 # 训练时每个批次的样本数

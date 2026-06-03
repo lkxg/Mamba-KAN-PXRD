@@ -6,7 +6,7 @@
 - 丢弃其他字段（晶胞参数、原子坐标等）
 
 输出文件：
-- dataset/intensities.npy：内存映射文件，形状 (N, 10824)，float16 格式，约 10GB
+- dataset/pxrd.npy：内存映射文件，形状 (N, 10824)，float16 格式，约 10GB
 - dataset/labels.csv：包含 row, id, space_group, crystal_system, crystal_system_id 列
 
 技术细节：
@@ -103,7 +103,7 @@ def main():
     print(f"  found {n:,} JSON files  ({time.time()-t_start:.1f}s)")
 
     # ---------- 步骤 2：分配输出内存映射文件 ----------
-    npy_path = OUT_DIR / "intensities.npy"
+    npy_path = OUT_DIR / "pxrd.npy"
     n_bytes = n * INTENSITY_LEN * 2  # float16 占 2 字节
     print(f"\nAllocating output:")
     print(f"  {npy_path}")

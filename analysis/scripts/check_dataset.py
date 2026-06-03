@@ -1,7 +1,7 @@
 """数据集完整性快速检查脚本。
 
 对预处理后的数据集进行基本验证：
-- 验证 intensities.npy 和 labels.csv 的基本统计信息
+- 验证 pxrd.npy 和 labels.csv 的基本统计信息
 - 检查数据格式是否正确
 - 验证数值范围是否合理
 """
@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(r"d:/SimPOD/dataset")
 
 # 加载数据
-X = np.load(ROOT / "intensities.npy", mmap_mode="r")
+X = np.load(ROOT / "pxrd.npy", mmap_mode="r")
 labels = pd.read_csv(ROOT / "labels.csv")
 
 # 打印基本信息
