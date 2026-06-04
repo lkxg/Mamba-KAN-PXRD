@@ -3,6 +3,7 @@ dataset/*.npy
 dataset/*.npz
 Structures/
 splits/
+papers/
 
 # Outputs
 checkpoints/

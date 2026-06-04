@@ -3,8 +3,7 @@
 
 Credentials are read from environment variables by default:
   OSCA_ACCESS_KEY_ID / OSCA_SECRET_ACCESS_KEY
-or:
-  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+python3 scripts/download_osca_oss.py --bucket 20822-myfile --key data/PXRD.zip --output papers/PXRD.zip
 """
 
 from __future__ import annotations
