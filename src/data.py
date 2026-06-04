@@ -69,7 +69,16 @@ class PXRDDataset(Dataset):
 
         # 使用内存映射加载强度数据（只读模式，不占用大量内存）
         self._X: np.ndarray = np.load(npy_path, mmap_mode="r")
-        self._labels: pd.DataFrame = pd.read_csv(csv_path)
+        labels = pd.read_csv(csv_path)
+        if not labels["row"].is_unique:
+            raise ValueError(f"{csv_path} contains duplicate row values.")
+        self._labels: pd.DataFrame = labels.set_index("row", drop=False)
+
+        label_rows = self._labels.index.to_numpy(dtype=np.int64)
+        if len(label_rows) and (
+            label_rows.min() < 0 or label_rows.max() >= self._X.shape[0]
+        ):
+            raise ValueError("label rows must be valid row indices into pxrd.npy.")
 
         # 验证任务类型
         if task not in ("space_group", "crystal_system"):
@@ -79,21 +88,30 @@ class PXRDDataset(Dataset):
 
         # 过滤有效样本（crystal_system_id >= 0 表示有效样本）
         valid_mask = self._labels["crystal_system_id"] >= 0
+        valid_rows = self._labels.loc[valid_mask, "row"].to_numpy(dtype=np.int64)
         if rows is None:
-            rows = self._labels.loc[valid_mask, "row"].to_numpy()
+            rows = valid_rows
         else:
             rows = np.asarray(rows, dtype=np.int64)
-            rows = rows[valid_mask.iloc[rows].to_numpy()]
+            missing_rows = np.setdiff1d(rows, label_rows, assume_unique=False)
+            if len(missing_rows):
+                raise ValueError(f"unknown row values in split: {missing_rows[:10]}")
+            rows = rows[self._labels.loc[rows, "crystal_system_id"].to_numpy() >= 0]
         self.rows = rows
 
         # 根据任务类型设置标签和类别数
+        self._y = np.full(self._X.shape[0], -100, dtype=np.int64)
         if task == "space_group":
             # 空间群标签：范围 1-230，转换为 0-229 以便 PyTorch 处理
-            self._y = (self._labels["space_group"].to_numpy() - 1).astype(np.int64)
+            self._y[label_rows] = (
+                self._labels["space_group"].to_numpy() - 1
+            ).astype(np.int64)
             self.num_classes = 230
         else:
             # 晶系标签：范围 0-6
-            self._y = self._labels["crystal_system_id"].to_numpy().astype(np.int64)
+            self._y[label_rows] = (
+                self._labels["crystal_system_id"].to_numpy()
+            ).astype(np.int64)
             self.num_classes = 7
 
     def __len__(self) -> int:
@@ -225,3 +243,41 @@ def load_splits(splits_csv: str | Path) -> dict[str, np.ndarray]:
         name: df.loc[df["split"] == name, "row"].to_numpy()
         for name in ("train", "val", "test")
     }
+
+
+def class_counts_for_rows(
+    labels_csv: str | Path,
+    rows: np.ndarray,
+    task: TaskType,
+) -> np.ndarray:
+    """统计指定样本行的类别数量。"""
+    labels = pd.read_csv(labels_csv).set_index("row")
+    selected = labels.loc[np.asarray(rows, dtype=np.int64)]
+
+    if task == "space_group":
+        return (selected["space_group"]
+                .value_counts()
+                .reindex(range(1, 231), fill_value=0)
+                .to_numpy())
+    if task == "crystal_system":
+        return (selected["crystal_system_id"]
+                .value_counts()
+                .reindex(range(7), fill_value=0)
+                .to_numpy())
+    raise ValueError(f"unknown task: {task!r}")
+
+
+def labels_for_rows(
+    labels_csv: str | Path,
+    rows: np.ndarray,
+    task: TaskType,
+) -> np.ndarray:
+    """返回指定样本行的 0-based 分类标签。"""
+    labels = pd.read_csv(labels_csv).set_index("row")
+    selected = labels.loc[np.asarray(rows, dtype=np.int64)]
+
+    if task == "space_group":
+        return (selected["space_group"].to_numpy() - 1).astype(np.int64)
+    if task == "crystal_system":
+        return selected["crystal_system_id"].to_numpy().astype(np.int64)
+    raise ValueError(f"unknown task: {task!r}")

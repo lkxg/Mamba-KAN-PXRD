@@ -1,8 +1,8 @@
 """根据 labels.csv 生成分层抽样划分文件 splits/splits.csv。
 
 使用方法:
-    python make_splits.py
-    python make_splits.py --val-frac 0.05 --test-frac 0.05 --seed 0
+    python3 scripts/make_splits.py
+    python3 scripts/make_splits.py --val-frac 0.05 --test-frac 0.05 --seed 0
 
 输出文件格式:
     splits/splits.csv - 包含 row, space_group, split 三列
@@ -11,9 +11,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data import make_stratified_split
 
