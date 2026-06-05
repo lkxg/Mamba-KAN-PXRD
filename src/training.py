@@ -109,7 +109,13 @@ class FocalLoss(nn.Module):
 
 
 def build_loss(
-    name: Literal["ce", "weighted_ce", "class_balanced_ce", "focal"] = "ce",
+    name: Literal[
+        "ce",
+        "label_smoothing",
+        "weighted_ce",
+        "class_balanced_ce",
+        "focal",
+    ] = "ce",
     *,
     class_counts: np.ndarray | None = None,
     gamma: float = 2.0,
@@ -122,6 +128,7 @@ def build_loss(
     参数:
         name: 损失函数名称
               - "ce": 标准交叉熵损失
+              - "label_smoothing": 带标签平滑的交叉熵损失
               - "weighted_ce": 加权交叉熵，权重为 1/sqrt(类别样本数)
               - "class_balanced_ce": 有效样本数加权交叉熵
               - "focal": Focal Loss
@@ -135,7 +142,7 @@ def build_loss(
         PyTorch 损失函数模块
     """
     name = name.lower()
-    if name == "ce":
+    if name in {"ce", "label_smoothing"}:
         return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     if name == "weighted_ce":
         if class_counts is None:

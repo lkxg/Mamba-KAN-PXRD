@@ -10,7 +10,7 @@ data:
   root: dataset                  # 数据目录路径，包含 pxrd.npy 和 labels.csv
   splits_csv: splits/splits.csv  # 数据划分文件路径（由 make_splits.py 生成）
   task: space_group              # 分类任务类型：space_group（230类）或 crystal_system（7类）
-  batch_size: 512                # H100 起点；若显存/吞吐仍有余量可试 1024
+  batch_size: 1024                # H100 起点；若显存/吞吐仍有余量可试 1024
   num_workers: 12                # 当前机器 20 核，给 DataLoader 留足并发
   prefetch_factor: 4             # 每个 worker 预取 batch 数
   pin_memory: true               # 是否固定内存页，加快 GPU 数据传输
@@ -20,7 +20,7 @@ model:
   # 以下是各模型的具体参数（根据 name 选择使用的配置块）
   resnet1d:
     base_channels: 64           # H100 上提升通道数，提高容量与 GPU 利用率
-    blocks_per_stage: [2, 2, 2, 2]  # 每个阶段的残差块数量
+    blocks_per_stage: [3, 4, 6, 3]  # 每个阶段的残差块数量
   mlp:
     hidden: [1024, 512]          # MLP 隐藏层维度
     dropout: 0.2                 # Dropout 概率

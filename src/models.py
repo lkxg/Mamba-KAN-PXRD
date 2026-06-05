@@ -1,16 +1,46 @@
 """PXRD 分类任务的模型架构定义。
 
-当前提供两个基准模型：
+当前提供多个基准模型：
 1. MLPClassifier：简单的全连接多层感知机
 2. ResNet1D：适合一维信号（如 PXRD 曲线）的残差网络
+3. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
+4. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
 
 这些模型为项目提供了基线性能，后续可以添加更先进的架构（如 Mamba-KAN 混合模型）。
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _num_patches(signal_length: int, patch_len: int, stride: int) -> int:
+    if signal_length <= patch_len:
+        return 1
+    pad = (stride - ((signal_length - patch_len) % stride)) % stride
+    return (signal_length + pad - patch_len) // stride + 1
+
+
+def _patchify_1d(x: torch.Tensor, patch_len: int, stride: int) -> torch.Tensor:
+    """Convert a PXRD curve into non-overlapping or strided patches."""
+    if x.ndim == 3:
+        if x.shape[1] != 1:
+            raise ValueError("expected a single PXRD channel")
+        x = x.squeeze(1)
+    if x.ndim != 2:
+        raise ValueError(f"expected input shape (B, L), got {tuple(x.shape)}")
+
+    length = x.shape[-1]
+    if length <= patch_len:
+        pad = patch_len - length
+    else:
+        pad = (stride - ((length - patch_len) % stride)) % stride
+    if pad:
+        x = F.pad(x, (0, pad))
+    return x.unfold(dimension=-1, size=patch_len, step=stride).contiguous()
 
 
 class MLPClassifier(nn.Module):
@@ -185,4 +215,123 @@ class ResNet1D(nn.Module):
         return self.head(x)
 
 
-__all__ = ["MLPClassifier", "ResNet1D"]
+class BiGRUPatchClassifier(nn.Module):
+    """Patch 化 PXRD 序列的双向 GRU 分类器。
+
+    直接在 10,824 个采样点上运行 RNN 代价过高，因此先把曲线切成 patch，
+    再将 patch embedding 作为较短序列输入双向 GRU。
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 10824,
+        num_classes: int = 230,
+        patch_len: int = 64,
+        stride: int = 64,
+        d_model: int = 128,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if patch_len <= 0 or stride <= 0:
+            raise ValueError("patch_len and stride must be positive")
+        self.patch_len = int(patch_len)
+        self.stride = int(stride)
+        self.patch_norm = nn.LayerNorm(self.patch_len)
+        self.patch_embed = nn.Linear(self.patch_len, d_model)
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(2 * hidden_size),
+            nn.Dropout(dropout),
+            nn.Linear(2 * hidden_size, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        patches = _patchify_1d(x, self.patch_len, self.stride)
+        z = self.patch_embed(self.patch_norm(patches))
+        _, h_n = self.gru(z)
+        h_n = h_n.view(self.gru.num_layers, 2, x.shape[0], self.gru.hidden_size)
+        last = h_n[-1]
+        feat = torch.cat([last[0], last[1]], dim=-1)
+        return self.head(feat)
+
+
+class PatchTSTClassifier(nn.Module):
+    """PatchTST 风格的一维 PXRD 分类器。
+
+    对单通道 PXRD 曲线进行 patch embedding，再用 Transformer Encoder 建模
+    patch 间关系。这里保留 PatchTST 的核心 patch 化思想，用于序列 baseline。
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 10824,
+        num_classes: int = 230,
+        patch_len: int = 64,
+        stride: int = 64,
+        d_model: int = 192,
+        n_heads: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if patch_len <= 0 or stride <= 0:
+            raise ValueError("patch_len and stride must be positive")
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
+        self.patch_len = int(patch_len)
+        self.stride = int(stride)
+        num_patches = _num_patches(in_dim, self.patch_len, self.stride)
+
+        self.patch_norm = nn.LayerNorm(self.patch_len)
+        self.patch_embed = nn.Linear(self.patch_len, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_classes),
+        )
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        patches = _patchify_1d(x, self.patch_len, self.stride)
+        z = self.patch_embed(self.patch_norm(patches))
+        cls = self.cls_token.expand(z.shape[0], -1, -1)
+        z = torch.cat([cls, z], dim=1)
+        if z.shape[1] != self.pos_embed.shape[1]:
+            raise ValueError(
+                f"unexpected patch count: got {z.shape[1] - 1}, "
+                f"expected {self.pos_embed.shape[1] - 1}"
+            )
+        z = z + self.pos_embed
+        z = self.encoder(z)
+        return self.head(z[:, 0])
+
+
+__all__ = [
+    "MLPClassifier",
+    "ResNet1D",
+    "BiGRUPatchClassifier",
+    "PatchTSTClassifier",
+]

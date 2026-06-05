@@ -179,6 +179,14 @@ def make_stratified_split(
     """
     if not {"row", "space_group"}.issubset(labels.columns):
         raise ValueError("`labels` must contain 'row' and 'space_group' columns")
+    if not 0.0 <= val_frac < 1.0:
+        raise ValueError("val_frac must satisfy 0 <= val_frac < 1")
+    if not 0.0 <= test_frac < 1.0:
+        raise ValueError("test_frac must satisfy 0 <= test_frac < 1")
+    if val_frac + test_frac >= 1.0:
+        raise ValueError("val_frac + test_frac must be less than 1")
+    if min_per_class < 2:
+        raise ValueError("min_per_class must be at least 2 for stratified splitting")
 
     # 统计每个空间群的样本数
     counts = labels["space_group"].value_counts()
@@ -197,22 +205,31 @@ def make_stratified_split(
     else:
         rows = splittable_df["row"].to_numpy()
         y = splittable_df["space_group"].to_numpy()
+        rows_trainval = rows
+        y_trainval = y
+        rows_test = np.array([], dtype=rows.dtype)
 
         # 第一步：划分测试集
-        rows_trainval, rows_test, y_trainval, _ = train_test_split(
-            rows, y,
-            test_size=test_frac,
-            stratify=y,
-            random_state=random_state,
-        )
+        if test_frac > 0.0:
+            rows_trainval, rows_test, y_trainval, _ = train_test_split(
+                rows, y,
+                test_size=test_frac,
+                stratify=y,
+                random_state=random_state,
+            )
+
         # 第二步：从剩余数据中划分验证集
-        rel_val_frac = val_frac / (1.0 - test_frac)
-        rows_train, rows_val, _, _ = train_test_split(
-            rows_trainval, y_trainval,
-            test_size=rel_val_frac,
-            stratify=y_trainval,
-            random_state=random_state,
-        )
+        rows_train = rows_trainval
+        rows_val = np.array([], dtype=rows.dtype)
+        if val_frac > 0.0:
+            rel_val_frac = val_frac / (1.0 - test_frac)
+            rows_train, rows_val, _, _ = train_test_split(
+                rows_trainval, y_trainval,
+                test_size=rel_val_frac,
+                stratify=y_trainval,
+                random_state=random_state,
+            )
+
         # 合并不可分割空间群的训练集索引
         train_idx = np.concatenate([train_idx_rare, rows_train])
         val_idx = rows_val
@@ -239,6 +256,12 @@ def load_splits(splits_csv: str | Path) -> dict[str, np.ndarray]:
         字典，键为划分名称（"train", "val", "test"），值为对应的样本行索引数组
     """
     df = pd.read_csv(splits_csv)
+    required = {"row", "split"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"{splits_csv} must contain columns: {sorted(required)}")
+    unknown = sorted(set(df["split"]) - set(SPLIT_TO_ID))
+    if unknown:
+        raise ValueError(f"{splits_csv} contains unknown split values: {unknown}")
     return {
         name: df.loc[df["split"] == name, "row"].to_numpy()
         for name in ("train", "val", "test")

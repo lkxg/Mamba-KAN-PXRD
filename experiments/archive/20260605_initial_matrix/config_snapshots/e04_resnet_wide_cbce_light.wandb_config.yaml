@@ -1,0 +1,178 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    code_path: code/scripts/train.py
+    python_version: 3.10.12
+    cli_version: 0.27.1
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1780638502
+    t:
+      1:
+      - 1
+      - 5
+      - 53
+      2:
+      - 1
+      - 5
+      - 53
+      3:
+      - 2
+      - 4
+      - 13
+      - 15
+      - 16
+      - 42
+      - 61
+      - 62
+      4: 3.10.12
+      5: 0.27.1
+      13: linux-x86_64
+    e:
+      pentjyman2z9ddhwku7bmyzoepbvfj4x:
+        os: Linux-6.8.0-124-generic-x86_64-with-glibc2.35
+        python: CPython 3.10.12
+        started_at: '2026-06-05T05:48:21.909475Z'
+        args:
+        - --config
+        - configs/experiments/e04_resnet_wide_cbce_light.yaml
+        program: /home/exouser/code/Mamba-KAN-PXRD/scripts/train.py
+        code_path: scripts/train.py
+        code_path_local: scripts/train.py
+        git:
+          remote_url: https://github.com/lkxg/Mamba-KAN-PXRD.git
+          commit: e39a9ceda9033ab8bfc226ce9ee63364b975ed08
+        root: wandb
+        host: mk-pxrd
+        executable: /usr/bin/python3
+        cpu_count: 20
+        cpu_count_logical: 20
+        gpu_type: NVIDIA H100 80GB HBM3
+        gpu_count: 1
+        disk:
+          /:
+            total: '103865303040'
+            used: '35359080448'
+        memory:
+          total: '247395160064'
+        gpu_nvidia:
+        - name: NVIDIA H100 80GB HBM3
+          memory_total: '85520809984'
+          cuda_cores: 16896
+          architecture: Hopper
+          uuid: GPU-f4ed6503-3709-a1c0-e59c-bcd68c23317c
+        cuda_version: '13.2'
+        writer_id: pentjyman2z9ddhwku7bmyzoepbvfj4x
+experiment:
+  desc: null
+  value:
+    name: e04_resnet_wide_cbce_light
+    seed: 42
+data:
+  desc: null
+  value:
+    root: dataset
+    splits_csv: splits/splits.csv
+    task: space_group
+    batch_size: 768
+    num_workers: 12
+    prefetch_factor: 4
+    pin_memory: true
+model:
+  desc: null
+  value:
+    name: resnet1d
+    resnet1d:
+      base_channels: 96
+      blocks_per_stage:
+      - 3
+      - 4
+      - 6
+      - 3
+    mlp:
+      hidden:
+      - 1024
+      - 512
+      dropout: 0.2
+optim:
+  desc: null
+  value:
+    name: adamw
+    lr: 0.0008
+    weight_decay: 0.001
+    betas:
+    - 0.9
+    - 0.999
+scheduler:
+  desc: null
+  value:
+    name: cosine
+    warmup_epochs: 3
+train:
+  desc: null
+  value:
+    epochs: 30
+    amp: true
+    amp_dtype: bf16
+    grad_clip: 1.0
+    log_every: 50
+logging:
+  desc: null
+  value:
+    tensorboard: true
+    wandb:
+      enabled: true
+      project: mamba-kan-pxrd
+      entity: null
+      mode: offline
+      group: multi_exp_longtail
+      job_type: train
+      tags:
+      - h100
+      - resnet1d
+      - wide
+      - class-balanced-ce-light
+      - offline
+      notes: E04 wider ResNet with lighter class-balanced CE beta.
+      dir: wandb
+      save_code: true
+      watch_model: false
+      watch_log: gradients
+      watch_log_freq: 100
+      log_best_checkpoint: false
+loss:
+  desc: null
+  value:
+    name: class_balanced_ce
+    label_smoothing: 0.05
+    focal_gamma: 2.0
+    class_weight_power: 0.5
+    class_weight_beta: 0.995
+sampler:
+  desc: null
+  value:
+    name: none
+    power: 0.5
+    replacement: true
+    num_samples_multiplier: 1.0
+performance:
+  desc: null
+  value:
+    tf32: true
+    cudnn_benchmark: true
+    matmul_precision: high
+    compile: true
+    compile_mode: default
+checkpoint:
+  desc: null
+  value:
+    out_dir: checkpoints
+    save_best: true
+    monitor: val_balanced_acc1_macro
+    mode: max
+    balanced_metric:
+      acc1_weight: 0.5
+      macro_acc1_weight: 0.5

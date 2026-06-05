@@ -21,7 +21,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
-from src.models import MLPClassifier, ResNet1D
+from src.models import (
+    BiGRUPatchClassifier,
+    MLPClassifier,
+    PatchTSTClassifier,
+    ResNet1D,
+)
 from src.training import (
     amp_dtype_from_config,
     build_loss,
@@ -41,7 +46,7 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
         num_classes: 分类类别数（空间群为 230，晶系为 7）
 
     返回:
-        PyTorch 模型实例（MLPClassifier 或 ResNet1D）
+        PyTorch 模型实例
 
     异常:
         ValueError: 当模型名称未知时抛出
@@ -52,6 +57,18 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
                              **cfg["model"].get("mlp", {}))
     if name == "resnet1d":
         return ResNet1D(num_classes=num_classes, **cfg["model"].get("resnet1d", {}))
+    if name == "bigru_patch":
+        return BiGRUPatchClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("bigru_patch", {}),
+        )
+    if name == "patchtst":
+        return PatchTSTClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("patchtst", {}),
+        )
     raise ValueError(f"unknown model: {name!r}")
 
 
@@ -97,6 +114,8 @@ def build_balanced_sampler(
     labels = torch.as_tensor(labels_for_rows(labels_csv, train_rows, task), dtype=torch.long)
     counts = torch.as_tensor(class_counts, dtype=torch.float64)
     power = float(sampler_cfg.get("power", 0.5))
+    if power < 0:
+        raise ValueError("sampler.power must be non-negative")
     sample_weights = torch.pow(torch.clamp(counts[labels], min=1.0), -power)
     sample_weights = sample_weights / sample_weights.mean()
 
@@ -104,19 +123,46 @@ def build_balanced_sampler(
     if num_samples is None:
         multiplier = float(sampler_cfg.get("num_samples_multiplier", 1.0))
         num_samples = int(round(len(train_rows) * multiplier))
+    num_samples = int(num_samples)
+    if num_samples <= 0:
+        raise ValueError("sampler.num_samples must be positive")
+    replacement = bool(sampler_cfg.get("replacement", True))
+    if not replacement and num_samples > len(train_rows):
+        raise ValueError(
+            "sampler.num_samples cannot exceed the training set size "
+            "when replacement is false"
+        )
 
     generator = torch.Generator()
     generator.manual_seed(int(cfg["experiment"].get("seed", 42)))
     return WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=int(num_samples),
-        replacement=bool(sampler_cfg.get("replacement", True)),
+        num_samples=num_samples,
+        replacement=replacement,
         generator=generator,
     )
 
 
-def metric_value(train_stats, val_stats, monitor: str) -> float:
+def metric_value(
+    train_stats,
+    val_stats,
+    monitor: str,
+    checkpoint_cfg: dict | None = None,
+) -> float:
     """返回 checkpoint 监控指标。"""
+    checkpoint_cfg = checkpoint_cfg or {}
+    balanced_cfg = checkpoint_cfg.get("balanced_metric", {})
+    acc1_weight = float(balanced_cfg.get("acc1_weight", 0.5))
+    macro_weight = float(balanced_cfg.get("macro_acc1_weight", 0.5))
+    if acc1_weight < 0 or macro_weight < 0:
+        raise ValueError("balanced_metric weights must be non-negative")
+    balanced_weight_sum = acc1_weight + macro_weight
+    if balanced_weight_sum <= 0:
+        raise ValueError("at least one balanced_metric weight must be positive")
+    balanced_acc1_macro = (
+        acc1_weight * val_stats.acc1 + macro_weight * val_stats.macro_acc1
+    ) / balanced_weight_sum
+
     metrics = {
         "train_loss": train_stats.loss,
         "train_acc1": train_stats.acc1,
@@ -125,9 +171,13 @@ def metric_value(train_stats, val_stats, monitor: str) -> float:
         "val_acc1": val_stats.acc1,
         "val_acc5": val_stats.acc5,
         "val_macro_acc1": val_stats.macro_acc1,
+        "val_balanced_acc1_macro": balanced_acc1_macro,
     }
     if monitor not in metrics:
-        raise ValueError(f"unknown checkpoint monitor: {monitor!r}")
+        raise ValueError(
+            f"unknown checkpoint monitor: {monitor!r}; "
+            f"choose one of {sorted(metrics)}"
+        )
     return metrics[monitor]
 
 
@@ -173,6 +223,40 @@ def init_wandb(cfg: dict, run_dir: Path):
     return run
 
 
+def build_optimizer(cfg: dict, params) -> torch.optim.Optimizer:
+    """Build the optimizer selected by config."""
+    optim_cfg = cfg.get("optim", {})
+    name = optim_cfg.get("name", "adamw").lower()
+    lr = float(optim_cfg["lr"])
+    weight_decay = float(optim_cfg.get("weight_decay", 0.0))
+
+    if name == "adamw":
+        return torch.optim.AdamW(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
+            eps=float(optim_cfg.get("eps", 1e-8)),
+        )
+    if name == "adam":
+        return torch.optim.Adam(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
+            eps=float(optim_cfg.get("eps", 1e-8)),
+        )
+    if name == "sgd":
+        return torch.optim.SGD(
+            params,
+            lr=lr,
+            momentum=float(optim_cfg.get("momentum", 0.9)),
+            weight_decay=weight_decay,
+            nesterov=bool(optim_cfg.get("nesterov", False)),
+        )
+    raise ValueError(f"unknown optimizer: {name!r}")
+
+
 def main():
     """主训练流程。"""
     # ---------- 命令行参数解析 ----------
@@ -193,10 +277,18 @@ def main():
     # 加载预先划分好的训练/验证/测试集索引
     splits = load_splits(cfg["data"]["splits_csv"])
     task = cfg["data"]["task"]
+    monitor = cfg["checkpoint"].get("monitor", "val_acc1")
+    monitor_mode = cfg["checkpoint"].get("mode", "max")
+    if monitor_mode not in {"max", "min"}:
+        raise ValueError(f"unknown checkpoint mode: {monitor_mode!r}")
 
     # 创建 PyTorch Dataset 对象
     train_ds = PXRDDataset(cfg["data"]["root"], rows=splits["train"], task=task)
     val_ds   = PXRDDataset(cfg["data"]["root"], rows=splits["val"],   task=task)
+    if len(train_ds) == 0:
+        raise ValueError("train split is empty")
+    if monitor.startswith("val_") and len(val_ds) == 0:
+        raise ValueError(f"{monitor} requires a non-empty validation split")
 
     labels_csv = Path(cfg["data"]["root"]) / "labels.csv"
     loss_name = cfg["loss"]["name"].lower()
@@ -224,12 +316,17 @@ def main():
     if cfg["data"]["num_workers"] > 0:
         common["prefetch_factor"] = cfg["data"].get("prefetch_factor", 2)
 
+    batch_size = int(cfg["data"]["batch_size"])
+    train_epoch_samples = len(train_sampler) if train_sampler is not None else len(train_ds)
+    drop_last = bool(cfg["train"].get("drop_last", True))
+    drop_last = drop_last and train_epoch_samples >= batch_size
+
     # 创建训练和验证数据加载器
     train_loader = DataLoader(
         train_ds,
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        drop_last=True,
+        drop_last=drop_last,
         **common,
     )
     val_loader   = DataLoader(val_ds,   shuffle=False, drop_last=False, **common)
@@ -266,12 +363,8 @@ def main():
     print(f"Loss: {loss_name}")
 
     # ========== 优化器和学习率调度器 ==========
-    optimizer = torch.optim.AdamW(
-        raw_model.parameters(),
-        lr=cfg["optim"]["lr"],                      # 初始学习率
-        weight_decay=cfg["optim"]["weight_decay"],  # 权重衰减（L2 正则化）
-        betas=tuple(cfg["optim"]["betas"]),         # Adam 动量参数
-    )
+    optimizer = build_optimizer(cfg, raw_model.parameters())
+    print(f"Optimizer: {cfg.get('optim', {}).get('name', 'adamw')}")
     # 混合精度训练（AMP）：减少显存占用并加速训练
     use_amp = cfg["train"].get("amp", True) and device.type == "cuda"
     amp_dtype = amp_dtype_from_config(cfg["train"].get("amp_dtype", "float16"), device)
@@ -284,15 +377,17 @@ def main():
 
     # ========== 日志记录设置 ==========
     run_name = cfg["experiment"]["name"]
-    run_dir = Path("runs") / f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_id = f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = Path("runs") / run_id
     logging_cfg = cfg.get("logging", {})
     writer = None
     if logging_cfg.get("tensorboard", True):
         writer = SummaryWriter(run_dir)  # TensorBoard 日志
-    ckpt_dir = Path(cfg["checkpoint"]["out_dir"])
+    ckpt_dir = Path(cfg["checkpoint"]["out_dir"]) / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     if writer is not None:
         print(f"TensorBoard: {run_dir}")
+    print(f"Checkpoints: {ckpt_dir}")
 
     wandb_run = init_wandb(cfg, run_dir)
     wandb_cfg = logging_cfg.get("wandb", {})
@@ -308,8 +403,6 @@ def main():
             )
 
     # ========== 训练循环 ==========
-    monitor = cfg["checkpoint"].get("monitor", "val_acc1")
-    monitor_mode = cfg["checkpoint"].get("mode", "max")
     best_score = -float("inf") if monitor_mode == "max" else float("inf")
     for epoch in range(epochs):
         # 更新学习率（使用余弦退火调度器）
@@ -343,14 +436,22 @@ def main():
         dt = time.time() - t0
 
         # 打印训练统计信息
-        score = metric_value(train_stats, val_stats, monitor)
+        balanced_score = metric_value(
+            train_stats,
+            val_stats,
+            "val_balanced_acc1_macro",
+            cfg["checkpoint"],
+        )
+        score = metric_value(train_stats, val_stats, monitor, cfg["checkpoint"])
         print(f"epoch {epoch+1:3d}/{epochs}  "
               f"lr={lr:.2e}  "
               f"train loss={train_stats.loss:.4f} acc1={train_stats.acc1:.4f}  "
               f"val loss={val_stats.loss:.4f} acc1={val_stats.acc1:.4f} "
-              f"acc5={val_stats.acc5:.4f} macro={val_stats.macro_acc1:.4f}  "
+              f"acc5={val_stats.acc5:.4f} macro={val_stats.macro_acc1:.4f} "
+              f"balanced={balanced_score:.4f}  "
               f"{monitor}={score:.4f}  "
-              f"({dt:.0f}s)")
+              f"({dt:.0f}s)",
+              flush=True)
 
         # 记录到 TensorBoard
         if writer is not None:
@@ -361,6 +462,7 @@ def main():
             writer.add_scalar("val/acc1", val_stats.acc1, epoch)
             writer.add_scalar("val/acc5", val_stats.acc5, epoch)
             writer.add_scalar("val/macro_acc1", val_stats.macro_acc1, epoch)
+            writer.add_scalar("val/balanced_acc1_macro", balanced_score, epoch)
 
         if wandb_run is not None:
             wandb_run.log({
@@ -373,30 +475,15 @@ def main():
                 "val_acc1": val_stats.acc1,
                 "val_acc5": val_stats.acc5,
                 "val_macro_acc1": val_stats.macro_acc1,
+                "val_balanced_acc1_macro": balanced_score,
                 "epoch_time_sec": dt,
             }, step=epoch + 1)
 
-        if monitor_mode == "max":
-            is_better = score > best_score
-        elif monitor_mode == "min":
-            is_better = score < best_score
-        else:
-            raise ValueError(f"unknown checkpoint mode: {monitor_mode!r}")
+        is_better = score > best_score if monitor_mode == "max" else score < best_score
 
         # 保存最佳模型（基于配置指定的验证指标）
-        if cfg["checkpoint"].get("save_best", True) and is_better:
+        if is_better:
             best_score = score
-            best_path = ckpt_dir / "best.pt"
-            torch.save({
-                "epoch": epoch,
-                "model_state": raw_model.state_dict(),
-                "config": cfg,
-                "val_acc1": val_stats.acc1,
-                "val_acc5": val_stats.acc5,
-                "val_macro_acc1": val_stats.macro_acc1,
-                "monitor": monitor,
-                "monitor_score": score,
-            }, best_path)
 
             if wandb_run is not None:
                 wandb_run.summary["best_epoch"] = epoch + 1
@@ -404,8 +491,23 @@ def main():
                 wandb_run.summary[f"best_{monitor}"] = best_score
                 wandb_run.summary["best_val_acc1"] = val_stats.acc1
                 wandb_run.summary["best_val_macro_acc1"] = val_stats.macro_acc1
+                wandb_run.summary["best_val_balanced_acc1_macro"] = balanced_score
 
-                if wandb_cfg.get("log_best_checkpoint", False):
+            if cfg["checkpoint"].get("save_best", True):
+                best_path = ckpt_dir / "best.pt"
+                torch.save({
+                    "epoch": epoch,
+                    "model_state": raw_model.state_dict(),
+                    "config": cfg,
+                    "val_acc1": val_stats.acc1,
+                    "val_acc5": val_stats.acc5,
+                    "val_macro_acc1": val_stats.macro_acc1,
+                    "val_balanced_acc1_macro": balanced_score,
+                    "monitor": monitor,
+                    "monitor_score": score,
+                }, best_path)
+
+                if wandb_run is not None and wandb_cfg.get("log_best_checkpoint", False):
                     import wandb
 
                     artifact = wandb.Artifact(
@@ -424,7 +526,7 @@ def main():
         writer.close()
     if wandb_run is not None:
         wandb_run.finish()
-    print(f"Best {monitor}: {best_score:.4f}")
+    print(f"Best {monitor}: {best_score:.4f}", flush=True)
 
 
 if __name__ == "__main__":

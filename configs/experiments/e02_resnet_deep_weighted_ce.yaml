@@ -1,0 +1,85 @@
+experiment:
+  name: e02_resnet_deep_weighted_ce
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 1024
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: resnet1d
+  resnet1d:
+    base_channels: 64
+    blocks_per_stage: [3, 4, 6, 3]
+  mlp:
+    hidden: [1024, 512]
+    dropout: 0.2
+
+optim:
+  name: adamw
+  lr: 1.0e-3
+  weight_decay: 5.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 3
+
+train:
+  epochs: 30
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 50
+
+logging:
+  tensorboard: true
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: offline
+    group: multi_exp_longtail
+    job_type: train
+    tags: [h100, resnet1d, deep, weighted-ce, offline]
+    notes: E02 deep ResNet with milder weighted CE and label_smoothing=0.03.
+    dir: wandb
+    save_code: true
+    watch_model: false
+    watch_log: gradients
+    watch_log_freq: 100
+    log_best_checkpoint: false
+
+loss:
+  name: weighted_ce
+  label_smoothing: 0.03
+  focal_gamma: 2.0
+  class_weight_power: 0.30
+  class_weight_beta: 0.999
+
+sampler:
+  name: none
+  power: 0.5
+  replacement: true
+  num_samples_multiplier: 1.0
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: true
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5
