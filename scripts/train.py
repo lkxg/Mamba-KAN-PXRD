@@ -23,15 +23,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
 from src.models import (
     BiGRUPatchClassifier,
+    DualRangePXRDClassifier,
     MLPClassifier,
     PatchTSTClassifier,
     ResNet1D,
 )
 from src.training import (
     amp_dtype_from_config,
+    aux_loss_weights_from_model,
     build_loss,
     configure_backend,
     evaluate,
+    rare_classes_from_counts,
     train_one_epoch,
 )
 from src.utils import load_config, set_seed
@@ -57,6 +60,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
                              **cfg["model"].get("mlp", {}))
     if name == "resnet1d":
         return ResNet1D(num_classes=num_classes, **cfg["model"].get("resnet1d", {}))
+    if name == "dual_range":
+        return DualRangePXRDClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("dual_range", {}),
+        )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(
             in_dim=in_dim,
@@ -171,6 +180,7 @@ def metric_value(
         "val_acc1": val_stats.acc1,
         "val_acc5": val_stats.acc5,
         "val_macro_acc1": val_stats.macro_acc1,
+        "val_rare_acc1": val_stats.rare_acc1,
         "val_balanced_acc1_macro": balanced_acc1_macro,
     }
     if monitor not in metrics:
@@ -292,11 +302,16 @@ def main():
 
     labels_csv = Path(cfg["data"]["root"]) / "labels.csv"
     loss_name = cfg["loss"]["name"].lower()
-    needs_class_counts = loss_name in {"weighted_ce", "class_balanced_ce"}
     sampler_name = cfg.get("sampler", {}).get("name", "none").lower()
-    class_counts = None
-    if needs_class_counts or sampler_name == "class_balanced":
-        class_counts = class_counts_for_rows(labels_csv, train_ds.rows, task)
+    class_counts = class_counts_for_rows(labels_csv, train_ds.rows, task)
+    metrics_cfg = cfg.get("metrics", {})
+    rare_max_count = int(metrics_cfg.get("rare_max_train_count", 100))
+    rare_min_count = int(metrics_cfg.get("rare_min_train_count", 1))
+    rare_classes = rare_classes_from_counts(
+        class_counts,
+        max_count=rare_max_count,
+        min_count=rare_min_count,
+    )
 
     train_sampler = build_balanced_sampler(
         cfg,
@@ -334,6 +349,10 @@ def main():
     print(f"Task: {task}  num_classes={train_ds.num_classes}")
     print(f"  train: {len(train_ds):,}  |  val: {len(val_ds):,}")
     print(f"Sampler: {sampler_name}")
+    print(
+        f"Rare classes: {len(rare_classes)} "
+        f"(train count {rare_min_count}-{rare_max_count})"
+    )
 
     # ========== 模型构建 ==========
     # 根据配置创建模型并移动到指定设备
@@ -341,8 +360,15 @@ def main():
                         num_classes=train_ds.num_classes).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {cfg['model']['name']}  ({n_params/1e6:.1f}M params)")
+    if hasattr(model, "sa_branch") and getattr(model, "sa_branch") is not None:
+        print(f"  SA mixer backend: {model.sa_branch.actual_mamba_backend}")
+    if hasattr(model, "wa_branch") and getattr(model, "wa_branch") is not None:
+        print(f"  WA mixer backend: {model.wa_branch.actual_mamba_backend}")
 
     raw_model = model
+    aux_loss_weights = aux_loss_weights_from_model(raw_model)
+    if aux_loss_weights:
+        print(f"Aux losses: {aux_loss_weights}")
     if cfg.get("performance", {}).get("compile", False) and device.type == "cuda":
         compile_mode = cfg.get("performance", {}).get("compile_mode", "default")
         model = torch.compile(raw_model, mode=compile_mode)
@@ -359,6 +385,7 @@ def main():
         label_smoothing=cfg["loss"].get("label_smoothing", 0.0),
         class_weight_power=cfg["loss"].get("class_weight_power", 0.5),
         class_weight_beta=cfg["loss"].get("class_weight_beta", 0.99),
+        logit_adjustment_tau=cfg["loss"].get("logit_adjustment_tau", 1.0),
     ).to(device)
     print(f"Loss: {loss_name}")
 
@@ -423,6 +450,8 @@ def main():
             log_every=cfg["train"].get("log_every", 100),  # 日志打印频率
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+            aux_loss_weights=aux_loss_weights,
+            rare_classes=rare_classes,
         )
         # 在验证集上评估
         val_stats = evaluate(
@@ -432,6 +461,8 @@ def main():
             device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+            aux_loss_weights=aux_loss_weights,
+            rare_classes=rare_classes,
         )
         dt = time.time() - t0
 
@@ -443,11 +474,19 @@ def main():
             cfg["checkpoint"],
         )
         score = metric_value(train_stats, val_stats, monitor, cfg["checkpoint"])
+        extra_parts = [
+            f"rare={val_stats.rare_acc1:.4f}",
+        ]
+        if val_stats.aux_loss:
+            extra_parts.append(f"aux={val_stats.aux_loss:.4f}")
+        if val_stats.gate_mean is not None:
+            extra_parts.append(f"gate={val_stats.gate_mean:.4f}")
         print(f"epoch {epoch+1:3d}/{epochs}  "
               f"lr={lr:.2e}  "
               f"train loss={train_stats.loss:.4f} acc1={train_stats.acc1:.4f}  "
               f"val loss={val_stats.loss:.4f} acc1={val_stats.acc1:.4f} "
               f"acc5={val_stats.acc5:.4f} macro={val_stats.macro_acc1:.4f} "
+              f"{' '.join(extra_parts)} "
               f"balanced={balanced_score:.4f}  "
               f"{monitor}={score:.4f}  "
               f"({dt:.0f}s)",
@@ -462,7 +501,11 @@ def main():
             writer.add_scalar("val/acc1", val_stats.acc1, epoch)
             writer.add_scalar("val/acc5", val_stats.acc5, epoch)
             writer.add_scalar("val/macro_acc1", val_stats.macro_acc1, epoch)
+            writer.add_scalar("val/rare_acc1", val_stats.rare_acc1, epoch)
+            writer.add_scalar("val/aux_loss", val_stats.aux_loss, epoch)
             writer.add_scalar("val/balanced_acc1_macro", balanced_score, epoch)
+            if val_stats.gate_mean is not None:
+                writer.add_scalar("val/gate_mean", val_stats.gate_mean, epoch)
 
         if wandb_run is not None:
             wandb_run.log({
@@ -475,9 +518,15 @@ def main():
                 "val_acc1": val_stats.acc1,
                 "val_acc5": val_stats.acc5,
                 "val_macro_acc1": val_stats.macro_acc1,
+                "val_rare_acc1": val_stats.rare_acc1,
+                "val_aux_loss": val_stats.aux_loss,
                 "val_balanced_acc1_macro": balanced_score,
                 "epoch_time_sec": dt,
-            }, step=epoch + 1)
+            } | (
+                {"val_gate_mean": val_stats.gate_mean}
+                if val_stats.gate_mean is not None
+                else {}
+            ), step=epoch + 1)
 
         is_better = score > best_score if monitor_mode == "max" else score < best_score
 
@@ -491,7 +540,10 @@ def main():
                 wandb_run.summary[f"best_{monitor}"] = best_score
                 wandb_run.summary["best_val_acc1"] = val_stats.acc1
                 wandb_run.summary["best_val_macro_acc1"] = val_stats.macro_acc1
+                wandb_run.summary["best_val_rare_acc1"] = val_stats.rare_acc1
                 wandb_run.summary["best_val_balanced_acc1_macro"] = balanced_score
+                if val_stats.gate_mean is not None:
+                    wandb_run.summary["best_val_gate_mean"] = val_stats.gate_mean
 
             if cfg["checkpoint"].get("save_best", True):
                 best_path = ckpt_dir / "best.pt"
@@ -502,7 +554,13 @@ def main():
                     "val_acc1": val_stats.acc1,
                     "val_acc5": val_stats.acc5,
                     "val_macro_acc1": val_stats.macro_acc1,
+                    "val_rare_acc1": val_stats.rare_acc1,
+                    "val_aux_loss": val_stats.aux_loss,
+                    "val_gate_mean": val_stats.gate_mean,
                     "val_balanced_acc1_macro": balanced_score,
+                    "rare_classes": sorted(rare_classes),
+                    "rare_max_train_count": rare_max_count,
+                    "rare_min_train_count": rare_min_count,
                     "monitor": monitor,
                     "monitor_score": score,
                 }, best_path)

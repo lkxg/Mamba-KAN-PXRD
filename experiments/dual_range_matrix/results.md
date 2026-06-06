@@ -1,0 +1,8 @@
+| experiment | model | loss | best_epoch | val_acc1 | val_macro | val_rare | test_acc1 | test_acc5 | test_macro | test_f1 | test_rare | gate | sa_mamba | wa_mamba | occ_delta_acc1 | occ_delta_macro | occ_delta_f1 | occ_delta_rare |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| e02_resnet_deep_label_smoothing | resnet1d | label_smoothing | 30 | 0.769061 | 0.495244 |  | 0.765881 | 0.935192 | 0.467400 | 0.479361 | 0.407207 |  |  |  | -0.457058 | -0.287502 | -0.271860 | -0.259459 |
+| e07_wa_only_resnet_label_smoothing | dual_range | label_smoothing | 34 | 0.659192 | 0.472489 | 0.441696 | 0.657981 | 0.902125 | 0.451649 | 0.469857 | 0.425225 |  |  | none | -0.309443 | -0.281544 | -0.286011 | -0.299099 |
+| e14_sa_only_resnet_ablation | dual_range | weighted_ce | 30 | 0.415856 | 0.233306 | 0.250883 | 0.417579 | 0.802881 | 0.233504 | 0.228156 | 0.261261 |  | none |  | -0.411850 | -0.229020 | -0.228107 | -0.261261 |
+| e08_dual_concat_resnet | dual_range | weighted_ce | 31 | 0.673621 | 0.539536 | 0.535336 | 0.669909 | 0.930767 | 0.503937 | 0.493816 | 0.470270 |  | none | none | -0.341805 | -0.346988 | -0.322435 | -0.338739 |
+| e09_dual_gated_resnet | dual_range | weighted_ce | 35 | 0.700212 | 0.538182 | 0.522968 | 0.701821 | 0.936132 | 0.505635 | 0.504605 | 0.475676 | 0.465612 | none | none | -0.378676 | -0.376632 | -0.363794 | -0.385586 |
+| e11_dual_gated_kan | dual_range | weighted_ce | 39 | 0.707971 | 0.547590 | 0.526502 | 0.705091 | 0.920635 | 0.521570 | 0.516939 | 0.506306 | 0.483037 | none | none | -0.466912 | -0.385465 | -0.368857 | -0.416216 |

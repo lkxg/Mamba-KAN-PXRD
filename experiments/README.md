@@ -11,6 +11,21 @@ Use this directory as the experiment index.
 - Logs: `e02_loss_ablation/logs/`
 - Plan/config notes: `e02_loss_ablation/plan.md`
 
+## Dual-Range Matrix
+
+- `dual_range_matrix/` is the current SA/WA architecture matrix.
+- Fixed strong baseline: `configs/experiments/e02_resnet_deep_label_smoothing.yaml`
+  (`ResNet1D + label_smoothing`).
+- Matrix configs: E07 WA-only, E08 concat, E09 gated, E10 gated+Mamba,
+  E11 gated+KAN, E12 gated+Mamba+KAN, E13 E12+aux heads, and E14 SA-only.
+- Primary table after running: `dual_range_matrix/results.md`
+- Full CSV after running: `dual_range_matrix/results.csv`
+- Logs after running: `dual_range_matrix/logs/`
+- Plan/config notes: `dual_range_matrix/README.md`
+- Formal run gates: `analysis/scripts/preflight_dual_range.py`,
+  `analysis/scripts/smoke_dual_range_forward.py`, and
+  `analysis/scripts/audit_dual_range.py`.
+
 ## Sequence Baselines
 
 - `sequence_baselines/` contains BiGRU and PatchTST-style baselines trained with
@@ -19,6 +34,17 @@ Use this directory as the experiment index.
 - Full CSV: `sequence_baselines/results.csv`
 - Logs: `sequence_baselines/logs/`
 - Plan/config notes: `sequence_baselines/plan.md`
+
+## Dual-Range Loss Control
+
+- `dual_range_loss_control/` contains the same-architecture E09/E15 loss
+  control for the gated dual-range ResNet.
+- `e09_dual_gated_resnet` uses the mixed long-tail recipe,
+  `weighted_ce + label_smoothing=0.03`.
+- `e15_dual_gated_resnet_label_smoothing` keeps the E09 architecture fixed and
+  switches only to `label_smoothing=0.05`.
+- Result: label smoothing improves overall Top-1, while the mixed recipe remains
+  better for test macro and rare-class accuracy.
 
 ## Historical Records
 

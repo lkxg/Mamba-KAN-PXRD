@@ -1,0 +1,10 @@
+# Extra CUDA dependencies for formal Mamba experiment rows.
+#
+# Install after requirements.txt on the intended CUDA/H100 runner:
+#   python3 -m pip install -r requirements.txt
+#   python3 -m pip install -r requirements-mamba.txt
+#
+# The dual-range matrix preflight requires both packages before final E10/E12/E13
+# runs. CPU/sandbox smoke tests may use the local fallback instead.
+mamba-ssm>=2.2
+causal-conv1d>=1.2

@@ -5,16 +5,23 @@
 2. ResNet1D：适合一维信号（如 PXRD 曲线）的残差网络
 3. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
 4. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
+5. DualRangePXRDClassifier：SA/WA 双分支 + 可选 selective SSM + KAN head
 
 这些模型为项目提供了基线性能，后续可以添加更先进的架构（如 Mamba-KAN 混合模型）。
 """
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from mamba_ssm import Mamba as _MambaSSM
+except Exception:  # pragma: no cover - optional CUDA extension
+    _MambaSSM = None
 
 
 def _num_patches(signal_length: int, patch_len: int, stride: int) -> int:
@@ -41,6 +48,53 @@ def _patchify_1d(x: torch.Tensor, patch_len: int, stride: int) -> torch.Tensor:
     if pad:
         x = F.pad(x, (0, pad))
     return x.unfold(dimension=-1, size=patch_len, step=stride).contiguous()
+
+
+def _as_tuple(values: Sequence[int] | int) -> tuple[int, ...]:
+    if isinstance(values, int):
+        return (values,)
+    return tuple(int(v) for v in values)
+
+
+def _range_to_slice(
+    *,
+    start_deg: float,
+    end_deg: float,
+    signal_length: int,
+    theta_min: float,
+    theta_max: float,
+) -> slice:
+    """Map a 2theta range to a stable Python slice over the sampled curve."""
+    if signal_length <= 1:
+        return slice(0, signal_length)
+    if theta_min >= theta_max:
+        raise ValueError("theta_min must be smaller than theta_max")
+    start = max(float(start_deg), float(theta_min))
+    end = min(float(end_deg), float(theta_max))
+    if start >= end:
+        raise ValueError(
+            f"empty 2theta range [{start_deg}, {end_deg}] for "
+            f"coverage [{theta_min}, {theta_max}]"
+        )
+
+    step = (theta_max - theta_min) / (signal_length - 1)
+    left = int(math.floor((start - theta_min) / step))
+    right = int(math.ceil((end - theta_min) / step)) + 1
+    left = max(0, min(signal_length - 1, left))
+    right = max(left + 1, min(signal_length, right))
+    return slice(left, right)
+
+
+def _make_angle_channel(
+    rng: slice,
+    *,
+    signal_length: int,
+    theta_min: float,
+    theta_max: float,
+) -> torch.Tensor:
+    full = torch.linspace(float(theta_min), float(theta_max), int(signal_length))
+    angles = full[rng]
+    return ((angles - float(theta_min)) / (float(theta_max) - float(theta_min))) * 2 - 1
 
 
 class MLPClassifier(nn.Module):
@@ -215,6 +269,582 @@ class ResNet1D(nn.Module):
         return self.head(x)
 
 
+class _ResNetFeatureEncoder(nn.Module):
+    """ResNet-style feature extractor that keeps the final sequence map."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int = 1,
+        base_channels: int = 32,
+        blocks_per_stage: Sequence[int] = (2, 2, 2),
+        stem_kernel: int = 15,
+        stem_stride: int = 4,
+        stem_pool: bool = True,
+    ) -> None:
+        super().__init__()
+        if base_channels <= 0:
+            raise ValueError("base_channels must be positive")
+        blocks_per_stage = _as_tuple(blocks_per_stage)
+        if not blocks_per_stage:
+            raise ValueError("blocks_per_stage must contain at least one stage")
+        if stem_kernel <= 0 or stem_stride <= 0:
+            raise ValueError("stem_kernel and stem_stride must be positive")
+
+        c = int(base_channels)
+        stem: list[nn.Module] = [
+            nn.Conv1d(
+                in_channels,
+                c,
+                kernel_size=stem_kernel,
+                stride=stem_stride,
+                padding=stem_kernel // 2,
+                bias=False,
+            ),
+            nn.BatchNorm1d(c),
+            nn.GELU(),
+        ]
+        if stem_pool:
+            stem.append(nn.MaxPool1d(kernel_size=3, stride=2, padding=1))
+        self.stem = nn.Sequential(*stem)
+
+        stages: list[nn.Module] = []
+        ch = c
+        for i, n_blocks in enumerate(blocks_per_stage):
+            out_ch = ch if i == 0 else ch * 2
+            stride = 1 if i == 0 else 2
+            for b in range(int(n_blocks)):
+                stages.append(_ResBlock1D(
+                    ch if b == 0 else out_ch,
+                    out_ch,
+                    stride=stride if b == 0 else 1,
+                ))
+            ch = out_ch
+        self.stages = nn.Sequential(*stages)
+        self.out_channels = ch
+
+    def forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        if x.ndim != 3:
+            raise ValueError(f"expected (B, L) or (B, C, L), got {tuple(x.shape)}")
+        return self.stages(self.stem(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = self.forward_sequence(x)
+        return F.adaptive_avg_pool1d(seq, 1).flatten(1)
+
+
+class _LocalSelectiveSSMBlock(nn.Module):
+    """A lightweight selective sequence mixer used when mamba-ssm is unavailable.
+
+    It preserves the Mamba placement and tensor contract for ablations: local
+    depthwise convolution gates a residual feed-forward path over the compressed
+    ResNet feature sequence.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        expand: int = 2,
+        d_conv: int = 5,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if expand <= 0 or d_conv <= 0:
+            raise ValueError("expand and d_conv must be positive")
+        inner = int(d_model * expand)
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, inner * 2)
+        self.conv = nn.Conv1d(
+            inner,
+            inner,
+            kernel_size=d_conv,
+            padding=d_conv // 2,
+            groups=inner,
+        )
+        self.out_proj = nn.Linear(inner, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        value, gate = self.in_proj(x).chunk(2, dim=-1)
+        value = self.conv(value.transpose(1, 2)).transpose(1, 2)
+        if value.shape[1] != gate.shape[1]:
+            value = value[:, : gate.shape[1], :]
+        value = F.silu(value) * torch.sigmoid(gate)
+        return residual + self.dropout(self.out_proj(value))
+
+
+class _ResidualMambaSSMBlock(nn.Module):
+    """LayerNorm + residual wrapper around the optional mamba-ssm block."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if _MambaSSM is None:
+            raise ImportError("mamba_ssm is not installed")
+        self.norm = nn.LayerNorm(d_model)
+        self.mixer = _MambaSSM(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.dropout(self.mixer(self.norm(x)))
+
+
+class _MambaSequenceMixer(nn.Module):
+    """Stacked Mamba blocks with an explicit local fallback backend."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        num_layers: int = 0,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.0,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_layers = int(num_layers)
+        self.backend = backend.lower()
+        if self.num_layers <= 0:
+            self.blocks = nn.ModuleList()
+            self.actual_backend = "none"
+            return
+        if self.backend not in {"auto", "mamba_ssm", "local"}:
+            raise ValueError("mamba backend must be auto, mamba_ssm, or local")
+
+        use_mamba = self.backend in {"auto", "mamba_ssm"} and _MambaSSM is not None
+        if self.backend == "mamba_ssm" and not use_mamba:
+            raise ImportError(
+                "mamba_ssm is not installed. Install mamba-ssm/causal-conv1d "
+                "or set mamba.backend: local."
+            )
+
+        blocks: list[nn.Module] = []
+        if use_mamba:
+            for _ in range(self.num_layers):
+                blocks.append(_ResidualMambaSSMBlock(
+                    d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dropout=dropout,
+                ))
+            self.actual_backend = "mamba_ssm"
+        else:
+            for _ in range(self.num_layers):
+                blocks.append(_LocalSelectiveSSMBlock(
+                    d_model,
+                    expand=expand,
+                    d_conv=d_conv,
+                    dropout=dropout,
+                ))
+            self.actual_backend = "local"
+        self.blocks = nn.ModuleList(blocks)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        if self.num_layers > 0:
+            x = self.norm(x)
+        return x
+
+
+class _RBFLayer(nn.Module):
+    """Compact RBF expansion used by the local KAN head."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        num_grids: int = 8,
+        grid_min: float = -2.0,
+        grid_max: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if in_features <= 0 or out_features <= 0:
+            raise ValueError("in_features and out_features must be positive")
+        if num_grids < 2:
+            raise ValueError("num_grids must be at least 2")
+        centers = torch.linspace(grid_min, grid_max, num_grids)
+        self.register_buffer("centers", centers)
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.base = nn.Linear(in_features, out_features)
+        self.spline = nn.Linear(in_features * num_grids, out_features, bias=False)
+        self.norm = nn.LayerNorm(out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = torch.tanh(x)
+        basis = torch.exp(
+            -F.softplus(self.gamma) * (x_norm.unsqueeze(-1) - self.centers).pow(2)
+        )
+        basis = basis.flatten(1)
+        return self.norm(self.base(x) + self.spline(basis))
+
+
+class KANHead(nn.Module):
+    """GPU-friendly KAN-style classifier head with local RBF basis functions."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        *,
+        hidden: Sequence[int] = (512,),
+        num_grids: int = 8,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        prev = int(in_dim)
+        for h in _as_tuple(hidden):
+            layers.extend([
+                _RBFLayer(prev, int(h), num_grids=num_grids),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            prev = int(h)
+        layers.append(nn.Linear(prev, int(out_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _make_head(
+    *,
+    name: str,
+    in_dim: int,
+    out_dim: int,
+    hidden: Sequence[int] = (512,),
+    dropout: float = 0.1,
+    kan_grids: int = 8,
+) -> nn.Module:
+    name = name.lower()
+    if name == "linear":
+        return nn.Sequential(nn.LayerNorm(in_dim), nn.Dropout(dropout), nn.Linear(in_dim, out_dim))
+    if name == "mlp":
+        layers: list[nn.Module] = [nn.LayerNorm(in_dim)]
+        prev = in_dim
+        for h in _as_tuple(hidden):
+            layers.extend([nn.Linear(prev, int(h)), nn.GELU(), nn.Dropout(dropout)])
+            prev = int(h)
+        layers.append(nn.Linear(prev, out_dim))
+        return nn.Sequential(*layers)
+    if name == "kan":
+        return nn.Sequential(
+            nn.LayerNorm(in_dim),
+            KANHead(
+                in_dim,
+                out_dim,
+                hidden=hidden,
+                num_grids=kan_grids,
+                dropout=dropout,
+            ),
+        )
+    raise ValueError(f"unknown head type: {name!r}")
+
+
+class _DualRangeBranch(nn.Module):
+    """One SA/WA branch: range ResNet -> optional sequence mixer -> pooling."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        base_channels: int,
+        blocks_per_stage: Sequence[int],
+        stem_kernel: int = 15,
+        stem_stride: int = 4,
+        stem_pool: bool = True,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.encoder = _ResNetFeatureEncoder(
+            in_channels=in_channels,
+            base_channels=base_channels,
+            blocks_per_stage=blocks_per_stage,
+            stem_kernel=stem_kernel,
+            stem_stride=stem_stride,
+            stem_pool=stem_pool,
+        )
+        self.mixer = _MambaSequenceMixer(
+            self.encoder.out_channels,
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+        )
+        self.out_dim = self.encoder.out_channels
+        self.actual_mamba_backend = self.mixer.actual_backend
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = self.encoder.forward_sequence(x).transpose(1, 2)
+        seq = self.mixer(seq)
+        return seq.mean(dim=1)
+
+
+class DualRangePXRDClassifier(nn.Module):
+    """SA/WA dual-range classifier for PXRD space-group classification.
+
+    The default ranges match the current SimPOD coverage: SA=5-15 degrees and
+    WA=10-90 degrees, retaining an overlap around the boundary.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 10824,
+        num_classes: int = 230,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+        sa_range: Sequence[float] = (5.0, 15.0),
+        wa_range: Sequence[float] = (10.0, 90.0),
+        use_sa: bool = True,
+        use_wa: bool = True,
+        add_angle_channel: bool = False,
+        fusion: str = "concat",
+        head: str = "mlp",
+        head_hidden: Sequence[int] = (512,),
+        head_dropout: float = 0.1,
+        kan_grids: int = 8,
+        aux_heads: bool = False,
+        sa_aux_weight: float = 0.2,
+        wa_aux_weight: float = 0.2,
+        sa_base_channels: int = 24,
+        sa_blocks_per_stage: Sequence[int] = (2, 2, 2),
+        wa_base_channels: int = 64,
+        wa_blocks_per_stage: Sequence[int] = (3, 4, 6, 3),
+        stem_kernel: int = 15,
+        stem_stride: int = 4,
+        stem_pool: bool = True,
+        mamba: dict | None = None,
+    ) -> None:
+        super().__init__()
+        if not use_sa and not use_wa:
+            raise ValueError("at least one branch must be enabled")
+        if len(sa_range) != 2 or len(wa_range) != 2:
+            raise ValueError("sa_range and wa_range must be [start, end]")
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        self.theta_min = float(theta_min)
+        self.theta_max = float(theta_max)
+        self.use_sa = bool(use_sa)
+        self.use_wa = bool(use_wa)
+        self.add_angle_channel = bool(add_angle_channel)
+        self.fusion = fusion.lower()
+        self.aux_heads_enabled = bool(aux_heads)
+        self.aux_loss_weights = {
+            "sa_logits": (
+                float(sa_aux_weight)
+                if self.aux_heads_enabled and self.use_sa
+                else 0.0
+            ),
+            "wa_logits": (
+                float(wa_aux_weight)
+                if self.aux_heads_enabled and self.use_wa
+                else 0.0
+            ),
+        }
+
+        self.sa_slice = _range_to_slice(
+            start_deg=float(sa_range[0]),
+            end_deg=float(sa_range[1]),
+            signal_length=self.in_dim,
+            theta_min=self.theta_min,
+            theta_max=self.theta_max,
+        )
+        self.wa_slice = _range_to_slice(
+            start_deg=float(wa_range[0]),
+            end_deg=float(wa_range[1]),
+            signal_length=self.in_dim,
+            theta_min=self.theta_min,
+            theta_max=self.theta_max,
+        )
+        in_channels = 2 if self.add_angle_channel else 1
+
+        mamba_cfg = dict(mamba or {})
+        mamba_backend = mamba_cfg.get("backend", "auto")
+        sa_mamba_layers = int(mamba_cfg.get("sa_layers", 0))
+        wa_mamba_layers = int(mamba_cfg.get("wa_layers", 0))
+        common_mamba = dict(
+            mamba_d_state=int(mamba_cfg.get("d_state", 16)),
+            mamba_d_conv=int(mamba_cfg.get("d_conv", 4)),
+            mamba_expand=int(mamba_cfg.get("expand", 2)),
+            mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
+            mamba_backend=mamba_backend,
+        )
+
+        if self.use_sa:
+            self.sa_branch = _DualRangeBranch(
+                in_channels=in_channels,
+                base_channels=sa_base_channels,
+                blocks_per_stage=sa_blocks_per_stage,
+                stem_kernel=stem_kernel,
+                stem_stride=stem_stride,
+                stem_pool=stem_pool,
+                mamba_layers=sa_mamba_layers,
+                **common_mamba,
+            )
+            sa_dim = self.sa_branch.out_dim
+        else:
+            self.sa_branch = None
+            sa_dim = 0
+
+        if self.use_wa:
+            self.wa_branch = _DualRangeBranch(
+                in_channels=in_channels,
+                base_channels=wa_base_channels,
+                blocks_per_stage=wa_blocks_per_stage,
+                stem_kernel=stem_kernel,
+                stem_stride=stem_stride,
+                stem_pool=stem_pool,
+                mamba_layers=wa_mamba_layers,
+                **common_mamba,
+            )
+            wa_dim = self.wa_branch.out_dim
+        else:
+            self.wa_branch = None
+            wa_dim = 0
+
+        fusion_in = sa_dim + wa_dim
+        if self.fusion == "concat" or not (self.use_sa and self.use_wa):
+            fused_dim = fusion_in
+            self.gate = None
+        elif self.fusion == "gated":
+            if sa_dim != wa_dim:
+                proj_dim = max(sa_dim, wa_dim)
+                self.sa_align = nn.Linear(sa_dim, proj_dim) if sa_dim != proj_dim else nn.Identity()
+                self.wa_align = nn.Linear(wa_dim, proj_dim) if wa_dim != proj_dim else nn.Identity()
+                sa_dim = wa_dim = proj_dim
+                fusion_in = sa_dim + wa_dim
+            else:
+                self.sa_align = nn.Identity()
+                self.wa_align = nn.Identity()
+            self.gate = nn.Sequential(
+                nn.LayerNorm(fusion_in),
+                nn.Linear(fusion_in, max(64, fusion_in // 4)),
+                nn.GELU(),
+                nn.Linear(max(64, fusion_in // 4), sa_dim),
+                nn.Sigmoid(),
+            )
+            fused_dim = fusion_in
+        else:
+            raise ValueError("fusion must be concat or gated")
+
+        self.head = _make_head(
+            name=head,
+            in_dim=fused_dim,
+            out_dim=self.num_classes,
+            hidden=head_hidden,
+            dropout=head_dropout,
+            kan_grids=kan_grids,
+        )
+        if self.aux_heads_enabled:
+            if self.use_sa:
+                self.sa_head = _make_head(
+                    name="linear",
+                    in_dim=sa_dim,
+                    out_dim=self.num_classes,
+                    dropout=head_dropout,
+                )
+            if self.use_wa:
+                self.wa_head = _make_head(
+                    name="linear",
+                    in_dim=wa_dim,
+                    out_dim=self.num_classes,
+                    dropout=head_dropout,
+                )
+
+        if self.add_angle_channel:
+            sa_angles = _make_angle_channel(
+                self.sa_slice,
+                signal_length=self.in_dim,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+            )
+            wa_angles = _make_angle_channel(
+                self.wa_slice,
+                signal_length=self.in_dim,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+            )
+            self.register_buffer("sa_angles", sa_angles.view(1, 1, -1), persistent=False)
+            self.register_buffer("wa_angles", wa_angles.view(1, 1, -1), persistent=False)
+
+    def _prepare_branch_input(self, x: torch.Tensor, rng: slice, angle_name: str) -> torch.Tensor:
+        z = x[:, rng]
+        z = z.unsqueeze(1)
+        if self.add_angle_channel:
+            angles = getattr(self, angle_name).expand(z.shape[0], -1, -1)
+            z = torch.cat([z, angles.to(dtype=z.dtype, device=z.device)], dim=1)
+        return z
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | dict[str, torch.Tensor]:
+        if x.ndim == 3:
+            if x.shape[1] != 1:
+                raise ValueError("DualRangePXRDClassifier expects a single intensity channel")
+            x = x.squeeze(1)
+        if x.ndim != 2:
+            raise ValueError(f"expected input shape (B, L), got {tuple(x.shape)}")
+
+        outputs: dict[str, torch.Tensor] = {}
+        parts: list[torch.Tensor] = []
+        f_sa = f_wa = None
+
+        if self.use_sa and self.sa_branch is not None:
+            f_sa = self.sa_branch(self._prepare_branch_input(x, self.sa_slice, "sa_angles"))
+            parts.append(f_sa)
+        if self.use_wa and self.wa_branch is not None:
+            f_wa = self.wa_branch(self._prepare_branch_input(x, self.wa_slice, "wa_angles"))
+            parts.append(f_wa)
+
+        if self.gate is not None and f_sa is not None and f_wa is not None:
+            f_sa = self.sa_align(f_sa)
+            f_wa = self.wa_align(f_wa)
+            gate = self.gate(torch.cat([f_sa, f_wa], dim=-1))
+            fused = torch.cat([gate * f_sa, (1.0 - gate) * f_wa], dim=-1)
+            outputs["gate"] = gate.detach()
+            outputs["gate_mean"] = gate.detach().mean(dim=1)
+        else:
+            fused = torch.cat(parts, dim=-1)
+
+        outputs["logits"] = self.head(fused)
+        if self.aux_heads_enabled:
+            if f_sa is not None and hasattr(self, "sa_head"):
+                outputs["sa_logits"] = self.sa_head(f_sa)
+            if f_wa is not None and hasattr(self, "wa_head"):
+                outputs["wa_logits"] = self.wa_head(f_wa)
+        return outputs if len(outputs) > 1 else outputs["logits"]
+
+
 class BiGRUPatchClassifier(nn.Module):
     """Patch 化 PXRD 序列的双向 GRU 分类器。
 
@@ -332,6 +962,8 @@ class PatchTSTClassifier(nn.Module):
 __all__ = [
     "MLPClassifier",
     "ResNet1D",
+    "DualRangePXRDClassifier",
+    "KANHead",
     "BiGRUPatchClassifier",
     "PatchTSTClassifier",
 ]

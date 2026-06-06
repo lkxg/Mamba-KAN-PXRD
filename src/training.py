@@ -108,12 +108,85 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
+def _positive_class_counts(class_counts: np.ndarray | None, *, name: str) -> np.ndarray:
+    """Return finite positive class counts for prior/logit adjustment losses."""
+    if class_counts is None:
+        raise ValueError(f"`class_counts` required for {name}")
+    counts = np.asarray(class_counts, dtype=np.float64)
+    if counts.ndim != 1:
+        raise ValueError("class_counts must be a 1D array")
+    if np.any(counts < 0):
+        raise ValueError("class_counts must be non-negative")
+    if not np.any(counts > 0):
+        raise ValueError("class_counts must contain at least one positive count")
+    return np.maximum(counts, 1.0)
+
+
+class BalancedSoftmaxLoss(nn.Module):
+    """Balanced Softmax loss using training-set class frequencies."""
+
+    def __init__(
+        self,
+        class_counts: np.ndarray,
+        *,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        counts = _positive_class_counts(class_counts, name="balanced_softmax")
+        self.register_buffer(
+            "log_counts",
+            torch.tensor(np.log(counts), dtype=torch.float32),
+        )
+        self.label_smoothing = float(label_smoothing)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        adjusted = logits + self.log_counts.to(dtype=logits.dtype)
+        return F.cross_entropy(
+            adjusted,
+            target,
+            label_smoothing=self.label_smoothing,
+        )
+
+
+class LogitAdjustedLoss(nn.Module):
+    """Logit-adjusted cross entropy with configurable prior strength."""
+
+    def __init__(
+        self,
+        class_counts: np.ndarray,
+        *,
+        tau: float = 1.0,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if tau < 0:
+            raise ValueError("logit_adjustment_tau must be non-negative")
+        counts = _positive_class_counts(class_counts, name="logit_adjustment")
+        priors = counts / counts.sum()
+        self.register_buffer(
+            "log_priors",
+            torch.tensor(np.log(priors), dtype=torch.float32),
+        )
+        self.tau = float(tau)
+        self.label_smoothing = float(label_smoothing)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        adjusted = logits + self.tau * self.log_priors.to(dtype=logits.dtype)
+        return F.cross_entropy(
+            adjusted,
+            target,
+            label_smoothing=self.label_smoothing,
+        )
+
+
 def build_loss(
     name: Literal[
         "ce",
         "label_smoothing",
         "weighted_ce",
         "class_balanced_ce",
+        "balanced_softmax",
+        "logit_adjustment",
         "focal",
     ] = "ce",
     *,
@@ -122,6 +195,7 @@ def build_loss(
     label_smoothing: float = 0.0,
     class_weight_power: float = 0.5,
     class_weight_beta: float = 0.99,
+    logit_adjustment_tau: float = 1.0,
 ) -> nn.Module:
     """根据名称构建损失函数。
 
@@ -131,12 +205,15 @@ def build_loss(
               - "label_smoothing": 带标签平滑的交叉熵损失
               - "weighted_ce": 加权交叉熵，权重为 1/sqrt(类别样本数)
               - "class_balanced_ce": 有效样本数加权交叉熵
+              - "balanced_softmax": 按训练类别频数调整 softmax 分母
+              - "logit_adjustment": 按训练类别先验调整 logits
               - "focal": Focal Loss
         class_counts: 各类别的样本数量，用于计算加权交叉熵的权重
         gamma: Focal Loss 的聚焦参数
         label_smoothing: 标签平滑参数，用于防止过拟合
         class_weight_power: weighted_ce 的类别频数指数
         class_weight_beta: class_balanced_ce 的有效样本数 beta
+        logit_adjustment_tau: logit_adjustment 的类别先验强度
 
     返回:
         PyTorch 损失函数模块
@@ -173,6 +250,17 @@ def build_loss(
         weights[present] = weights[present] / weights[present].mean()
         w_tensor = torch.tensor(weights, dtype=torch.float32)
         return nn.CrossEntropyLoss(weight=w_tensor, label_smoothing=label_smoothing)
+    if name == "balanced_softmax":
+        return BalancedSoftmaxLoss(
+            class_counts,
+            label_smoothing=label_smoothing,
+        )
+    if name == "logit_adjustment":
+        return LogitAdjustedLoss(
+            class_counts,
+            tau=logit_adjustment_tau,
+            label_smoothing=label_smoothing,
+        )
     if name == "focal":
         return FocalLoss(gamma=gamma)
     raise ValueError(f"unknown loss: {name!r}")
@@ -191,6 +279,10 @@ class StepStats:
     correct_top5: int    # Top-5 正确预测数
     class_correct_top1: np.ndarray | None = None
     class_total: np.ndarray | None = None
+    aux_loss: float = 0.0
+    gate_mean: float | None = None
+    rare_correct_top1: int | None = None
+    rare_total: int | None = None
 
     @property
     def acc1(self) -> float:
@@ -213,6 +305,13 @@ class StepStats:
         per_class = self.class_correct_top1[present] / self.class_total[present]
         return float(per_class.mean())
 
+    @property
+    def rare_acc1(self) -> float:
+        """Top-1 accuracy on classes marked rare by the training split."""
+        if self.rare_correct_top1 is None or self.rare_total is None:
+            return float("nan")
+        return self.rare_correct_top1 / max(self.rare_total, 1)
+
 
 def _accuracy_topk(logits: torch.Tensor, target: torch.Tensor, k: int = 5) -> int:
     """计算 Top-k 准确率。
@@ -232,6 +331,67 @@ def _accuracy_topk(logits: torch.Tensor, target: torch.Tensor, k: int = 5) -> in
     return int((top == target.unsqueeze(1)).any(dim=1).sum().item())
 
 
+def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the primary classification logits from a tensor or model dict."""
+    if isinstance(output, dict):
+        return output["logits"]
+    return output
+
+
+def loss_with_auxiliary(
+    output: torch.Tensor | dict[str, torch.Tensor],
+    target: torch.Tensor,
+    loss_fn: nn.Module,
+    *,
+    aux_weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute main loss plus optional branch auxiliary losses."""
+    logits = primary_logits(output)
+    main_loss = loss_fn(logits, target)
+    aux_loss = logits.sum() * 0.0
+    if isinstance(output, dict):
+        weights = aux_weights or {}
+        for key in ("sa_logits", "wa_logits"):
+            weight = float(weights.get(key, 0.0))
+            if weight > 0 and key in output:
+                aux_loss = aux_loss + weight * loss_fn(output[key], target)
+    return main_loss + aux_loss, logits, aux_loss.detach()
+
+
+def output_gate_mean(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor | None:
+    """Return batch gate means when a gated dual-range model exposes them."""
+    if isinstance(output, dict) and "gate_mean" in output:
+        return output["gate_mean"].detach()
+    return None
+
+
+def rare_classes_from_counts(
+    class_counts: np.ndarray | None,
+    *,
+    max_count: int,
+    min_count: int = 1,
+) -> set[int]:
+    """Return 0-based class ids treated as rare under the training split."""
+    if class_counts is None:
+        return set()
+    max_count = int(max_count)
+    min_count = int(min_count)
+    return {
+        int(i)
+        for i, c in enumerate(class_counts)
+        if int(c) >= min_count and int(c) <= max_count
+    }
+
+
+def aux_loss_weights_from_model(model: nn.Module) -> dict[str, float]:
+    """Read optional auxiliary loss weights from a raw or compiled model."""
+    candidate = getattr(model, "_orig_mod", model)
+    weights = getattr(candidate, "aux_loss_weights", None)
+    if not weights:
+        return {}
+    return {str(k): float(v) for k, v in dict(weights).items() if float(v) > 0}
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -245,6 +405,8 @@ def train_one_epoch(
     progress_callback=None,
     use_amp: bool | None = None,
     amp_dtype: torch.dtype | None = None,
+    aux_loss_weights: dict[str, float] | None = None,
+    rare_classes: set[int] | None = None,
 ) -> StepStats:
     """训练一个 epoch。
 
@@ -264,7 +426,11 @@ def train_one_epoch(
     """
     model.train()
     total_loss = 0.0
+    total_aux_loss = 0.0
     n = correct1 = correct5 = 0
+    rare_correct1 = rare_total = 0
+    gate_sum = 0.0
+    gate_count = 0
     if use_amp is None:
         use_amp = scaler is not None
     use_scaler = scaler is not None and scaler.is_enabled()
@@ -283,8 +449,13 @@ def train_one_epoch(
             enabled=use_amp,
             dtype=amp_dtype,
         ):
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            output = model(x)
+            loss, logits, aux_loss = loss_with_auxiliary(
+                output,
+                y,
+                loss_fn,
+                aux_weights=aux_loss_weights,
+            )
 
         # 反向传播
         if use_scaler:
@@ -303,16 +474,38 @@ def train_one_epoch(
         # 统计信息
         bsz = y.size(0)
         total_loss += float(loss.item()) * bsz
+        total_aux_loss += float(aux_loss.item()) * bsz
         n += bsz
         correct1 += _accuracy_topk(logits.detach(), y, k=1)
         correct5 += _accuracy_topk(logits.detach(), y, k=5)
+        if rare_classes:
+            pred = logits.detach().argmax(dim=1)
+            rare_mask = torch.zeros_like(y, dtype=torch.bool)
+            for cls in rare_classes:
+                rare_mask |= y == int(cls)
+            if rare_mask.any():
+                rare_total += int(rare_mask.sum().item())
+                rare_correct1 += int((pred[rare_mask] == y[rare_mask]).sum().item())
+
+        gate_mean = output_gate_mean(output)
+        if gate_mean is not None:
+            gate_sum += float(gate_mean.float().sum().item())
+            gate_count += int(gate_mean.numel())
 
         # 进度回调
         if progress_callback is not None and (step % log_every == 0):
             progress_callback(step, total_loss / max(n, 1), correct1 / max(n, 1))
 
-    return StepStats(loss=total_loss / max(n, 1), n=n,
-                     correct_top1=correct1, correct_top5=correct5)
+    return StepStats(
+        loss=total_loss / max(n, 1),
+        n=n,
+        correct_top1=correct1,
+        correct_top5=correct5,
+        aux_loss=total_aux_loss / max(n, 1),
+        gate_mean=(gate_sum / gate_count) if gate_count else None,
+        rare_correct_top1=rare_correct1 if rare_classes else None,
+        rare_total=rare_total if rare_classes else None,
+    )
 
 
 @torch.no_grad()
@@ -324,6 +517,8 @@ def evaluate(
     *,
     use_amp: bool = True,
     amp_dtype: torch.dtype | None = None,
+    aux_loss_weights: dict[str, float] | None = None,
+    rare_classes: set[int] | None = None,
 ) -> StepStats:
     """在验证集或测试集上评估模型。
 
@@ -339,7 +534,11 @@ def evaluate(
     """
     model.eval()
     total_loss = 0.0
+    total_aux_loss = 0.0
     n = correct1 = correct5 = 0
+    rare_correct1 = rare_total = 0
+    gate_sum = 0.0
+    gate_count = 0
     class_correct1: np.ndarray | None = None
     class_total: np.ndarray | None = None
 
@@ -352,11 +551,17 @@ def evaluate(
             enabled=use_amp,
             dtype=amp_dtype,
         ):
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            output = model(x)
+            loss, logits, aux_loss = loss_with_auxiliary(
+                output,
+                y,
+                loss_fn,
+                aux_weights=aux_loss_weights,
+            )
 
         bsz = y.size(0)
         total_loss += float(loss.item()) * bsz
+        total_aux_loss += float(aux_loss.item()) * bsz
         n += bsz
         correct1 += _accuracy_topk(logits, y, k=1)
         correct5 += _accuracy_topk(logits, y, k=5)
@@ -374,15 +579,35 @@ def evaluate(
             y_cpu[correct_mask].numpy(),
             minlength=num_classes,
         )
+        if rare_classes:
+            rare_mask = np.isin(y_cpu.numpy(), list(rare_classes))
+            rare_total += int(rare_mask.sum())
+            if rare_mask.any():
+                rare_correct1 += int((pred_cpu.numpy()[rare_mask] == y_cpu.numpy()[rare_mask]).sum())
 
-    return StepStats(loss=total_loss / max(n, 1), n=n,
-                     correct_top1=correct1, correct_top5=correct5,
-                     class_correct_top1=class_correct1,
-                     class_total=class_total)
+        gate_mean = output_gate_mean(output)
+        if gate_mean is not None:
+            gate_sum += float(gate_mean.float().sum().item())
+            gate_count += int(gate_mean.numel())
+
+    return StepStats(
+        loss=total_loss / max(n, 1),
+        n=n,
+        correct_top1=correct1,
+        correct_top5=correct5,
+        class_correct_top1=class_correct1,
+        class_total=class_total,
+        aux_loss=total_aux_loss / max(n, 1),
+        gate_mean=(gate_sum / gate_count) if gate_count else None,
+        rare_correct_top1=rare_correct1 if rare_classes else None,
+        rare_total=rare_total if rare_classes else None,
+    )
 
 
 __all__ = [
     "configure_backend", "amp_dtype_from_config",
     "FocalLoss", "build_loss",
-    "StepStats", "train_one_epoch", "evaluate",
+    "StepStats", "primary_logits", "loss_with_auxiliary",
+    "rare_classes_from_counts", "aux_loss_weights_from_model",
+    "train_one_epoch", "evaluate",
 ]

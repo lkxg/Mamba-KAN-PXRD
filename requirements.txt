@@ -20,9 +20,8 @@ matplotlib>=3.8,<3.11
 tensorboard>=2.17,<2.21
 wandb>=0.17,<1
 
-# Optional: Mamba (uncomment when wiring the Mamba-KAN model)
-# mamba-ssm>=2.2
-# causal-conv1d>=1.2
+# Optional CUDA Mamba backend for formal E10/E12/E13 runs:
+# install requirements-mamba.txt on the CUDA/H100 runner.
 
 # Optional: KAN reference implementations
 # efficient-kan

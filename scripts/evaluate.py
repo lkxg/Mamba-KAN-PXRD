@@ -6,14 +6,23 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+mpl_config_dir = Path(os.environ.get("MPLCONFIGDIR", Path(tempfile.gettempdir()) / "matplotlib"))
+mpl_config_dir.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import confusion_matrix, f1_score
 from torch.utils.data import DataLoader
@@ -22,17 +31,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import PXRDDataset, class_counts_for_rows, load_splits
+from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
 from src.models import (
     BiGRUPatchClassifier,
+    DualRangePXRDClassifier,
     MLPClassifier,
     PatchTSTClassifier,
     ResNet1D,
 )
 from src.training import (
     amp_dtype_from_config,
+    aux_loss_weights_from_model,
     build_loss,
     configure_backend,
+    loss_with_auxiliary,
+    output_gate_mean,
+    rare_classes_from_counts,
     StepStats,
 )
 from src.utils import set_seed
@@ -66,6 +80,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
                              **cfg["model"].get("mlp", {}))
     if name == "resnet1d":
         return ResNet1D(num_classes=num_classes, **cfg["model"].get("resnet1d", {}))
+    if name == "dual_range":
+        return DualRangePXRDClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("dual_range", {}),
+        )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(
             in_dim=in_dim,
@@ -101,6 +121,57 @@ def sparse_ticks(n: int, max_ticks: int = 40) -> np.ndarray:
     return ticks
 
 
+def angle_range_to_slice(
+    *,
+    start_deg: float,
+    end_deg: float,
+    signal_length: int,
+    theta_min: float = 5.0,
+    theta_max: float = 90.0,
+) -> slice:
+    """Map a 2theta interval to sampled PXRD indices."""
+    if signal_length <= 1:
+        return slice(0, signal_length)
+    if theta_min >= theta_max:
+        raise ValueError("theta_min must be smaller than theta_max")
+    start = max(float(start_deg), float(theta_min))
+    end = min(float(end_deg), float(theta_max))
+    if start >= end:
+        raise ValueError(
+            f"empty 2theta range [{start_deg}, {end_deg}] for "
+            f"coverage [{theta_min}, {theta_max}]"
+        )
+    step = (theta_max - theta_min) / (signal_length - 1)
+    left = int(math.floor((start - theta_min) / step))
+    right = int(math.ceil((end - theta_min) / step)) + 1
+    left = max(0, min(signal_length - 1, left))
+    right = max(left + 1, min(signal_length, right))
+    return slice(left, right)
+
+
+class MaskAngleRange:
+    """Zero out a fixed 2theta interval for occlusion analysis."""
+
+    def __init__(self, rng: slice, fill_value: float = 0.0) -> None:
+        self.rng = rng
+        self.fill_value = float(fill_value)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        out = x.clone()
+        out[self.rng] = self.fill_value
+        return out
+
+
+def rows_metadata(labels_csv: str | Path, rows: np.ndarray) -> pd.DataFrame:
+    """Load labels metadata for a sequence of dataset rows."""
+    meta = pd.read_csv(
+        labels_csv,
+        usecols=["row", "space_group", "crystal_system", "crystal_system_id"],
+    ).set_index("row")
+    selected = meta.loc[np.asarray(rows, dtype=np.int64)].reset_index()
+    return selected
+
+
 @torch.no_grad()
 def evaluate_with_predictions(
     model: torch.nn.Module,
@@ -111,13 +182,20 @@ def evaluate_with_predictions(
     use_amp: bool = True,
     amp_dtype: torch.dtype | None = None,
     max_topk: int = 10,
+    aux_loss_weights: dict[str, float] | None = None,
+    rare_classes: set[int] | None = None,
 ) -> tuple[StepStats, dict[str, np.ndarray]]:
     """评估模型，同时收集绘图所需的预测结果。"""
     model.eval()
     total_loss = 0.0
+    total_aux_loss = 0.0
     n = 0
     correct1 = 0
     correct5 = 0
+    rare_correct1 = 0
+    rare_total = 0
+    gate_sum = 0.0
+    gate_count = 0
     class_correct1: np.ndarray | None = None
     class_total: np.ndarray | None = None
     topk_correct: np.ndarray | None = None
@@ -127,6 +205,7 @@ def evaluate_with_predictions(
     top1_conf_parts: list[np.ndarray] = []
     true_conf_parts: list[np.ndarray] = []
     correct_parts: list[np.ndarray] = []
+    gate_mean_parts: list[np.ndarray] = []
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -137,8 +216,13 @@ def evaluate_with_predictions(
             enabled=use_amp,
             dtype=amp_dtype,
         ):
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            output = model(x)
+            loss, logits, aux_loss = loss_with_auxiliary(
+                output,
+                y,
+                loss_fn,
+                aux_weights=aux_loss_weights,
+            )
 
         bsz = y.size(0)
         num_classes = logits.shape[1]
@@ -152,6 +236,7 @@ def evaluate_with_predictions(
         correct_mask = pred == y
 
         total_loss += float(loss.item()) * bsz
+        total_aux_loss += float(aux_loss.item()) * bsz
         n += bsz
         correct1 += int(correct_mask.sum().item())
         correct5 += int((top_idx[:, :top5] == y.unsqueeze(1)).any(dim=1).sum().item())
@@ -175,6 +260,18 @@ def evaluate_with_predictions(
             y_cpu[correct_cpu].numpy(),
             minlength=num_classes,
         )
+        if rare_classes:
+            rare_mask = np.isin(y_np, list(rare_classes))
+            rare_total += int(rare_mask.sum())
+            if rare_mask.any():
+                rare_correct1 += int((pred_cpu.numpy()[rare_mask] == y_np[rare_mask]).sum())
+
+        gate_mean = output_gate_mean(output)
+        if gate_mean is not None:
+            gate_mean_cpu = gate_mean.float().detach().cpu().numpy()
+            gate_mean_parts.append(gate_mean_cpu)
+            gate_sum += float(gate_mean_cpu.sum())
+            gate_count += int(gate_mean_cpu.size)
 
         y_true_parts.append(y_np)
         y_pred_parts.append(pred_cpu.numpy())
@@ -195,6 +292,9 @@ def evaluate_with_predictions(
         ),
         "correct": np.concatenate(correct_parts) if correct_parts else np.array([]),
         "topk_correct": topk_correct if topk_correct is not None else np.array([]),
+        "gate_mean": (
+            np.concatenate(gate_mean_parts) if gate_mean_parts else np.array([])
+        ),
     }
     stats = StepStats(
         loss=total_loss / max(n, 1),
@@ -203,6 +303,10 @@ def evaluate_with_predictions(
         correct_top5=correct5,
         class_correct_top1=class_correct1,
         class_total=class_total,
+        aux_loss=total_aux_loss / max(n, 1),
+        gate_mean=(gate_sum / gate_count) if gate_count else None,
+        rare_correct_top1=rare_correct1 if rare_classes else None,
+        rare_total=rare_total if rare_classes else None,
     )
     return stats, outputs
 
@@ -378,6 +482,181 @@ def save_topk_accuracy(
     plt.close(fig)
 
 
+def save_gate_mean_distribution(
+    gate_mean: np.ndarray,
+    out_path: Path,
+) -> None:
+    """保存 gated SA/WA fusion 的样本级 gate 均值分布。"""
+    gate_mean = np.asarray(gate_mean, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    bins = np.linspace(0.0, 1.0, 26)
+    ax.hist(gate_mean, bins=bins, color="#72b7b2", alpha=0.82)
+    mean = float(gate_mean.mean()) if gate_mean.size else float("nan")
+    if gate_mean.size:
+        ax.axvline(mean, color="#e45756", lw=1.8, label=f"Mean={mean:.3f}")
+        ax.legend()
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Mean gate value per sample (SA weight; WA weight = 1 - gate)")
+    ax.set_ylabel("Samples")
+    ax.set_title("SA/WA Gate Mean Distribution")
+    ax.grid(axis="y", alpha=0.25)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def save_gate_by_crystal_system(
+    gate_mean: np.ndarray,
+    metadata: pd.DataFrame,
+    out_path: Path,
+) -> pd.DataFrame:
+    """保存不同晶系的 gate 均值，并返回汇总表。"""
+    gate_mean = np.asarray(gate_mean, dtype=np.float64)
+    if gate_mean.size == 0:
+        return pd.DataFrame()
+
+    df = metadata.copy()
+    df["gate_mean"] = gate_mean
+    summary = (
+        df.groupby(["crystal_system_id", "crystal_system"], dropna=False)["gate_mean"]
+        .agg(["count", "mean", "std", "median"])
+        .reset_index()
+        .sort_values("crystal_system_id")
+    )
+    summary["std"] = summary["std"].fillna(0.0)
+
+    fig, ax = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+    x = np.arange(len(summary))
+    ax.bar(x, summary["mean"], color="#4c78a8", width=0.72)
+    ax.errorbar(
+        x,
+        summary["mean"],
+        yerr=summary["std"],
+        fmt="none",
+        ecolor="#333333",
+        elinewidth=1.1,
+        capsize=3,
+    )
+    ax.axhline(0.5, color="#e45756", lw=1.2, ls="--")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        summary["crystal_system"].astype(str).to_list(),
+        rotation=30,
+        ha="right",
+    )
+    ax.set_xlabel("Crystal system")
+    ax.set_ylabel("Mean gate value per sample (SA weight)")
+    ax.set_title("Gate Mean by Crystal System")
+    ax.grid(axis="y", alpha=0.25)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return summary
+
+
+def save_per_class_metrics(
+    stats: StepStats,
+    labels: list[str],
+    out_path: Path,
+    *,
+    rare_classes: set[int] | None = None,
+) -> None:
+    """保存每类样本数、正确数、准确率和 rare 标记。"""
+    rare_classes = rare_classes or set()
+    total = (
+        stats.class_total
+        if stats.class_total is not None
+        else np.zeros(len(labels), dtype=np.int64)
+    )
+    correct = (
+        stats.class_correct_top1
+        if stats.class_correct_top1 is not None
+        else np.zeros(len(labels), dtype=np.int64)
+    )
+    acc = np.divide(
+        correct,
+        total,
+        out=np.full(len(labels), np.nan, dtype=np.float64),
+        where=total > 0,
+    )
+    rows = pd.DataFrame({
+        "class_id": np.arange(len(labels)),
+        "label": labels,
+        "total": total,
+        "correct_top1": correct,
+        "acc1": acc,
+        "is_rare": [i in rare_classes for i in range(len(labels))],
+    })
+    rows.to_csv(out_path, index=False)
+
+
+def save_confusion_cases(
+    outputs: dict[str, np.ndarray],
+    metadata: pd.DataFrame,
+    labels: list[str],
+    out_path: Path,
+    *,
+    max_rows: int = 100,
+) -> None:
+    """保存高置信度错分案例，便于回看混淆空间群。"""
+    y_true = outputs["y_true"].astype(np.int64)
+    y_pred = outputs["y_pred"].astype(np.int64)
+    correct = outputs["correct"].astype(bool)
+    df = metadata.copy()
+    df["true_class_id"] = y_true
+    df["pred_class_id"] = y_pred
+    df["true_label"] = [labels[i] for i in y_true]
+    df["pred_label"] = [labels[i] for i in y_pred]
+    df["top1_conf"] = outputs["top1_conf"]
+    df["true_conf"] = outputs["true_conf"]
+    df["confidence_margin"] = df["top1_conf"] - df["true_conf"]
+    if outputs.get("gate_mean", np.array([])).size == len(df):
+        df["gate_mean"] = outputs["gate_mean"]
+
+    wrong = df.loc[~correct].copy()
+    if wrong.empty:
+        wrong.head(0).to_csv(out_path, index=False)
+        return
+    wrong.sort_values(
+        ["top1_conf", "confidence_margin"],
+        ascending=False,
+    ).head(max_rows).to_csv(out_path, index=False)
+
+
+def save_confusion_pair_summary(
+    outputs: dict[str, np.ndarray],
+    labels: list[str],
+    out_path: Path,
+    *,
+    max_rows: int = 100,
+) -> None:
+    """保存最常见的 true/pred 混淆对。"""
+    y_true = outputs["y_true"].astype(np.int64)
+    y_pred = outputs["y_pred"].astype(np.int64)
+    wrong = y_true != y_pred
+    if not wrong.any():
+        pd.DataFrame(
+            columns=["true_class_id", "pred_class_id", "true_label", "pred_label", "count"]
+        ).to_csv(out_path, index=False)
+        return
+
+    pairs = pd.DataFrame({
+        "true_class_id": y_true[wrong],
+        "pred_class_id": y_pred[wrong],
+    })
+    summary = (
+        pairs.value_counts(["true_class_id", "pred_class_id"])
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+        .head(max_rows)
+    )
+    summary["true_label"] = [labels[i] for i in summary["true_class_id"]]
+    summary["pred_label"] = [labels[i] for i in summary["pred_class_id"]]
+    summary = summary[
+        ["true_class_id", "pred_class_id", "true_label", "pred_label", "count"]
+    ]
+    summary.to_csv(out_path, index=False)
+
+
 def save_eval_plots(
     outputs: dict[str, np.ndarray],
     stats: StepStats,
@@ -385,6 +664,8 @@ def save_eval_plots(
     task: str,
     num_classes: int,
     out_dir: Path,
+    metadata: pd.DataFrame | None = None,
+    rare_classes: set[int] | None = None,
 ) -> list[Path]:
     """生成并保存评估图表。"""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +691,28 @@ def save_eval_plots(
     save_class_distribution(y_true, y_pred, labels, paths[2])
     save_confidence_histogram(outputs["top1_conf"], outputs["correct"], paths[3])
     save_topk_accuracy(outputs["topk_correct"], stats.n, paths[4])
+    per_class_path = out_dir / "per_class_metrics.csv"
+    save_per_class_metrics(stats, labels, per_class_path, rare_classes=rare_classes)
+    paths.append(per_class_path)
+
+    gate_mean = outputs.get("gate_mean", np.array([]))
+    if gate_mean.size:
+        path = out_dir / "06_gate_mean_distribution.png"
+        save_gate_mean_distribution(gate_mean, path)
+        paths.append(path)
+        if metadata is not None:
+            system_path = out_dir / "07_gate_by_crystal_system.png"
+            gate_summary = save_gate_by_crystal_system(gate_mean, metadata, system_path)
+            if not gate_summary.empty:
+                gate_summary.to_csv(out_dir / "gate_by_crystal_system.csv", index=False)
+                paths.append(system_path)
+
+    if metadata is not None:
+        cases_path = out_dir / "confusion_cases.csv"
+        pairs_path = out_dir / "confusion_pairs.csv"
+        save_confusion_cases(outputs, metadata, labels, cases_path)
+        save_confusion_pair_summary(outputs, labels, pairs_path)
+        paths.extend([cases_path, pairs_path])
     return paths
 
 
@@ -434,6 +737,53 @@ def main():
         default=10,
         help="Top-k 准确率曲线最大 k 值",
     )
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "test"],
+        default="test",
+        help="评估的数据划分，默认 test",
+    )
+    ap.add_argument(
+        "--only-rare",
+        action="store_true",
+        help="只评估训练集频数定义下的 rare classes 样本",
+    )
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="仅评估测试集前 N 个样本；用于快速烟测，默认全量测试集",
+    )
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="覆盖 checkpoint 配置中的评估 batch size",
+    )
+    ap.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="覆盖 checkpoint 配置中的 DataLoader num_workers；烟测可设为 0",
+    )
+    ap.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="评估时禁用 pin_memory",
+    )
+    ap.add_argument(
+        "--skip-occlusion",
+        action="store_true",
+        help="跳过默认 5-15 度低角遮挡复评",
+    )
+    ap.add_argument(
+        "--occlusion-range",
+        type=float,
+        nargs=2,
+        default=(5.0, 15.0),
+        metavar=("START_DEG", "END_DEG"),
+        help="低角遮挡实验的 2theta 范围，默认 5 15",
+    )
     args = ap.parse_args()
 
     # ---------- 加载检查点 ----------
@@ -445,18 +795,66 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configure_backend(cfg, device)
 
-    # ---------- 加载测试数据 ----------
+    # ---------- 加载评估数据 ----------
     splits = load_splits(cfg["data"]["splits_csv"])
     task = cfg["data"]["task"]
-    test_ds = PXRDDataset(cfg["data"]["root"], rows=splits["test"], task=task)
-    loader_kwargs = dict(
-        batch_size=cfg["data"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=cfg["data"]["pin_memory"],
-        persistent_workers=cfg["data"]["num_workers"] > 0,
+    class_counts = class_counts_for_rows(
+        Path(cfg["data"]["root"]) / "labels.csv",
+        splits["train"],
+        task,
     )
-    if cfg["data"]["num_workers"] > 0:
+    metrics_cfg = cfg.get("metrics", {})
+    rare_max_count = int(ckpt.get(
+        "rare_max_train_count",
+        metrics_cfg.get("rare_max_train_count", 100),
+    ))
+    rare_min_count = int(ckpt.get(
+        "rare_min_train_count",
+        metrics_cfg.get("rare_min_train_count", 1),
+    ))
+    rare_classes = rare_classes_from_counts(
+        class_counts,
+        max_count=rare_max_count,
+        min_count=rare_min_count,
+    )
+
+    test_rows = splits[args.split]
+    if args.only_rare:
+        y_eval = labels_for_rows(
+            Path(cfg["data"]["root"]) / "labels.csv",
+            test_rows,
+            task,
+        )
+        test_rows = test_rows[np.isin(y_eval, list(rare_classes))]
+        if len(test_rows) == 0:
+            raise ValueError(f"{args.split} split has no rare-class samples")
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("--max-samples must be positive")
+        test_rows = test_rows[:args.max_samples]
+    test_ds = PXRDDataset(cfg["data"]["root"], rows=test_rows, task=task)
+    batch_size = (
+        int(args.batch_size)
+        if args.batch_size is not None
+        else int(cfg["data"]["batch_size"])
+    )
+    num_workers = (
+        int(args.num_workers)
+        if args.num_workers is not None
+        else int(cfg["data"]["num_workers"])
+    )
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=bool(cfg["data"]["pin_memory"]) and not args.no_pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+    if num_workers > 0:
         loader_kwargs["prefetch_factor"] = cfg["data"].get("prefetch_factor", 2)
     test_loader = DataLoader(test_ds, **loader_kwargs)
 
@@ -466,23 +864,45 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     print(f"Loaded checkpoint from epoch {ckpt['epoch']}, "
           f"val acc1={ckpt.get('val_acc1', float('nan')):.4f}")
+    sa_mamba_backend = ""
+    wa_mamba_backend = ""
+    if hasattr(model, "sa_branch") and getattr(model, "sa_branch") is not None:
+        sa_mamba_backend = str(model.sa_branch.actual_mamba_backend)
+        print(f"  SA mixer backend: {sa_mamba_backend}")
+    if hasattr(model, "wa_branch") and getattr(model, "wa_branch") is not None:
+        wa_mamba_backend = str(model.wa_branch.actual_mamba_backend)
+        print(f"  WA mixer backend: {wa_mamba_backend}")
+    aux_loss_weights = aux_loss_weights_from_model(model)
+    if aux_loss_weights:
+        print(f"Aux losses: {aux_loss_weights}")
 
-    # ---------- 在测试集上评估 ----------
-    class_counts = None
+    # ---------- 在评估集上评估 ----------
     loss_name = cfg["loss"]["name"].lower()
-    if loss_name in {"weighted_ce", "class_balanced_ce"}:
-        class_counts = class_counts_for_rows(
-            Path(cfg["data"]["root"]) / "labels.csv",
-            splits["train"],
-            task,
-        )
+    print(
+        f"Rare classes: {len(rare_classes)} "
+        f"(train count {rare_min_count}-{rare_max_count})"
+    )
+    print(
+        f"Eval split: {args.split}"
+        f"{' rare-only' if args.only_rare else ''}  N={len(test_ds)}"
+    )
     loss_fn = build_loss(
         loss_name,
-        class_counts=class_counts,
+        class_counts=(
+            class_counts
+            if loss_name in {
+                "weighted_ce",
+                "class_balanced_ce",
+                "balanced_softmax",
+                "logit_adjustment",
+            }
+            else None
+        ),
         gamma=cfg["loss"].get("focal_gamma", 2.0),
         label_smoothing=cfg["loss"].get("label_smoothing", 0.0),
         class_weight_power=cfg["loss"].get("class_weight_power", 0.5),
         class_weight_beta=cfg["loss"].get("class_weight_beta", 0.99),
+        logit_adjustment_tau=cfg["loss"].get("logit_adjustment_tau", 1.0),
     ).to(device)
     use_amp = cfg["train"].get("amp", True) and device.type == "cuda"
     amp_dtype = amp_dtype_from_config(cfg["train"].get("amp_dtype", "float16"), device)
@@ -491,6 +911,8 @@ def main():
         use_amp=use_amp,
         amp_dtype=amp_dtype,
         max_topk=max(1, args.topk_plot_max),
+        aux_loss_weights=aux_loss_weights,
+        rare_classes=rare_classes,
     )
     macro_f1 = f1_score(
         outputs["y_true"],
@@ -503,24 +925,124 @@ def main():
     # 打印测试结果
     print(f"Test loss={stats.loss:.4f}  acc1={stats.acc1:.4f}  "
           f"acc5={stats.acc5:.4f}  macro={stats.macro_acc1:.4f}  "
-          f"macro_f1={macro_f1:.4f}  (N={stats.n})")
+          f"macro_f1={macro_f1:.4f}  rare={stats.rare_acc1:.4f}  "
+          f"aux={stats.aux_loss:.4f}  "
+          f"gate={stats.gate_mean if stats.gate_mean is not None else float('nan'):.4f}  "
+          f"(N={stats.n})")
+
+    plot_dir = (
+        Path(args.plot_dir)
+        if args.plot_dir is not None
+        else Path(args.checkpoint).resolve().parent / "eval_plots"
+    )
+    metadata = rows_metadata(Path(cfg["data"]["root"]) / "labels.csv", test_ds.rows)
+    metrics = {
+        "checkpoint": str(Path(args.checkpoint)),
+        "epoch": int(ckpt["epoch"]),
+        "task": task,
+        "split": args.split,
+        "only_rare": bool(args.only_rare),
+        "sa_mamba_backend": sa_mamba_backend or None,
+        "wa_mamba_backend": wa_mamba_backend or None,
+        "n": int(stats.n),
+        "loss": float(stats.loss),
+        "acc1": float(stats.acc1),
+        "acc5": float(stats.acc5),
+        "macro_acc1": float(stats.macro_acc1),
+        "macro_f1": float(macro_f1),
+        "rare_acc1": float(stats.rare_acc1),
+        "rare_total": int(stats.rare_total or 0),
+        "rare_class_count": int(len(rare_classes)),
+        "aux_loss": float(stats.aux_loss),
+        "gate_mean": (
+            float(stats.gate_mean)
+            if stats.gate_mean is not None
+            else None
+        ),
+    }
 
     if not args.no_plots:
-        plot_dir = (
-            Path(args.plot_dir)
-            if args.plot_dir is not None
-            else Path(args.checkpoint).resolve().parent / "eval_plots"
-        )
         plot_paths = save_eval_plots(
             outputs,
             stats,
             task=task,
             num_classes=test_ds.num_classes,
             out_dir=plot_dir,
+            metadata=metadata,
+            rare_classes=rare_classes,
         )
         print(f"Saved evaluation plots to {plot_dir}")
         for path in plot_paths:
             print(f"  {path.name}")
+
+    if not args.skip_occlusion:
+        occ_start, occ_end = args.occlusion_range
+        occ_slice = angle_range_to_slice(
+            start_deg=occ_start,
+            end_deg=occ_end,
+            signal_length=test_ds.signal_length,
+        )
+        occ_ds = PXRDDataset(
+            cfg["data"]["root"],
+            rows=test_ds.rows,
+            task=task,
+            transform=MaskAngleRange(occ_slice),
+        )
+        occ_loader = DataLoader(occ_ds, **loader_kwargs)
+        occ_stats, occ_outputs = evaluate_with_predictions(
+            model,
+            occ_loader,
+            loss_fn,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            max_topk=max(1, args.topk_plot_max),
+            aux_loss_weights=aux_loss_weights,
+            rare_classes=rare_classes,
+        )
+        occ_macro_f1 = f1_score(
+            occ_outputs["y_true"],
+            occ_outputs["y_pred"],
+            labels=np.arange(test_ds.num_classes),
+            average="macro",
+            zero_division=0,
+        )
+        metrics["occlusion"] = {
+            "range_deg": [float(occ_start), float(occ_end)],
+            "loss": float(occ_stats.loss),
+            "acc1": float(occ_stats.acc1),
+            "acc5": float(occ_stats.acc5),
+            "macro_acc1": float(occ_stats.macro_acc1),
+            "macro_f1": float(occ_macro_f1),
+            "rare_acc1": float(occ_stats.rare_acc1),
+            "aux_loss": float(occ_stats.aux_loss),
+            "gate_mean": (
+                float(occ_stats.gate_mean)
+                if occ_stats.gate_mean is not None
+                else None
+            ),
+            "delta_acc1": float(occ_stats.acc1 - stats.acc1),
+            "delta_macro_acc1": float(occ_stats.macro_acc1 - stats.macro_acc1),
+            "delta_macro_f1": float(occ_macro_f1 - macro_f1),
+            "delta_rare_acc1": float(occ_stats.rare_acc1 - stats.rare_acc1),
+        }
+        print(
+            f"Occlusion {occ_start:.1f}-{occ_end:.1f} deg  "
+            f"acc1={occ_stats.acc1:.4f}  acc5={occ_stats.acc5:.4f}  "
+            f"macro={occ_stats.macro_acc1:.4f}  macro_f1={occ_macro_f1:.4f}  "
+            f"rare={occ_stats.rare_acc1:.4f}  "
+            f"delta_acc1={occ_stats.acc1 - stats.acc1:+.4f}  "
+            f"delta_macro={occ_stats.macro_acc1 - stats.macro_acc1:+.4f}"
+        )
+
+    if not args.no_plots:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = plot_dir / "metrics.json"
+        metrics_path.write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"  {metrics_path.name}")
 
 
 if __name__ == "__main__":
