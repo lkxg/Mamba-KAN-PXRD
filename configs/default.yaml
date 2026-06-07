@@ -42,7 +42,6 @@ train:
   log_every: 50                 # 日志打印频率（每多少批次打印一次）
 
 logging:
-  tensorboard: true              # 同时保留本地 TensorBoard 日志
   wandb:
     enabled: true                # 训练指标同步到 wandb.ai；不需要时改为 false
     project: mamba-kan-pxrd      # W&B project 名称

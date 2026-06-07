@@ -42,7 +42,7 @@ from src.models import (
 from src.training import (
     amp_dtype_from_config,
     aux_loss_weights_from_model,
-    build_loss,
+    build_loss_from_config,
     configure_backend,
     loss_with_auxiliary,
     output_gate_mean,
@@ -192,6 +192,7 @@ def evaluate_with_predictions(
     n = 0
     correct1 = 0
     correct5 = 0
+    correct10 = 0
     rare_correct1 = 0
     rare_total = 0
     gate_sum = 0.0
@@ -228,7 +229,8 @@ def evaluate_with_predictions(
         num_classes = logits.shape[1]
         plot_topk = min(max_topk, num_classes)
         top5 = min(5, num_classes)
-        eval_topk = max(plot_topk, top5)
+        top10 = min(10, num_classes)
+        eval_topk = max(plot_topk, top5, top10)
 
         probs = torch.softmax(logits.float(), dim=1)
         top_probs, top_idx = probs.topk(eval_topk, dim=1)
@@ -240,6 +242,7 @@ def evaluate_with_predictions(
         n += bsz
         correct1 += int(correct_mask.sum().item())
         correct5 += int((top_idx[:, :top5] == y.unsqueeze(1)).any(dim=1).sum().item())
+        correct10 += int((top_idx[:, :top10] == y.unsqueeze(1)).any(dim=1).sum().item())
 
         if topk_correct is None:
             topk_correct = np.zeros(plot_topk, dtype=np.int64)
@@ -301,6 +304,7 @@ def evaluate_with_predictions(
         n=n,
         correct_top1=correct1,
         correct_top5=correct5,
+        correct_top10=correct10,
         class_correct_top1=class_correct1,
         class_total=class_total,
         aux_loss=total_aux_loss / max(n, 1),
@@ -886,24 +890,13 @@ def main():
         f"Eval split: {args.split}"
         f"{' rare-only' if args.only_rare else ''}  N={len(test_ds)}"
     )
-    loss_fn = build_loss(
-        loss_name,
-        class_counts=(
-            class_counts
-            if loss_name in {
-                "weighted_ce",
-                "class_balanced_ce",
-                "balanced_softmax",
-                "logit_adjustment",
-            }
-            else None
-        ),
-        gamma=cfg["loss"].get("focal_gamma", 2.0),
-        label_smoothing=cfg["loss"].get("label_smoothing", 0.0),
-        class_weight_power=cfg["loss"].get("class_weight_power", 0.5),
-        class_weight_beta=cfg["loss"].get("class_weight_beta", 0.99),
-        logit_adjustment_tau=cfg["loss"].get("logit_adjustment_tau", 1.0),
+    loss_fn = build_loss_from_config(
+        cfg["loss"],
+        class_counts=class_counts,
     ).to(device)
+    if hasattr(loss_fn, "set_class_weights") and "ldam_drw_active" in ckpt:
+        loss_fn.set_class_weights(bool(ckpt["ldam_drw_active"]))
+        print(f"LDAM-DRW eval weights: {bool(ckpt['ldam_drw_active'])}")
     use_amp = cfg["train"].get("amp", True) and device.type == "cuda"
     amp_dtype = amp_dtype_from_config(cfg["train"].get("amp_dtype", "float16"), device)
     stats, outputs = evaluate_with_predictions(
@@ -924,7 +917,8 @@ def main():
 
     # 打印测试结果
     print(f"Test loss={stats.loss:.4f}  acc1={stats.acc1:.4f}  "
-          f"acc5={stats.acc5:.4f}  macro={stats.macro_acc1:.4f}  "
+          f"acc5={stats.acc5:.4f}  acc10={stats.acc10:.4f}  "
+          f"macro={stats.macro_acc1:.4f}  "
           f"macro_f1={macro_f1:.4f}  rare={stats.rare_acc1:.4f}  "
           f"aux={stats.aux_loss:.4f}  "
           f"gate={stats.gate_mean if stats.gate_mean is not None else float('nan'):.4f}  "
@@ -948,6 +942,7 @@ def main():
         "loss": float(stats.loss),
         "acc1": float(stats.acc1),
         "acc5": float(stats.acc5),
+        "acc10": float(stats.acc10),
         "macro_acc1": float(stats.macro_acc1),
         "macro_f1": float(macro_f1),
         "rare_acc1": float(stats.rare_acc1),
@@ -1012,6 +1007,7 @@ def main():
             "loss": float(occ_stats.loss),
             "acc1": float(occ_stats.acc1),
             "acc5": float(occ_stats.acc5),
+            "acc10": float(occ_stats.acc10),
             "macro_acc1": float(occ_stats.macro_acc1),
             "macro_f1": float(occ_macro_f1),
             "rare_acc1": float(occ_stats.rare_acc1),
@@ -1029,6 +1025,7 @@ def main():
         print(
             f"Occlusion {occ_start:.1f}-{occ_end:.1f} deg  "
             f"acc1={occ_stats.acc1:.4f}  acc5={occ_stats.acc5:.4f}  "
+            f"acc10={occ_stats.acc10:.4f}  "
             f"macro={occ_stats.macro_acc1:.4f}  macro_f1={occ_macro_f1:.4f}  "
             f"rare={occ_stats.rare_acc1:.4f}  "
             f"delta_acc1={occ_stats.acc1 - stats.acc1:+.4f}  "

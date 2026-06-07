@@ -1,9 +1,8 @@
 """Forward-smoke the dual-range experiment configs.
 
-This does not train or write formal results. It only checks that each E07-E14
-config instantiates, accepts a PXRD-length tensor, and exposes the expected
-output contract: logits, optional gate statistics, auxiliary logits, and
-declared Mamba backends.
+This does not train or write formal results. It only checks that each current
+dual-range matrix config instantiates, accepts a PXRD-length tensor, and exposes
+the expected output contract: logits and optional gate statistics.
 
 Usage:
     python3 analysis/scripts/smoke_dual_range_forward.py
@@ -31,10 +30,7 @@ CONFIGS = [
     "configs/experiments/e14_sa_only_resnet_ablation.yaml",
     "configs/experiments/e08_dual_concat_resnet.yaml",
     "configs/experiments/e09_dual_gated_resnet.yaml",
-    "configs/experiments/e10_dual_gated_mamba.yaml",
     "configs/experiments/e11_dual_gated_kan.yaml",
-    "configs/experiments/e12_dual_gated_mamba_kan.yaml",
-    "configs/experiments/e13_dual_gated_mamba_kan_aux.yaml",
 ]
 
 

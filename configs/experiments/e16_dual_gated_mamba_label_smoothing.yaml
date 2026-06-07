@@ -61,7 +61,6 @@ train:
   drop_last: true
 
 logging:
-  tensorboard: true
   wandb:
     enabled: true
     project: mamba-kan-pxrd
@@ -70,7 +69,7 @@ logging:
     group: dual_range_loss_control
     job_type: train
     tags: [h100, e16, dual-range, gated, mamba, label-smoothing, loss-control]
-    notes: Same architecture as E10 gated Mamba model, but label-smoothing-only loss.
+    notes: Same architecture as the gated Mamba model, but label-smoothing-only loss.
     dir: wandb
     save_code: true
     watch_model: false

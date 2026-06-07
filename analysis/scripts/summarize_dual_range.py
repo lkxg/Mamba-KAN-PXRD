@@ -2,7 +2,7 @@
 
 Usage:
     python3 analysis/scripts/summarize_dual_range.py
-    python3 analysis/scripts/summarize_dual_range.py --results /tmp/results.csv
+    python3 analysis/scripts/summarize_dual_range.py --results /tmp/results.md
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.run_experiments import load_existing_results, normalize_results_path
+
 
 BASELINE = "e02_resnet_deep_label_smoothing"
 
@@ -27,35 +29,24 @@ MATRIX_ORDER = [
     "e14_sa_only_resnet_ablation",
     "e08_dual_concat_resnet",
     "e09_dual_gated_resnet",
-    "e10_dual_gated_mamba",
     "e11_dual_gated_kan",
-    "e12_dual_gated_mamba_kan",
-    "e13_dual_gated_mamba_kan_aux",
 ]
 
 ABLATIONS = [
     ("SA only vs WA only", "e14_sa_only_resnet_ablation", "e07_wa_only_resnet_label_smoothing"),
     ("SA+WA concat vs WA only", "e08_dual_concat_resnet", "e07_wa_only_resnet_label_smoothing"),
     ("Gated vs concat", "e09_dual_gated_resnet", "e08_dual_concat_resnet"),
-    ("Mamba vs ResNet", "e10_dual_gated_mamba", "e09_dual_gated_resnet"),
     ("KAN vs MLP head", "e11_dual_gated_kan", "e09_dual_gated_resnet"),
-    ("Mamba+KAN vs gated ResNet", "e12_dual_gated_mamba_kan", "e09_dual_gated_resnet"),
-    ("Aux heads vs no aux", "e13_dual_gated_mamba_kan_aux", "e12_dual_gated_mamba_kan"),
 ]
 
 METRIC_COLUMNS = [
     "test_acc1",
     "test_acc5",
+    "test_acc10",
     "test_macro_acc1",
     "test_macro_f1",
     "test_rare_acc1",
     "test_gate_mean",
-    "sa_mamba_backend",
-    "wa_mamba_backend",
-    "occlusion_delta_acc1",
-    "occlusion_delta_macro_acc1",
-    "occlusion_delta_macro_f1",
-    "occlusion_delta_rare_acc1",
 ]
 
 
@@ -138,6 +129,7 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
                 "- Test: "
                 f"Top-1={fmt(base.get('test_acc1'))}, "
                 f"Top-5={fmt(base.get('test_acc5'))}, "
+                f"Top-10={fmt(base.get('test_acc10'))}, "
                 f"Macro Acc={fmt(base.get('test_macro_acc1'))}, "
                 f"Macro F1={fmt(base.get('test_macro_f1'))}, "
                 f"Rare Acc={fmt(base.get('test_rare_acc1'))}"
@@ -148,13 +140,13 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
         "",
         "## Matrix",
         "",
-        "| experiment | top1 | top5 | macro | f1 | rare | gate | SA mamba | WA mamba | occ d_top1 | occ d_macro | occ d_f1 | occ d_rare | d_top1 vs baseline | d_macro vs baseline |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| experiment | top1 | top5 | top10 | macro | f1 | rare | gate | d_top1 vs baseline | d_macro vs baseline |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     for experiment in MATRIX_ORDER:
         row = row_for(df, experiment)
         if row is None:
-            lines.append(f"| {experiment} | pending |  |  |  |  |  |  |  |  |  |  |  |  |  |")
+            lines.append(f"| {experiment} | pending |  |  |  |  |  |  |  |  |")
             continue
         lines.append(
             "| "
@@ -162,16 +154,11 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
                 experiment,
                 fmt(row.get("test_acc1")),
                 fmt(row.get("test_acc5")),
+                fmt(row.get("test_acc10")),
                 fmt(row.get("test_macro_acc1")),
                 fmt(row.get("test_macro_f1")),
                 fmt(row.get("test_rare_acc1")),
                 fmt(row.get("test_gate_mean")),
-                str(row.get("sa_mamba_backend", "")),
-                str(row.get("wa_mamba_backend", "")),
-                fmt(row.get("occlusion_delta_acc1"), signed=True),
-                fmt(row.get("occlusion_delta_macro_acc1"), signed=True),
-                fmt(row.get("occlusion_delta_macro_f1"), signed=True),
-                fmt(row.get("occlusion_delta_rare_acc1"), signed=True),
                 metric_delta(row, base, "test_acc1"),
                 metric_delta(row, base, "test_macro_acc1"),
             ])
@@ -182,8 +169,8 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
         "",
         "## Ablations",
         "",
-        "| contrast | candidate | reference | d_top1 | d_macro | d_f1 | d_rare |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| contrast | candidate | reference | d_top1 | d_top10 | d_macro | d_f1 | d_rare |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     for label, candidate, reference in ABLATIONS:
         cand = row_for(df, candidate)
@@ -195,6 +182,7 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
                 candidate,
                 reference,
                 metric_delta(cand, ref, "test_acc1"),
+                metric_delta(cand, ref, "test_acc10"),
                 metric_delta(cand, ref, "test_macro_acc1"),
                 metric_delta(cand, ref, "test_macro_f1"),
                 metric_delta(cand, ref, "test_rare_acc1"),
@@ -272,14 +260,14 @@ def write_report(df: pd.DataFrame, out_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Summarize dual-range experiment results")
-    ap.add_argument("--results", default="experiments/dual_range_matrix/results.csv")
+    ap.add_argument("--results", default="experiments/dual_range_matrix/results.md")
     ap.add_argument("--out", default="experiments/dual_range_matrix/summary.md")
     args = ap.parse_args()
 
-    results_path = Path(args.results)
+    results_path = normalize_results_path(Path(args.results))
     if not results_path.exists():
         raise FileNotFoundError(f"{results_path} does not exist; run scripts/run_experiments.py first")
-    df = pd.read_csv(results_path, keep_default_na=False)
+    df = pd.DataFrame(load_existing_results(results_path))
     missing = [c for c in ["experiment", *METRIC_COLUMNS] if c not in df.columns]
     if missing:
         raise ValueError(f"{results_path} is missing columns: {missing}")

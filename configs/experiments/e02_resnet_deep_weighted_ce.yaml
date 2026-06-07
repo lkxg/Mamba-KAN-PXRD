@@ -38,7 +38,6 @@ train:
   log_every: 50
 
 logging:
-  tensorboard: true
   wandb:
     enabled: true
     project: mamba-kan-pxrd

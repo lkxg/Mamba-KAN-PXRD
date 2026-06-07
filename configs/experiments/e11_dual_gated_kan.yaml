@@ -62,7 +62,6 @@ train:
   drop_last: true
 
 logging:
-  tensorboard: true
   wandb:
     enabled: true
     project: mamba-kan-pxrd

@@ -1,8 +1,8 @@
-"""Audit progress against the 11-step dual-range PXRD plan.
+"""Audit progress against the current dual-range PXRD matrix.
 
 This script checks current repo evidence, not intent. It separates implemented
-code/config from final experiment evidence so CPU smoke results are not mistaken
-for completed H100/CUDA matrix results.
+code/config from final experiment evidence so smoke results are not mistaken for
+completed matrix results.
 
 Usage:
     python3 analysis/scripts/audit_dual_range.py
@@ -13,8 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
-import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +23,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils import load_config
+from scripts.run_experiments import (
+    RESULT_COLUMNS,
+    load_existing_results,
+    normalize_results_path,
+    split_markdown_row,
+)
 
 
 BASELINE = "e02_resnet_deep_label_smoothing"
@@ -34,10 +38,7 @@ CONFIGS = {
     "e07_wa_only_resnet_label_smoothing": "configs/experiments/e07_wa_only_resnet_label_smoothing.yaml",
     "e08_dual_concat_resnet": "configs/experiments/e08_dual_concat_resnet.yaml",
     "e09_dual_gated_resnet": "configs/experiments/e09_dual_gated_resnet.yaml",
-    "e10_dual_gated_mamba": "configs/experiments/e10_dual_gated_mamba.yaml",
     "e11_dual_gated_kan": "configs/experiments/e11_dual_gated_kan.yaml",
-    "e12_dual_gated_mamba_kan": "configs/experiments/e12_dual_gated_mamba_kan.yaml",
-    "e13_dual_gated_mamba_kan_aux": "configs/experiments/e13_dual_gated_mamba_kan_aux.yaml",
     "e14_sa_only_resnet_ablation": "configs/experiments/e14_sa_only_resnet_ablation.yaml",
 }
 
@@ -46,24 +47,12 @@ MATRIX_ORDER = [
     "e14_sa_only_resnet_ablation",
     "e08_dual_concat_resnet",
     "e09_dual_gated_resnet",
-    "e10_dual_gated_mamba",
     "e11_dual_gated_kan",
-    "e12_dual_gated_mamba_kan",
-    "e13_dual_gated_mamba_kan_aux",
 ]
-
-MAMBA_EXPERIMENTS = (
-    "e10_dual_gated_mamba",
-    "e12_dual_gated_mamba_kan",
-    "e13_dual_gated_mamba_kan_aux",
-)
 
 GATED_EXPERIMENTS = (
     "e09_dual_gated_resnet",
-    "e10_dual_gated_mamba",
     "e11_dual_gated_kan",
-    "e12_dual_gated_mamba_kan",
-    "e13_dual_gated_mamba_kan_aux",
 )
 
 GATE_PHASES = {
@@ -75,6 +64,7 @@ GATE_PHASES = {
 METRIC_COLUMNS = [
     "test_acc1",
     "test_acc5",
+    "test_acc10",
     "test_macro_acc1",
     "test_macro_f1",
     "test_rare_acc1",
@@ -101,16 +91,21 @@ def exists(path: str | Path) -> bool:
 
 
 def load_results(path: Path) -> tuple[list[str], dict[str, dict[str, str]]]:
+    path = normalize_results_path(path)
     if not path.exists():
         return [], {}
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = {
-            str(row.get("experiment", "")): row
-            for row in reader
-            if row.get("experiment")
-        }
-        return list(reader.fieldnames or []), rows
+    table_lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("|")
+    ]
+    fieldnames = split_markdown_row(table_lines[0]) if table_lines else []
+    rows = {
+        str(row.get("experiment", "")): row
+        for row in load_existing_results(path)
+        if row.get("experiment")
+    }
+    return fieldnames or list(RESULT_COLUMNS), rows
 
 
 def nonempty(row: dict[str, str] | None, columns: list[str]) -> bool:
@@ -198,21 +193,6 @@ def eval_metrics_exists(row: dict[str, str] | None) -> bool:
     return bool(metrics_path) and row_path(metrics_path).exists()
 
 
-def mamba_result_backends_ok(rows: dict[str, dict[str, str]]) -> tuple[bool, list[str], list[str]]:
-    bad: list[str] = []
-    pending: list[str] = []
-    for exp in MAMBA_EXPERIMENTS:
-        row = rows.get(exp)
-        if not nonempty(row, METRIC_COLUMNS):
-            pending.append(exp)
-            continue
-        sa_backend = str(row.get("sa_mamba_backend", "")).strip()
-        wa_backend = str(row.get("wa_mamba_backend", "")).strip()
-        if sa_backend != "mamba_ssm" or wa_backend != "mamba_ssm":
-            bad.append(f"{exp}: sa={sa_backend or 'missing'}, wa={wa_backend or 'missing'}")
-    return not bad, bad, pending
-
-
 def artifact_status(rows: dict[str, dict[str, str]]) -> tuple[str, str]:
     required = [BASELINE, *MATRIX_ORDER]
     artifact_rows = [exp for exp in required if eval_metrics_exists(rows.get(exp))]
@@ -248,9 +228,6 @@ def build_findings(results_path: Path) -> list[Finding]:
         for path in CONFIGS.values()
         if not exists(path)
     ]
-    mamba_importable = importlib.util.find_spec("mamba_ssm") is not None
-    mamba_backend_ok, bad_mamba_rows, pending_mamba_rows = mamba_result_backends_ok(rows)
-
     findings: list[Finding] = []
 
     findings.append(Finding(
@@ -298,78 +275,25 @@ def build_findings(results_path: Path) -> list[Finding]:
         f"{CONFIGS['e09_dual_gated_resnet']} uses gated fusion and model exposes gate_mean.",
     ))
 
-    mamba_cfgs_ok = True
-    for exp in MAMBA_EXPERIMENTS:
-        mcfg = dual_cfg(exp).get("mamba", {})
-        mamba_cfgs_ok = (
-            mamba_cfgs_ok
-            and 1 <= int(mcfg.get("sa_layers", 0)) <= 2
-            and 2 <= int(mcfg.get("wa_layers", 0)) <= 4
-        )
-    runner_guard_ok = run_source_contains("validate_mamba_backend", "allow_mamba_fallback")
-    findings.append(Finding(
-        "6a. Mamba after branch ResNets",
-        "PASS" if mamba_cfgs_ok and runner_guard_ok else "FAIL",
-        (
-            "Configs request SA 1 layer and WA 3 layers; "
-            f"official runner guard present={runner_guard_ok}; "
-            f"mamba_ssm importable in this environment={mamba_importable}."
-        ),
-    ))
-
-    if bad_mamba_rows:
-        mamba_backend_status = "FAIL"
-    elif pending_mamba_rows:
-        mamba_backend_status = "PENDING"
-    else:
-        mamba_backend_status = "PASS"
-    findings.append(Finding(
-        "6b. Formal Mamba backend evidence",
-        mamba_backend_status,
-        (
-            "Mamba result rows must report sa_mamba_backend=mamba_ssm and "
-            "wa_mamba_backend=mamba_ssm. "
-            f"pending={pending_mamba_rows or 'none'}; "
-            f"non-final={bad_mamba_rows or 'none'}."
-        ),
-        "final",
-    ))
-
     e11 = dual_cfg("e11_dual_gated_kan")
-    e12 = dual_cfg("e12_dual_gated_mamba_kan")
-    e13 = dual_cfg("e13_dual_gated_mamba_kan_aux")
     findings.append(Finding(
-        "7. KAN fused head",
+        "6. KAN fused head",
         "PASS" if (
             e11.get("head") == "kan"
-            and e12.get("head") == "kan"
-            and e13.get("head") == "kan"
             and model_source_contains("class KANHead")
         ) else "FAIL",
-        "E11/E12/E13 use head: kan and src/models.py defines KANHead.",
-    ))
-
-    findings.append(Finding(
-        "8. Auxiliary branch heads",
-        "PASS" if (
-            e13.get("aux_heads") is True
-            and abs(float(e13.get("sa_aux_weight", 0)) - 0.2) < 1e-6
-            and abs(float(e13.get("wa_aux_weight", 0)) - 0.2) < 1e-6
-            and model_source_contains("sa_logits", "wa_logits")
-            and (PROJECT_ROOT / "src/training.py").read_text(encoding="utf-8").find("loss_with_auxiliary") >= 0
-        ) else "FAIL",
-        "E13 enables SA/WA linear auxiliary heads at 0.2 each; training uses loss_with_auxiliary.",
+        "E11 uses head: kan and src/models.py defines KANHead.",
     ))
 
     matrix_config_status = "PASS" if all_configs_exist() else "FAIL"
     findings.append(Finding(
-        "9a. Experiment matrix configs",
+        "7a. Experiment matrix configs",
         matrix_config_status,
-        "All E07-E14 config files are present." if matrix_config_status == "PASS" else f"Missing: {missing_configs}",
+        "All current matrix config files are present." if matrix_config_status == "PASS" else f"Missing: {missing_configs}",
     ))
     completed_matrix = [exp for exp in [BASELINE, *MATRIX_ORDER] if nonempty(rows.get(exp), METRIC_COLUMNS)]
     findings.append(Finding(
-        "9b. Experiment matrix results",
+        "7b. Experiment matrix results",
         "PASS" if result_rows_complete(rows, [BASELINE, *MATRIX_ORDER]) else "PENDING",
         f"{len(completed_matrix)}/{1 + len(MATRIX_ORDER)} result rows have full test metrics in {rel(results_path)}.",
         "evidence",
@@ -379,10 +303,7 @@ def build_findings(results_path: Path) -> list[Finding]:
         ("e14_sa_only_resnet_ablation", "e07_wa_only_resnet_label_smoothing"),
         ("e08_dual_concat_resnet", "e07_wa_only_resnet_label_smoothing"),
         ("e09_dual_gated_resnet", "e08_dual_concat_resnet"),
-        ("e10_dual_gated_mamba", "e09_dual_gated_resnet"),
         ("e11_dual_gated_kan", "e09_dual_gated_resnet"),
-        ("e12_dual_gated_mamba_kan", "e09_dual_gated_resnet"),
-        ("e13_dual_gated_mamba_kan_aux", "e12_dual_gated_mamba_kan"),
     ]
     ablations_done = sum(
         1
@@ -390,7 +311,7 @@ def build_findings(results_path: Path) -> list[Finding]:
         if nonempty(rows.get(a), METRIC_COLUMNS) and nonempty(rows.get(b), METRIC_COLUMNS)
     )
     findings.append(Finding(
-        "10. Ablation analysis",
+        "8. Ablation analysis",
         "PASS" if ablations_done == len(ablation_pairs) else "PENDING",
         f"{ablations_done}/{len(ablation_pairs)} ablation contrasts have both candidate and reference metrics.",
         "evidence",
@@ -403,13 +324,13 @@ def build_findings(results_path: Path) -> list[Finding]:
         "MaskAngleRange",
     )
     findings.append(Finding(
-        "11a. Physical interpretation code",
+        "9a. Physical interpretation code",
         "PASS" if artifact_code_ok else "FAIL",
         "Evaluation code writes gate distribution, gate-by-system, confusion cases, and low-angle occlusion.",
     ))
     artifact_gate_status, artifact_gate_detail = artifact_status(rows)
     findings.append(Finding(
-        "11b. Physical interpretation artifacts",
+        "9b. Physical interpretation artifacts",
         artifact_gate_status if artifact_code_ok else "FAIL",
         artifact_gate_detail if artifact_code_ok else "Interpretation code is incomplete.",
         "evidence",
@@ -422,10 +343,17 @@ def build_findings(results_path: Path) -> list[Finding]:
     ))
 
     expected_fields = {
-        "sa_mamba_backend",
-        "wa_mamba_backend",
-        "occlusion_delta_macro_f1",
-        "occlusion_delta_rare_acc1",
+        "config",
+        "val_acc10",
+        "test_acc10",
+        "occlusion_acc1",
+        "occlusion_acc10",
+        "occlusion_macro_acc1",
+        "occlusion_macro_f1",
+        "occlusion_rare_acc1",
+        "eval_metrics",
+        "checkpoint",
+        "wandb_run",
     }
     schema_source_ok = run_source_contains(*expected_fields)
     schema_csv_ok = (
@@ -437,8 +365,8 @@ def build_findings(results_path: Path) -> list[Finding]:
         "PASS" if schema_source_ok and schema_csv_ok else "FAIL",
         (
             f"run_experiments.py fields present={schema_source_ok}; "
-            f"{rel(results_path)} has {len(fieldnames)} columns; "
-            f"CSV required additions present={schema_csv_ok}."
+            f"{rel(normalize_results_path(results_path))} has {len(fieldnames)} columns; "
+            f"Markdown required fields present={schema_csv_ok}."
         ),
     ))
 
@@ -470,8 +398,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Audit dual-range experiment progress")
     parser.add_argument(
         "--results",
-        default="experiments/dual_range_matrix/results.csv",
-        help="Result CSV to audit.",
+        default="experiments/dual_range_matrix/results.md",
+        help="Result Markdown table to audit. Legacy .csv paths map to .md.",
     )
     parser.add_argument(
         "--strict",
@@ -485,13 +413,13 @@ def main() -> None:
         help=(
             "Exit nonzero unless all findings in the selected phase set pass. "
             "implementation checks code/config only; evidence also requires "
-            "formal result rows and artifacts; final also requires mamba_ssm "
-            "backend evidence for Mamba rows."
+            "formal result rows and artifacts; final is currently equivalent "
+            "to evidence for this non-Mamba architecture matrix."
         ),
     )
     args = parser.parse_args()
 
-    findings = build_findings(PROJECT_ROOT / args.results)
+    findings = build_findings(normalize_results_path(PROJECT_ROOT / args.results))
     print_report(findings)
 
     gate = "final" if args.strict else args.gate

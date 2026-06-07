@@ -28,16 +28,28 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.utils import load_config
 
 
+DEFAULT_RESULTS = "experiments/dual_range_matrix/results.md"
+DEFAULT_LOGS_DIR = "experiments/dual_range_matrix/logs"
+MAIN_RESULTS = "experiments/main_results/results.md"
+MAIN_LOGS_DIR = "experiments/main_results/logs"
+
 DEFAULT_CONFIGS = [
     "configs/experiments/e02_resnet_deep_label_smoothing.yaml",
     "configs/experiments/e07_wa_only_resnet_label_smoothing.yaml",
     "configs/experiments/e08_dual_concat_resnet.yaml",
     "configs/experiments/e09_dual_gated_resnet.yaml",
-    "configs/experiments/e10_dual_gated_mamba.yaml",
     "configs/experiments/e11_dual_gated_kan.yaml",
-    "configs/experiments/e12_dual_gated_mamba_kan.yaml",
-    "configs/experiments/e13_dual_gated_mamba_kan_aux.yaml",
     "configs/experiments/e14_sa_only_resnet_ablation.yaml",
+]
+
+MAIN_CONFIGS = [
+    "configs/main/m01_resnet1d_label_smoothing.yaml",
+    "configs/main/m02_dual_gated_resnet_label_smoothing.yaml",
+    "configs/main/m03_dual_gated_kan_label_smoothing.yaml",
+    "configs/main/m04_dual_gated_mamba_label_smoothing.yaml",
+    "configs/main/m05_dual_gated_mamba_kan_label_smoothing.yaml",
+    "configs/main/m06_dual_gated_resnet_ldam_drw.yaml",
+    "configs/main/m07_dual_gated_resnet_crt.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -49,22 +61,17 @@ NON_MAMBA_CONFIGS = [
     "configs/experiments/e11_dual_gated_kan.yaml",
 ]
 
-MAMBA_CONFIGS = [
-    "configs/experiments/e10_dual_gated_mamba.yaml",
-    "configs/experiments/e12_dual_gated_mamba_kan.yaml",
-    "configs/experiments/e13_dual_gated_mamba_kan_aux.yaml",
-]
-
 CONFIG_PRESETS = {
     "full": DEFAULT_CONFIGS,
+    "main": MAIN_CONFIGS,
     "non_mamba": NON_MAMBA_CONFIGS,
-    "mamba": MAMBA_CONFIGS,
 }
 
 TEST_RE = re.compile(
     r"Test loss=(?P<loss>[0-9.]+)\s+"
     r"acc1=(?P<acc1>[0-9.]+)\s+"
     r"acc5=(?P<acc5>[0-9.]+)\s+"
+    r"(?:acc10=(?P<acc10>[0-9.]+)\s+)?"
     r"macro=(?P<macro>[0-9.]+)\s+"
     r"(?:macro_f1=(?P<macro_f1>[0-9.]+)\s+)?"
     r"(?:rare=(?P<rare>[0-9.]+|nan)\s+)?"
@@ -73,7 +80,7 @@ TEST_RE = re.compile(
     r"\(N=(?P<n>[0-9]+)\)"
 )
 
-RESULT_FIELDNAMES = [
+RESULT_COLUMNS = [
     "experiment",
     "config",
     "model",
@@ -88,6 +95,7 @@ RESULT_FIELDNAMES = [
     "monitor_score",
     "val_acc1",
     "val_acc5",
+    "val_acc10",
     "val_macro_acc1",
     "val_rare_acc1",
     "val_aux_loss",
@@ -96,26 +104,31 @@ RESULT_FIELDNAMES = [
     "test_loss",
     "test_acc1",
     "test_acc5",
+    "test_acc10",
     "test_macro_acc1",
     "test_macro_f1",
     "test_rare_acc1",
     "test_aux_loss",
     "test_gate_mean",
-    "sa_mamba_backend",
-    "wa_mamba_backend",
     "occlusion_acc1",
+    "occlusion_acc10",
     "occlusion_macro_acc1",
     "occlusion_macro_f1",
     "occlusion_rare_acc1",
-    "occlusion_delta_acc1",
-    "occlusion_delta_macro_acc1",
-    "occlusion_delta_macro_f1",
-    "occlusion_delta_rare_acc1",
     "test_n",
     "eval_metrics",
     "checkpoint",
     "wandb_run",
 ]
+
+LEGACY_MARKDOWN_ALIASES = {
+    "val_macro": "val_macro_acc1",
+    "val_rare": "val_rare_acc1",
+    "test_macro": "test_macro_acc1",
+    "test_f1": "test_macro_f1",
+    "test_rare": "test_rare_acc1",
+    "gate": "test_gate_mean",
+}
 
 
 def run_and_log(cmd: list[str], log_path: Path, env: dict[str, str]) -> str:
@@ -179,7 +192,7 @@ def parse_test_metrics(output: str) -> dict[str, str]:
 
 
 def format_metric(value, *, digits: int = 6) -> str:
-    """Format numeric metrics for stable CSV output."""
+    """Format numeric metrics for stable Markdown output."""
     if value is None:
         return ""
     try:
@@ -200,6 +213,7 @@ def checkpoint_metrics(best_path: Path) -> dict[str, str]:
         "monitor_score": format_metric(ckpt.get("monitor_score")),
         "val_acc1": format_metric(ckpt.get("val_acc1")),
         "val_acc5": format_metric(ckpt.get("val_acc5")),
+        "val_acc10": format_metric(ckpt.get("val_acc10")),
         "val_macro_acc1": format_metric(ckpt.get("val_macro_acc1")),
         "val_rare_acc1": format_metric(ckpt.get("val_rare_acc1")),
         "val_aux_loss": format_metric(ckpt.get("val_aux_loss")),
@@ -236,23 +250,142 @@ def load_eval_metrics(
     return metrics, metrics_path
 
 
-def load_existing_results(results_path: Path) -> list[dict[str, str]]:
-    """Load existing result rows so resumed runs keep prior experiments."""
+def normalize_results_path(path: Path) -> Path:
+    """Keep legacy --results *.csv invocations on the Markdown-only output."""
+    if path.suffix.lower() == ".csv":
+        return path.with_suffix(".md")
+    return path
+
+
+def normalize_result_row(row: dict[str, str]) -> dict[str, str]:
+    """Return a row with exactly the current Markdown result columns."""
+    normalized: dict[str, str] = {}
+    for key, value in row.items():
+        column = LEGACY_MARKDOWN_ALIASES.get(key, key)
+        if column in RESULT_COLUMNS:
+            normalized[column] = "" if value is None else str(value)
+    return {column: normalized.get(column, "") for column in RESULT_COLUMNS}
+
+
+def merge_result_rows(
+    base: dict[str, str],
+    overlay: dict[str, str],
+) -> dict[str, str]:
+    """Overlay non-empty values while preserving richer legacy data."""
+    merged = normalize_result_row(base)
+    for column, value in normalize_result_row(overlay).items():
+        if value.strip():
+            merged[column] = value
+    return merged
+
+
+def escape_markdown_cell(value: str) -> str:
+    """Escape table metacharacters in a Markdown cell."""
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def split_markdown_row(line: str) -> list[str]:
+    """Split one Markdown table row, respecting escaped pipes."""
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in line:
+        if escaped:
+            if char in {"|", "\\"}:
+                current.append(char)
+            else:
+                current.extend(["\\", char])
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current).strip())
+    return cells
+
+
+def is_markdown_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(set(cell.replace(":", "").strip()) <= {"-"} for cell in cells)
+
+
+def load_markdown_results(results_path: Path) -> list[dict[str, str]]:
+    """Load existing Markdown rows so resumed runs keep prior experiments."""
     if not results_path.exists() or results_path.stat().st_size == 0:
         return []
-    with results_path.open(newline="", encoding="utf-8") as f:
+    table_lines = [
+        line
+        for line in results_path.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("|")
+    ]
+    if len(table_lines) < 2:
+        return []
+    headers = split_markdown_row(table_lines[0])
+    rows: list[dict[str, str]] = []
+    for line in table_lines[1:]:
+        cells = split_markdown_row(line)
+        if is_markdown_separator(cells):
+            continue
+        row = dict(zip(headers, cells))
+        if row.get("experiment"):
+            rows.append(normalize_result_row(row))
+    return rows
+
+
+def load_legacy_csv_results(results_path: Path) -> list[dict[str, str]]:
+    """Read older CSV output as an input-only migration path."""
+    csv_path = results_path.with_suffix(".csv")
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return []
+    with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            return []
         return [
-            {field: row.get(field, "") for field in RESULT_FIELDNAMES}
+            normalize_result_row(row)
             for row in reader
             if row.get("experiment")
         ]
 
 
+def load_existing_results(results_path: Path) -> list[dict[str, str]]:
+    """Load prior Markdown rows, enriched from legacy CSV when present."""
+    rows: list[dict[str, str]] = []
+    positions: dict[str, int] = {}
+
+    for row in load_legacy_csv_results(results_path):
+        experiment = row.get("experiment", "")
+        if not experiment:
+            continue
+        positions[experiment] = len(rows)
+        rows.append(row)
+
+    for row in load_markdown_results(results_path):
+        experiment = row.get("experiment", "")
+        if not experiment:
+            continue
+        if experiment in positions:
+            rows[positions[experiment]] = merge_result_rows(
+                rows[positions[experiment]],
+                row,
+            )
+        else:
+            positions[experiment] = len(rows)
+            rows.append(row)
+    return rows
+
+
 def upsert_result(rows: list[dict[str, str]], row: dict[str, str]) -> None:
     """Add or replace one experiment row."""
+    row = normalize_result_row(row)
     for idx, existing in enumerate(rows):
         if existing.get("experiment") == row.get("experiment"):
             rows[idx] = row
@@ -260,69 +393,23 @@ def upsert_result(rows: list[dict[str, str]], row: dict[str, str]) -> None:
     rows.append(row)
 
 
-def append_results(results_path: Path, rows: list[dict[str, str]]) -> None:
-    """Write results CSV from all rows collected in this run."""
+def write_results_markdown(results_path: Path, rows: list[dict[str, str]]) -> None:
+    """Write the single Markdown result table."""
     if not rows:
         return
     results_path.parent.mkdir(parents=True, exist_ok=True)
-    with results_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=RESULT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def write_markdown(results_path: Path, rows: list[dict[str, str]]) -> None:
-    """Write a compact Markdown result table."""
-    md_path = results_path.with_suffix(".md")
-    headers = [
-        "experiment",
-        "model",
-        "loss",
-        "best_epoch",
-        "val_acc1",
-        "val_macro",
-        "val_rare",
-        "test_acc1",
-        "test_acc5",
-        "test_macro",
-        "test_f1",
-        "test_rare",
-        "gate",
-        "sa_mamba",
-        "wa_mamba",
-        "occ_delta_acc1",
-        "occ_delta_macro",
-        "occ_delta_f1",
-        "occ_delta_rare",
-    ]
     lines = [
-        "| " + " | ".join(headers) + " |",
-        "| " + " | ".join(["---"] * len(headers)) + " |",
+        "| " + " | ".join(RESULT_COLUMNS) + " |",
+        "| " + " | ".join(["---"] * len(RESULT_COLUMNS)) + " |",
     ]
     for row in rows:
+        normalized = normalize_result_row(row)
         values = [
-            row["experiment"],
-            row["model"],
-            row["loss"],
-            row["best_epoch"],
-            row["val_acc1"],
-            row["val_macro_acc1"],
-            row.get("val_rare_acc1", ""),
-            row["test_acc1"],
-            row["test_acc5"],
-            row["test_macro_acc1"],
-            row.get("test_macro_f1", ""),
-            row.get("test_rare_acc1", ""),
-            row.get("test_gate_mean", ""),
-            row.get("sa_mamba_backend", ""),
-            row.get("wa_mamba_backend", ""),
-            row.get("occlusion_delta_acc1", ""),
-            row.get("occlusion_delta_macro_acc1", ""),
-            row.get("occlusion_delta_macro_f1", ""),
-            row.get("occlusion_delta_rare_acc1", ""),
+            escape_markdown_cell(normalized[column])
+            for column in RESULT_COLUMNS
         ]
         lines.append("| " + " | ".join(values) + " |")
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    results_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def summarize_config(cfg: dict) -> dict[str, str]:
@@ -362,6 +449,9 @@ def summarize_config(cfg: dict) -> dict[str, str]:
     else:
         model_params = str(model_cfg)
     optim_cfg = cfg.get("optim", {})
+    loss_name = str(cfg["loss"]["name"])
+    if cfg.get("train", {}).get("crt", {}).get("enabled", False):
+        loss_name = f"{loss_name}+crt"
     return {
         "experiment": cfg["experiment"]["name"],
         "model": model_name,
@@ -369,7 +459,7 @@ def summarize_config(cfg: dict) -> dict[str, str]:
         "optimizer": optim_cfg.get("name", "adamw"),
         "lr": str(optim_cfg.get("lr", "")),
         "weight_decay": str(optim_cfg.get("weight_decay", "")),
-        "loss": cfg["loss"]["name"],
+        "loss": loss_name,
         "sampler": cfg.get("sampler", {}).get("name", "none"),
     }
 
@@ -427,27 +517,17 @@ def metrics_row(
             "test_loss": format_metric(metrics.get("loss")),
             "test_acc1": format_metric(metrics.get("acc1")),
             "test_acc5": format_metric(metrics.get("acc5")),
+            "test_acc10": format_metric(metrics.get("acc10")),
             "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_macro_f1": format_metric(metrics.get("macro_f1")),
             "test_rare_acc1": format_metric(metrics.get("rare_acc1")),
             "test_aux_loss": format_metric(metrics.get("aux_loss")),
             "test_gate_mean": format_metric(metrics.get("gate_mean")),
-            "sa_mamba_backend": str(metrics.get("sa_mamba_backend") or ""),
-            "wa_mamba_backend": str(metrics.get("wa_mamba_backend") or ""),
             "occlusion_acc1": format_metric(occlusion.get("acc1")),
+            "occlusion_acc10": format_metric(occlusion.get("acc10")),
             "occlusion_macro_acc1": format_metric(occlusion.get("macro_acc1")),
             "occlusion_macro_f1": format_metric(occlusion.get("macro_f1")),
             "occlusion_rare_acc1": format_metric(occlusion.get("rare_acc1")),
-            "occlusion_delta_acc1": format_metric(occlusion.get("delta_acc1")),
-            "occlusion_delta_macro_acc1": format_metric(
-                occlusion.get("delta_macro_acc1")
-            ),
-            "occlusion_delta_macro_f1": format_metric(
-                occlusion.get("delta_macro_f1")
-            ),
-            "occlusion_delta_rare_acc1": format_metric(
-                occlusion.get("delta_rare_acc1")
-            ),
             "test_n": str(int(metrics.get("n", 0))),
             "eval_metrics": (
                 display_path(metrics_path)
@@ -459,21 +539,17 @@ def metrics_row(
         "test_loss": fallback["loss"],
         "test_acc1": fallback["acc1"],
         "test_acc5": fallback["acc5"],
+        "test_acc10": fallback.get("acc10") or "",
         "test_macro_acc1": fallback["macro"],
         "test_macro_f1": fallback.get("macro_f1") or "",
         "test_rare_acc1": fallback.get("rare") or "",
         "test_aux_loss": fallback.get("aux") or "",
         "test_gate_mean": fallback.get("gate") or "",
-        "sa_mamba_backend": "",
-        "wa_mamba_backend": "",
         "occlusion_acc1": "",
+        "occlusion_acc10": "",
         "occlusion_macro_acc1": "",
         "occlusion_macro_f1": "",
         "occlusion_rare_acc1": "",
-        "occlusion_delta_acc1": "",
-        "occlusion_delta_macro_acc1": "",
-        "occlusion_delta_macro_f1": "",
-        "occlusion_delta_rare_acc1": "",
         "test_n": fallback["n"],
         "eval_metrics": "",
     }
@@ -513,8 +589,7 @@ def main() -> None:
         default=None,
         help=(
             "Named config group. Omit both --preset and --configs to run full. "
-            "Use non_mamba to run baseline/WA/SA/concat/gated/KAN rows before "
-            "CUDA Mamba dependencies are available."
+            "Use main for the unified main-result configs."
         ),
     )
     ap.add_argument(
@@ -526,8 +601,19 @@ def main() -> None:
             "with --preset, they are appended after that preset."
         ),
     )
-    ap.add_argument("--results", default="experiments/dual_range_matrix/results.csv")
-    ap.add_argument("--logs-dir", default="experiments/dual_range_matrix/logs")
+    ap.add_argument(
+        "--results",
+        default=None,
+        help=(
+            "Result Markdown path. Defaults to main_results for --preset main, "
+            "else dual_range_matrix. Legacy .csv paths are mapped to .md."
+        ),
+    )
+    ap.add_argument(
+        "--logs-dir",
+        default=None,
+        help="Log directory. Defaults to main_results for --preset main, else dual_range_matrix.",
+    )
     ap.add_argument(
         "--skip-train",
         action="store_true",
@@ -581,7 +667,12 @@ def main() -> None:
     env.setdefault("WANDB_MODE", "offline")
     env.setdefault("WANDB_DIR", str(PROJECT_ROOT / "wandb"))
 
-    results_path = Path(args.results)
+    default_results = MAIN_RESULTS if args.preset == "main" else DEFAULT_RESULTS
+    default_logs_dir = MAIN_LOGS_DIR if args.preset == "main" else DEFAULT_LOGS_DIR
+    results_arg = args.results or default_results
+    logs_dir_arg = args.logs_dir or default_logs_dir
+
+    results_path = normalize_results_path(Path(results_arg))
     rows: list[dict[str, str]] = load_existing_results(results_path)
     for config_path_str in resolve_config_paths(args.preset, args.configs):
         config_path = Path(config_path_str)
@@ -592,7 +683,7 @@ def main() -> None:
         started_at = time.time()
 
         if not args.skip_train:
-            train_log = Path(args.logs_dir) / f"{run_name}.train.log"
+            train_log = Path(logs_dir_arg) / f"{run_name}.train.log"
             run_and_log(
                 [sys.executable, "scripts/train.py", "--config", str(config_path)],
                 train_log,
@@ -602,7 +693,7 @@ def main() -> None:
         else:
             best_path = newest_checkpoint(run_name, 0.0)
 
-        eval_log = Path(args.logs_dir) / f"{run_name}.eval.log"
+        eval_log = Path(logs_dir_arg) / f"{run_name}.eval.log"
         eval_cmd = [sys.executable, "scripts/evaluate.py", "--checkpoint", str(best_path)]
         eval_plot_dir = None
         if args.eval_plot_dir_root is not None:
@@ -650,8 +741,7 @@ def main() -> None:
             "wandb_run": newest_wandb_run(started_at) or previous_wandb_run,
         }
         upsert_result(rows, row)
-        append_results(results_path, rows)
-        write_markdown(results_path, rows)
+        write_results_markdown(results_path, rows)
         print(f"Recorded result for {run_name}: {row}", flush=True)
 
 

@@ -16,5 +16,4 @@ and no sampler. Checkpoints are selected by:
 | E05 | `configs/experiments/e05_bigru_patch_weighted_ce_mixed.yaml` | Patchified BiGRU | weighted CE + smoothing `.03` | RNN sequence baseline. |
 | E06 | `configs/experiments/e06_patchtst_weighted_ce_mixed.yaml` | PatchTST-style Transformer | weighted CE + smoothing `.03` | Transformer/patch sequence baseline. |
 
-Results are written to `experiments/sequence_baselines/results.csv` and
-`experiments/sequence_baselines/results.md`.
+Results are written to `experiments/sequence_baselines/results.md`.

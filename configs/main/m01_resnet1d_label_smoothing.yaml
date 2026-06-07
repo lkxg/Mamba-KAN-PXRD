@@ -1,5 +1,5 @@
 experiment:
-  name: e05_bigru_patch_weighted_ce_mixed
+  name: m01_resnet1d_label_smoothing
   seed: 42
 
 data:
@@ -12,13 +12,12 @@ data:
   pin_memory: true
 
 model:
-  name: bigru_patch
-  bigru_patch:
-    patch_len: 64
-    stride: 64
-    d_model: 128
-    hidden_size: 256
-    num_layers: 2
+  name: resnet1d
+  resnet1d:
+    base_channels: 64
+    blocks_per_stage: [3, 4, 6, 3]
+  mlp:
+    hidden: [1024, 512]
     dropout: 0.2
 
 optim:
@@ -36,7 +35,7 @@ train:
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
-  log_every: 100
+  log_every: 50
 
 logging:
   wandb:
@@ -44,10 +43,10 @@ logging:
     project: mamba-kan-pxrd
     entity: null
     mode: offline
-    group: sequence_baselines
+    group: main_results
     job_type: train
-    tags: [h100, bigru, patch, weighted-ce, label-smoothing, offline]
-    notes: BiGRU patch baseline with E02 mixed weighted CE loss.
+    tags: [h100, m01, resnet1d, deep, label-smoothing, main]
+    notes: Main ResNet1D baseline with label smoothing CE.
     dir: wandb
     save_code: true
     watch_model: false
@@ -56,8 +55,8 @@ logging:
     log_best_checkpoint: false
 
 loss:
-  name: weighted_ce
-  label_smoothing: 0.03
+  name: label_smoothing
+  label_smoothing: 0.05
   focal_gamma: 2.0
   class_weight_power: 0.30
   class_weight_beta: 0.999
@@ -72,7 +71,7 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: false
+  compile: true
   compile_mode: default
 
 checkpoint:

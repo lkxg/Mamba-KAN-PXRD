@@ -7,7 +7,6 @@ Use this directory as the experiment index.
 - `e02_loss_ablation/` contains the clean E02 loss ablation:
   weighted CE, label smoothing, and focal loss under the same E02 base setup.
 - Primary table: `e02_loss_ablation/results.md`
-- Full CSV: `e02_loss_ablation/results.csv`
 - Logs: `e02_loss_ablation/logs/`
 - Plan/config notes: `e02_loss_ablation/plan.md`
 
@@ -16,10 +15,9 @@ Use this directory as the experiment index.
 - `dual_range_matrix/` is the current SA/WA architecture matrix.
 - Fixed strong baseline: `configs/experiments/e02_resnet_deep_label_smoothing.yaml`
   (`ResNet1D + label_smoothing`).
-- Matrix configs: E07 WA-only, E08 concat, E09 gated, E10 gated+Mamba,
-  E11 gated+KAN, E12 gated+Mamba+KAN, E13 E12+aux heads, and E14 SA-only.
+- Matrix configs: E07 WA-only, E08 concat, E09 gated, E11 gated+KAN, and
+  E14 SA-only.
 - Primary table after running: `dual_range_matrix/results.md`
-- Full CSV after running: `dual_range_matrix/results.csv`
 - Logs after running: `dual_range_matrix/logs/`
 - Plan/config notes: `dual_range_matrix/README.md`
 - Formal run gates: `analysis/scripts/preflight_dual_range.py`,
@@ -31,7 +29,6 @@ Use this directory as the experiment index.
 - `sequence_baselines/` contains BiGRU and PatchTST-style baselines trained with
   the current strongest mixed E02 loss recipe.
 - Primary table: `sequence_baselines/results.md`
-- Full CSV: `sequence_baselines/results.csv`
 - Logs: `sequence_baselines/logs/`
 - Plan/config notes: `sequence_baselines/plan.md`
 
@@ -46,6 +43,12 @@ Use this directory as the experiment index.
 - Result: label smoothing improves overall Top-1, while the mixed recipe remains
   better for test macro and rare-class accuracy.
 
+## Main Result Configs
+
+- `configs/main/` contains unified main-result configs M01-M07, including the
+  label-smoothing dual-range Mamba and Mamba-KAN runs.
+- Run them with `python3 scripts/run_experiments.py --preset main`.
+
 ## Historical Records
 
 - `archive/20260605_initial_matrix/` contains the earlier exploratory E01-E04
@@ -53,7 +56,7 @@ Use this directory as the experiment index.
 
 ## Checkpoints
 
-Model checkpoints remain under `checkpoints/` so result CSV checkpoint paths stay
+Model checkpoints remain under `checkpoints/` so result-table checkpoint paths stay
 directly usable. Evaluation plots are inside each checkpoint directory.
 
 ## Current E02 Configs

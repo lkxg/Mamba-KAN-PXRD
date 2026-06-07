@@ -1,7 +1,7 @@
 # 实验结果汇总
 
 本文档按当前已有结果整理 PXRD 空间群分类实验。主要测试集规模为
-`N=46784`。除特别说明外，指标来自各实验目录的 `results.csv` 和
+`N=46784`。除特别说明外，指标来自各实验目录的 `results.md` 和
 checkpoint 下的 `eval_plots/metrics.json`。
 
 ## 总体结论
@@ -123,8 +123,8 @@ checkpoint 下的 `eval_plots/metrics.json`。
 
 ## 待补与注意事项
 
-- `dual_range_matrix` 的正式矩阵仍缺 E10/E12/E13 行；后续 loss-control 里已有
-  `e16/e17` 的真实 `mamba_ssm` 结果，但正式矩阵表还未完全闭环。
+- `configs/main/` 已整理主结果入口；Mamba/Mamba-KAN 主结果应从 main preset
+  复跑或续跑，旧的 mixed-loss Mamba 矩阵行不再作为当前正式入口。
 - `e04_resnet_wide_cbce_light` 是很强的历史结果，建议按当前评估脚本补跑
   `metrics.json`、rare-class 和 low-angle occlusion，保证公平对比。
 - README 中仍有 `XX%` 占位，应在最终写作前替换为本汇总中的核心数字。
