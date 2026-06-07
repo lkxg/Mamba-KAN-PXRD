@@ -53,19 +53,25 @@ scheduler:
   warmup_epochs: 3
 
 train:
-  epochs: 35
+  epochs: 100
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
   log_every: 50
   drop_last: true
 
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 0.0
+  start_epoch: 50
+
 logging:
   wandb:
     enabled: true
     project: mamba-kan-pxrd
     entity: null
-    mode: offline
+    mode: online
     group: main_results
     job_type: train
     tags: [h100, m02, dual-range, gated, resnet, label-smoothing, main]
@@ -80,15 +86,9 @@ logging:
 loss:
   name: label_smoothing
   label_smoothing: 0.05
-  focal_gamma: 2.0
-  class_weight_power: 0.30
-  class_weight_beta: 0.999
 
 sampler:
   name: none
-  power: 0.5
-  replacement: true
-  num_samples_multiplier: 1.0
 
 metrics:
   rare_min_train_count: 1
@@ -98,7 +98,7 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: false
+  compile: true
   compile_mode: default
 
 checkpoint:

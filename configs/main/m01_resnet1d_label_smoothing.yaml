@@ -6,7 +6,7 @@ data:
   root: dataset
   splits_csv: splits/splits.csv
   task: space_group
-  batch_size: 1024
+  batch_size: 512
   num_workers: 12
   prefetch_factor: 4
   pin_memory: true
@@ -16,9 +16,6 @@ model:
   resnet1d:
     base_channels: 64
     blocks_per_stage: [3, 4, 6, 3]
-  mlp:
-    hidden: [1024, 512]
-    dropout: 0.2
 
 optim:
   name: adamw
@@ -31,18 +28,25 @@ scheduler:
   warmup_epochs: 3
 
 train:
-  epochs: 30
+  epochs: 100
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
   log_every: 50
+  drop_last: true
+
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 0.0
+  start_epoch: 50
 
 logging:
   wandb:
     enabled: true
     project: mamba-kan-pxrd
     entity: null
-    mode: offline
+    mode: online
     group: main_results
     job_type: train
     tags: [h100, m01, resnet1d, deep, label-smoothing, main]
@@ -57,15 +61,13 @@ logging:
 loss:
   name: label_smoothing
   label_smoothing: 0.05
-  focal_gamma: 2.0
-  class_weight_power: 0.30
-  class_weight_beta: 0.999
 
 sampler:
   name: none
-  power: 0.5
-  replacement: true
-  num_samples_multiplier: 1.0
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
 
 performance:
   tf32: true
@@ -80,5 +82,5 @@ checkpoint:
   monitor: val_balanced_acc1_macro
   mode: max
   balanced_metric:
-    acc1_weight: 0.5
-    macro_acc1_weight: 0.5
+    acc1_weight: 0.4
+    macro_acc1_weight: 0.6

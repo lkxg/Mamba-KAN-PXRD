@@ -53,7 +53,7 @@ scheduler:
   warmup_epochs: 3
 
 train:
-  epochs: 45
+  epochs: 100
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
@@ -61,7 +61,7 @@ train:
   drop_last: true
   crt:
     enabled: true
-    start_epoch: 36
+    start_epoch: 71
     warmup_epochs: 1
     freeze_batch_norm: true
     reset_best: true
@@ -78,12 +78,18 @@ train:
       replacement: true
       num_samples_multiplier: 1.0
 
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 0.0
+  start_epoch: 75
+
 logging:
   wandb:
     enabled: true
     project: mamba-kan-pxrd
     entity: null
-    mode: offline
+    mode: online
     group: main_results
     job_type: train
     tags: [h100, m07, dual-range, gated, resnet, crt, main]
@@ -98,15 +104,9 @@ logging:
 loss:
   name: label_smoothing
   label_smoothing: 0.05
-  focal_gamma: 2.0
-  class_weight_power: 0.30
-  class_weight_beta: 0.999
 
 sampler:
   name: none
-  power: 0.5
-  replacement: true
-  num_samples_multiplier: 1.0
 
 metrics:
   rare_min_train_count: 1
@@ -116,7 +116,7 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: false
+  compile: true
   compile_mode: default
 
 checkpoint:

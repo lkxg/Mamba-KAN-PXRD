@@ -48,6 +48,9 @@ MAIN_CONFIGS = [
     "configs/main/m03_dual_gated_kan_label_smoothing.yaml",
     "configs/main/m04_dual_gated_mamba_label_smoothing.yaml",
     "configs/main/m05_dual_gated_mamba_kan_label_smoothing.yaml",
+    "configs/main/m08_dual_gated_mamba_kan_angle_label_smoothing.yaml",
+    "configs/main/m09_dual_gated_mamba_kan_relaxed_resnet_label_smoothing.yaml",
+    "configs/main/m10_dual_gated_mamba_kan_more_relaxed_resnet_label_smoothing.yaml",
     "configs/main/m06_dual_gated_resnet_ldam_drw.yaml",
     "configs/main/m07_dual_gated_resnet_crt.yaml",
 ]
@@ -664,7 +667,6 @@ def main() -> None:
     args = ap.parse_args()
 
     env = os.environ.copy()
-    env.setdefault("WANDB_MODE", "offline")
     env.setdefault("WANDB_DIR", str(PROJECT_ROOT / "wandb"))
 
     default_results = MAIN_RESULTS if args.preset == "main" else DEFAULT_RESULTS

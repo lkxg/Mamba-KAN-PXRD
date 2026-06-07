@@ -53,19 +53,25 @@ scheduler:
   warmup_epochs: 3
 
 train:
-  epochs: 40
+  epochs: 100
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
   log_every: 50
   drop_last: true
 
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 0.0
+  start_epoch: 55
+
 logging:
   wandb:
     enabled: true
     project: mamba-kan-pxrd
     entity: null
-    mode: offline
+    mode: online
     group: main_results
     job_type: train
     tags: [h100, m06, dual-range, gated, resnet, ldam-drw, main]
@@ -84,13 +90,10 @@ loss:
   ldam_scale: 30.0
   ldam_class_weight_beta: 0.9999
   ldam_use_class_weights: false
-  ldam_drw_start_epoch: 21
+  ldam_drw_start_epoch: 51
 
 sampler:
   name: none
-  power: 0.5
-  replacement: true
-  num_samples_multiplier: 1.0
 
 metrics:
   rare_min_train_count: 1
@@ -100,7 +103,7 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: false
+  compile: true
   compile_mode: default
 
 checkpoint:
