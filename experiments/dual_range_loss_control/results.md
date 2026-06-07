@@ -1,3 +1,7 @@
 | experiment | model | loss | best_epoch | val_acc1 | val_macro | val_rare | test_acc1 | test_acc5 | test_macro | test_f1 | test_rare | gate | sa_mamba | wa_mamba | occ_delta_acc1 | occ_delta_macro | occ_delta_f1 | occ_delta_rare |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | e15_dual_gated_resnet_label_smoothing | dual_range | label_smoothing | 35 | 0.745527 | 0.524508 | 0.494700 | 0.745062 | 0.936089 | 0.491870 | 0.504762 | 0.461261 | 0.465963 | none | none | -0.538838 | -0.380433 | -0.383581 | -0.392793 |
+| e16_dual_gated_mamba_label_smoothing | dual_range | label_smoothing | 31 | 0.749524 | 0.547697 | 0.519435 | 0.749402 | 0.913817 | 0.516147 | 0.532831 | 0.481081 | 0.488554 | mamba_ssm | mamba_ssm | -0.413496 | -0.360207 | -0.350377 | -0.353153 |
+| e17_dual_gated_mamba_kan_label_smoothing | dual_range | label_smoothing | 38 | 0.751234 | 0.550067 | 0.528269 | 0.752223 | 0.918626 | 0.523835 | 0.545264 | 0.495495 | 0.491772 | mamba_ssm | mamba_ssm | -0.384341 | -0.347273 | -0.339788 | -0.344144 |
+| e18_dual_gated_resnet_balanced_softmax | dual_range | balanced_softmax | 35 | 0.679670 | 0.558055 | 0.547703 | 0.680703 | 0.906079 | 0.529451 | 0.450822 | 0.508108 | 0.432428 | none | none | -0.485251 | -0.395820 | -0.316413 | -0.405405 |
+| e19_dual_gated_resnet_logit_adjustment | dual_range | logit_adjustment | 35 | 0.722442 | 0.548849 | 0.528269 | 0.723046 | 0.933417 | 0.516405 | 0.487519 | 0.482883 | 0.431189 | none | none | -0.496965 | -0.386259 | -0.353368 | -0.390991 |
