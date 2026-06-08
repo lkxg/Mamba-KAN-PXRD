@@ -45,7 +45,7 @@ model:
       sa_layers: 2
       wa_layers: 4
       d_state: 16
-      d_conv: 8
+      d_conv: 4
       expand: 2
       dropout: 0.05
 
