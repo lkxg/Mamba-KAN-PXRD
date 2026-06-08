@@ -400,6 +400,7 @@ class StepStats:
     class_correct_top1: np.ndarray | None = None
     class_total: np.ndarray | None = None
     aux_loss: float = 0.0
+    contrastive_loss: float = 0.0
     gate_mean: float | None = None
     rare_correct_top1: int | None = None
     rare_total: int | None = None
@@ -463,24 +464,99 @@ def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tens
     return output
 
 
+def supervised_contrastive_loss(
+    embedding: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """Supervised contrastive loss over same-label positives in a batch."""
+    if temperature <= 0:
+        raise ValueError("contrastive temperature must be positive")
+    if embedding.ndim != 2:
+        raise ValueError(f"expected 2D contrastive embedding, got {tuple(embedding.shape)}")
+    if embedding.shape[0] != target.shape[0]:
+        raise ValueError("embedding and target batch sizes must match")
+
+    features = F.normalize(embedding.float(), dim=-1)
+    logits = features @ features.T / float(temperature)
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    batch_size = target.shape[0]
+    self_mask = torch.eye(batch_size, dtype=torch.bool, device=target.device)
+    positive_mask = target.view(-1, 1).eq(target.view(1, -1)) & ~self_mask
+    contrast_mask = ~self_mask
+    positive_count = positive_mask.sum(dim=1)
+    valid_anchor = positive_count > 0
+    if not bool(valid_anchor.any()):
+        return embedding.sum() * 0.0
+
+    logits = logits.masked_fill(~contrast_mask, float("-inf"))
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    positive_log_prob = (
+        log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1)
+        / positive_count.clamp_min(1)
+    )
+    return -positive_log_prob[valid_anchor].mean()
+
+
 def loss_with_auxiliary(
     output: torch.Tensor | dict[str, torch.Tensor],
     target: torch.Tensor,
     loss_fn: nn.Module,
     *,
     aux_weights: dict[str, float] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute main loss plus optional branch auxiliary losses."""
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.1,
+    contrastive_embedding_key: str = "embedding",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute main loss plus optional branch auxiliary and contrastive losses."""
     logits = primary_logits(output)
     main_loss = loss_fn(logits, target)
     aux_loss = logits.sum() * 0.0
+    contrastive_loss = logits.sum() * 0.0
     if isinstance(output, dict):
         weights = aux_weights or {}
         for key in ("sa_logits", "wa_logits"):
             weight = float(weights.get(key, 0.0))
             if weight > 0 and key in output:
                 aux_loss = aux_loss + weight * loss_fn(output[key], target)
-    return main_loss + aux_loss, logits, aux_loss.detach()
+        if contrastive_weight > 0:
+            if contrastive_embedding_key not in output:
+                raise KeyError(
+                    f"contrastive embedding {contrastive_embedding_key!r} missing from model output"
+                )
+            contrastive_loss = supervised_contrastive_loss(
+                output[contrastive_embedding_key],
+                target,
+                temperature=contrastive_temperature,
+            )
+    elif contrastive_weight > 0:
+        raise TypeError("contrastive loss requires a model output dict with embeddings")
+    total_loss = main_loss + aux_loss + float(contrastive_weight) * contrastive_loss
+    return total_loss, logits, aux_loss.detach(), contrastive_loss.detach()
+
+
+def supervised_contrastive_config(
+    loss_cfg: dict,
+    *,
+    epoch: int,
+) -> tuple[float, float, str]:
+    """Return scheduled supervised-contrastive weight, temperature, and key."""
+    cfg = loss_cfg.get("supervised_contrastive", {}) or {}
+    temperature = float(cfg.get("temperature", 0.1))
+    embedding_key = str(cfg.get("embedding_key", "embedding"))
+    if not bool(cfg.get("enabled", False)):
+        return 0.0, temperature, embedding_key
+
+    weight = float(cfg.get("weight", 0.05))
+    start_epoch = int(cfg.get("start_epoch", 1))
+    warmup_epochs = int(cfg.get("warmup_epochs", 0))
+    if epoch < start_epoch:
+        weight = 0.0
+    elif warmup_epochs > 0:
+        weight *= min(1.0, (epoch - start_epoch + 1) / warmup_epochs)
+    return weight, temperature, embedding_key
 
 
 def output_gate_mean(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor | None:
@@ -531,6 +607,9 @@ def train_one_epoch(
     use_amp: bool | None = None,
     amp_dtype: torch.dtype | None = None,
     aux_loss_weights: dict[str, float] | None = None,
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.1,
+    contrastive_embedding_key: str = "embedding",
     rare_classes: set[int] | None = None,
     freeze_batch_norm: bool = False,
 ) -> StepStats:
@@ -557,6 +636,7 @@ def train_one_epoch(
                 module.eval()
     total_loss = 0.0
     total_aux_loss = 0.0
+    total_contrastive_loss = 0.0
     n = correct1 = correct5 = correct10 = 0
     rare_correct1 = rare_total = 0
     gate_sum = 0.0
@@ -580,11 +660,14 @@ def train_one_epoch(
             dtype=amp_dtype,
         ):
             output = model(x)
-            loss, logits, aux_loss = loss_with_auxiliary(
+            loss, logits, aux_loss, contrastive_loss = loss_with_auxiliary(
                 output,
                 y,
                 loss_fn,
                 aux_weights=aux_loss_weights,
+                contrastive_weight=contrastive_weight,
+                contrastive_temperature=contrastive_temperature,
+                contrastive_embedding_key=contrastive_embedding_key,
             )
 
         # 反向传播
@@ -605,6 +688,7 @@ def train_one_epoch(
         bsz = y.size(0)
         total_loss += float(loss.item()) * bsz
         total_aux_loss += float(aux_loss.item()) * bsz
+        total_contrastive_loss += float(contrastive_loss.item()) * bsz
         n += bsz
         correct1 += _accuracy_topk(logits.detach(), y, k=1)
         correct5 += _accuracy_topk(logits.detach(), y, k=5)
@@ -634,6 +718,7 @@ def train_one_epoch(
         correct_top5=correct5,
         correct_top10=correct10,
         aux_loss=total_aux_loss / max(n, 1),
+        contrastive_loss=total_contrastive_loss / max(n, 1),
         gate_mean=(gate_sum / gate_count) if gate_count else None,
         rare_correct_top1=rare_correct1 if rare_classes else None,
         rare_total=rare_total if rare_classes else None,
@@ -684,7 +769,7 @@ def evaluate(
             dtype=amp_dtype,
         ):
             output = model(x)
-            loss, logits, aux_loss = loss_with_auxiliary(
+            loss, logits, aux_loss, _contrastive_loss = loss_with_auxiliary(
                 output,
                 y,
                 loss_fn,
@@ -742,6 +827,7 @@ __all__ = [
     "configure_backend", "amp_dtype_from_config",
     "FocalLoss", "LDAMLoss", "build_loss", "build_loss_from_config",
     "StepStats", "primary_logits", "loss_with_auxiliary",
+    "supervised_contrastive_config", "supervised_contrastive_loss",
     "rare_classes_from_counts", "aux_loss_weights_from_model",
     "train_one_epoch", "evaluate",
 ]

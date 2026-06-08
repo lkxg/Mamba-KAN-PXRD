@@ -952,6 +952,11 @@ class DualPlaneMambaClassifier(nn.Module):
         head: str = "mlp",
         head_hidden: Sequence[int] = (512,),
         head_dropout: float = 0.1,
+        projection_head: str = "kan",
+        projection_dim: int = 0,
+        projection_hidden: Sequence[int] = (256,),
+        projection_dropout: float = 0.1,
+        projection_normalize: bool = True,
         aux_heads: bool = False,
         sa_aux_weight: float = 0.1,
         wa_aux_weight: float = 0.1,
@@ -972,6 +977,7 @@ class DualPlaneMambaClassifier(nn.Module):
         self.fusion = fusion.lower()
         self.gate_type = gate.lower()
         self.aux_heads_enabled = bool(aux_heads)
+        self.projection_normalize = bool(projection_normalize)
 
         self.sa_slice = _range_to_slice(
             start_deg=float(sa_range[0]),
@@ -1101,6 +1107,19 @@ class DualPlaneMambaClassifier(nn.Module):
             dropout=head_dropout,
             kan_grids=kan_grids,
         )
+        projection_dim = int(projection_dim)
+        self.projection_head = (
+            _make_head(
+                name=projection_head,
+                in_dim=fused_dim,
+                out_dim=projection_dim,
+                hidden=projection_hidden,
+                dropout=projection_dropout,
+                kan_grids=kan_grids,
+            )
+            if projection_dim > 0
+            else None
+        )
         self.aux_loss_weights = {
             "sa_logits": (
                 float(sa_aux_weight)
@@ -1167,6 +1186,11 @@ class DualPlaneMambaClassifier(nn.Module):
             fused = parts[0]
 
         outputs["logits"] = self.head(fused)
+        if self.projection_head is not None:
+            embedding = self.projection_head(fused)
+            if self.projection_normalize:
+                embedding = F.normalize(embedding.float(), dim=-1).to(dtype=fused.dtype)
+            outputs["embedding"] = embedding
         if self.aux_heads_enabled:
             if f_sa is not None and hasattr(self, "sa_head"):
                 outputs["sa_logits"] = self.sa_head(f_sa)

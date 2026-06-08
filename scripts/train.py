@@ -35,6 +35,7 @@ from src.training import (
     configure_backend,
     evaluate,
     rare_classes_from_counts,
+    supervised_contrastive_config,
     train_one_epoch,
 )
 from src.utils import load_config, set_seed
@@ -622,6 +623,9 @@ def main():
         else:
             lr = phase_base_lr
 
+        contrastive_weight, contrastive_temperature, contrastive_embedding_key = (
+            supervised_contrastive_config(loss_cfg, epoch=epoch_num)
+        )
         t0 = time.time()
 
         # 训练一个 epoch
@@ -633,6 +637,9 @@ def main():
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             aux_loss_weights=aux_loss_weights,
+            contrastive_weight=contrastive_weight,
+            contrastive_temperature=contrastive_temperature,
+            contrastive_embedding_key=contrastive_embedding_key,
             rare_classes=rare_classes,
             freeze_batch_norm=freeze_batch_norm,
         )
@@ -664,6 +671,11 @@ def main():
         ]
         if val_stats.aux_loss:
             extra_parts.append(f"aux={val_stats.aux_loss:.4f}")
+        if train_stats.contrastive_loss:
+            extra_parts.append(
+                f"supcon={train_stats.contrastive_loss:.4f}"
+                f"x{contrastive_weight:.3f}"
+            )
         if val_stats.gate_mean is not None:
             extra_parts.append(f"gate={val_stats.gate_mean:.4f}")
         print(f"epoch {epoch+1:3d}/{epochs}  "
@@ -688,6 +700,8 @@ def main():
                 "train_acc1": train_stats.acc1,
                 "train_acc5": train_stats.acc5,
                 "train_acc10": train_stats.acc10,
+                "train_contrastive_loss": train_stats.contrastive_loss,
+                "train_contrastive_weight": contrastive_weight,
                 "val_loss": val_stats.loss,
                 "val_acc1": val_stats.acc1,
                 "val_acc5": val_stats.acc5,

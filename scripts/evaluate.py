@@ -225,7 +225,7 @@ def evaluate_with_predictions(
             dtype=amp_dtype,
         ):
             output = model(x)
-            loss, logits, aux_loss = loss_with_auxiliary(
+            loss, logits, aux_loss, _contrastive_loss = loss_with_auxiliary(
                 output,
                 y,
                 loss_fn,

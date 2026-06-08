@@ -6,7 +6,7 @@ data:
   root: dataset
   splits_csv: splits/splits.csv
   task: space_group
-  batch_size: 256
+  batch_size: 512
   num_workers: 12
   prefetch_factor: 4
   pin_memory: true
@@ -67,14 +67,14 @@ train:
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
-  log_every: 50
+  log_every: 100
   drop_last: true
 
 early_stopping:
   enabled: true
-  patience: 15
+  patience: 10
   min_delta: 0.0
-  start_epoch: 50
+  start_epoch: 40
 
 logging:
   wandb:
@@ -120,5 +120,5 @@ checkpoint:
   monitor: val_balanced_acc1_macro
   mode: max
   balanced_metric:
-    acc1_weight: 0.4
-    macro_acc1_weight: 0.6
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5

@@ -49,13 +49,15 @@ MAIN_CONFIGS = [
     "configs/main/m05_dual_gated_mamba_kan_label_smoothing.yaml",
     "configs/main/m08_dual_gated_mamba_kan_angle_label_smoothing.yaml",
     "configs/main/m09_dual_gated_mamba_kan_relaxed_resnet_label_smoothing.yaml",
-    "configs/main/m10_dual_gated_mamba_kan_more_relaxed_resnet_label_smoothing.yaml",
     "configs/main/m06_dual_gated_resnet_ldam_drw.yaml",
     "configs/main/m07_dual_gated_resnet_crt.yaml",
     "configs/main/m11_dual_plane_resconv_label_smoothing.yaml",
     "configs/main/m12_dual_plane_mamba_resconv_label_smoothing.yaml",
     "configs/main/m13_dual_plane_mamba_kan_gate_label_smoothing.yaml",
     "configs/main/m14_dual_plane_mamba_kan_gate_aux_label_smoothing.yaml",
+    "configs/main/m15_dual_plane_mamba_kan_gate_aux_supcon.yaml",
+    "configs/main/m16_dual_plane_mamba_kan_gate_aux_supcon_d64.yaml",
+    "configs/main/m17_wa_only_plane_mamba_kan_aux_supcon.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -460,6 +462,7 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"fusion={model_cfg.get('fusion', 'gated')},"
             f"gate={model_cfg.get('gate', 'mlp')},"
             f"mamba={model_cfg.get('mamba', {})},"
+            f"proj={model_cfg.get('projection_dim', 0)},"
             f"aux={model_cfg.get('aux_heads', False)}"
         )
     else:
@@ -468,6 +471,8 @@ def summarize_config(cfg: dict) -> dict[str, str]:
     loss_name = str(cfg["loss"]["name"])
     if cfg.get("train", {}).get("crt", {}).get("enabled", False):
         loss_name = f"{loss_name}+crt"
+    if cfg.get("loss", {}).get("supervised_contrastive", {}).get("enabled", False):
+        loss_name = f"{loss_name}+supcon"
     return {
         "experiment": cfg["experiment"]["name"],
         "model": model_name,

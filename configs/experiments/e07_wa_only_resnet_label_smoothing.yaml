@@ -57,7 +57,7 @@ train:
   amp: true
   amp_dtype: bf16
   grad_clip: 1.0
-  log_every: 50
+  log_every: 100
   drop_last: true
 
 logging:
