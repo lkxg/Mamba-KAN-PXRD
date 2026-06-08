@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
 from src.models import (
     BiGRUPatchClassifier,
+    DualPlaneMambaClassifier,
     DualRangePXRDClassifier,
     MLPClassifier,
     PatchTSTClassifier,
@@ -85,6 +86,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
             in_dim=in_dim,
             num_classes=num_classes,
             **cfg["model"].get("dual_range", {}),
+        )
+    if name == "dual_plane_mamba":
+        return DualPlaneMambaClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("dual_plane_mamba", {}),
         )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(

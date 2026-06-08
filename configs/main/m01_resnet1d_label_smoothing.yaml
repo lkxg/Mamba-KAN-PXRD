@@ -73,7 +73,7 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: true
+  compile: false
   compile_mode: default
 
 checkpoint:

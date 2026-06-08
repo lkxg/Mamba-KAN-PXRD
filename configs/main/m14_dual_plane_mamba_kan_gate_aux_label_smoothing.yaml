@@ -1,56 +1,66 @@
 experiment:
-  name: m06_dual_gated_resnet_ldam_drw
+  name: m14_dual_plane_mamba_kan_gate_aux_label_smoothing
   seed: 42
 
 data:
   root: dataset
   splits_csv: splits/splits.csv
   task: space_group
-  batch_size: 512
+  batch_size: 256
   num_workers: 12
   prefetch_factor: 4
   pin_memory: true
 
 model:
-  name: dual_range
-  dual_range:
+  name: dual_plane_mamba
+  dual_plane_mamba:
     theta_min: 5.0
     theta_max: 90.0
     sa_range: [5.0, 15.0]
     wa_range: [10.0, 90.0]
     use_sa: true
     use_wa: true
-    add_angle_channel: false
+    d_model: 32
+    sa_conv_channels: [32, 64, 128]
+    wa_conv_channels: [32, 64, 128, 256]
+    sa_blocks_per_stage: [1, 1, 1]
+    wa_blocks_per_stage: [1, 1, 1, 1]
+    pool_every_stage: true
+    pool_type: max
+    token_mode: multiply
+    token_dropout: 0.05
+    branch_dropout: 0.1
     fusion: gated
+    fusion_dim: 256
+    gate: kan
+    gate_hidden: [256]
+    gate_groups: 16
+    gate_dropout: 0.1
+    kan_grids: 8
     head: mlp
     head_hidden: [512]
     head_dropout: 0.1
-    aux_heads: false
-    sa_base_channels: 24
-    sa_blocks_per_stage: [2, 2, 2]
-    wa_base_channels: 64
-    wa_blocks_per_stage: [3, 4, 6, 3]
-    stem_kernel: 15
-    stem_stride: 4
-    stem_pool: true
+    aux_heads: true
+    sa_aux_weight: 0.1
+    wa_aux_weight: 0.1
     mamba:
       backend: auto
-      sa_layers: 0
-      wa_layers: 0
+      sa_layers: 2
+      wa_layers: 4
       d_state: 16
-      d_conv: 4
+      d_conv: 8
       expand: 2
-      dropout: 0.0
+      dropout: 0.05
 
 optim:
   name: adamw
-  lr: 8.0e-4
+  lr: 6.0e-4
   weight_decay: 5.0e-4
   betas: [0.9, 0.999]
 
 scheduler:
   name: cosine
-  warmup_epochs: 3
+  warmup_epochs: 5
 
 train:
   epochs: 100
@@ -64,7 +74,7 @@ early_stopping:
   enabled: true
   patience: 15
   min_delta: 0.0
-  start_epoch: 55
+  start_epoch: 50
 
 logging:
   wandb:
@@ -74,8 +84,8 @@ logging:
     mode: online
     group: main_results
     job_type: train
-    tags: [h100, m06, dual-range, gated, resnet, ldam-drw, main]
-    notes: Main dual-range gated ResNet with LDAM loss and deferred re-weighting.
+    tags: [h100, m14, dual-plane, mamba, kan-gate, aux-heads, resconv, plane-token, label-smoothing, main]
+    notes: Dual SA/WA angle-token Mamba-ResConv model with KAN fusion gate and branch auxiliary losses.
     dir: wandb
     save_code: true
     watch_model: false
@@ -84,16 +94,14 @@ logging:
     log_best_checkpoint: false
 
 loss:
-  name: ldam
-  label_smoothing: 0.0
-  ldam_max_m: 0.5
-  ldam_scale: 30.0
-  ldam_class_weight_beta: 0.9999
-  ldam_use_class_weights: false
-  ldam_drw_start_epoch: 51
+  name: label_smoothing
+  label_smoothing: 0.05
 
 sampler:
-  name: none
+  name: class_balanced
+  power: 0.5
+  replacement: true
+  num_samples_multiplier: 1.0
 
 metrics:
   rare_min_train_count: 1

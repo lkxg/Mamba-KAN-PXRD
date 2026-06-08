@@ -73,7 +73,7 @@ performance:
   tf32: true                     # 允许 TF32 加速 FP32 matmul/conv
   cudnn_benchmark: true          # 固定输入长度下可加速卷积
   matmul_precision: high         # torch.set_float32_matmul_precision
-  compile: true                  # PyTorch 2.x 编译优化；如首轮编译太慢可设为 false
+  compile: false                 # PyTorch 2.x 编译优化；如首轮编译太慢可设为 false
   compile_mode: default
 
 checkpoint:

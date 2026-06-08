@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
 from src.models import (
     BiGRUPatchClassifier,
+    DualPlaneMambaClassifier,
     DualRangePXRDClassifier,
     MLPClassifier,
     PatchTSTClassifier,
@@ -64,6 +65,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
             in_dim=in_dim,
             num_classes=num_classes,
             **cfg["model"].get("dual_range", {}),
+        )
+    if name == "dual_plane_mamba":
+        return DualPlaneMambaClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("dual_plane_mamba", {}),
         )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(
@@ -119,8 +126,8 @@ def build_balanced_sampler(
     if name != "class_balanced":
         raise ValueError(f"unknown sampler: {name!r}")
 
-    labels = torch.as_tensor(labels_for_rows(labels_csv, train_rows, task), dtype=torch.long)
-    counts = torch.as_tensor(class_counts, dtype=torch.float64)
+    labels = torch.tensor(labels_for_rows(labels_csv, train_rows, task), dtype=torch.long)
+    counts = torch.tensor(class_counts, dtype=torch.float64)
     power = float(sampler_cfg.get("power", 0.5))
     if power < 0:
         raise ValueError("sampler.power must be non-negative")

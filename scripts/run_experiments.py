@@ -16,7 +16,6 @@ import re
 import subprocess
 import sys
 import time
-from importlib.util import find_spec
 from pathlib import Path
 
 import torch
@@ -53,6 +52,10 @@ MAIN_CONFIGS = [
     "configs/main/m10_dual_gated_mamba_kan_more_relaxed_resnet_label_smoothing.yaml",
     "configs/main/m06_dual_gated_resnet_ldam_drw.yaml",
     "configs/main/m07_dual_gated_resnet_crt.yaml",
+    "configs/main/m11_dual_plane_resconv_label_smoothing.yaml",
+    "configs/main/m12_dual_plane_mamba_resconv_label_smoothing.yaml",
+    "configs/main/m13_dual_plane_mamba_kan_gate_label_smoothing.yaml",
+    "configs/main/m14_dual_plane_mamba_kan_gate_aux_label_smoothing.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -449,6 +452,16 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"mamba={model_cfg.get('mamba', {})},"
             f"aux={model_cfg.get('aux_heads', False)}"
         )
+    elif model_name == "dual_plane_mamba":
+        model_params = (
+            f"sa{model_cfg.get('use_sa', True)},"
+            f"wa{model_cfg.get('use_wa', True)},"
+            f"d={model_cfg.get('d_model')},"
+            f"fusion={model_cfg.get('fusion', 'gated')},"
+            f"gate={model_cfg.get('gate', 'mlp')},"
+            f"mamba={model_cfg.get('mamba', {})},"
+            f"aux={model_cfg.get('aux_heads', False)}"
+        )
     else:
         model_params = str(model_cfg)
     optim_cfg = cfg.get("optim", {})
@@ -469,42 +482,47 @@ def summarize_config(cfg: dict) -> dict[str, str]:
 
 def mamba_layers_requested(cfg: dict) -> int:
     """Return total branch Mamba layers requested by a config."""
-    if cfg.get("model", {}).get("name", "").lower() != "dual_range":
+    model_name = cfg.get("model", {}).get("name", "").lower()
+    if model_name not in {"dual_range", "dual_plane_mamba"}:
         return 0
-    mamba_cfg = cfg.get("model", {}).get("dual_range", {}).get("mamba", {}) or {}
+    model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
+    mamba_cfg = model_cfg.get("mamba", {}) or {}
     return int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
 
 
-def validate_mamba_backend(cfg: dict, *, allow_fallback: bool) -> None:
-    """Guard official matrix runs against accidentally using the local fallback."""
+def mamba_ssm_import_error() -> str | None:
+    """Return the mamba-ssm import error, or None when Mamba is usable."""
+    try:
+        from mamba_ssm import Mamba  # noqa: F401
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def validate_mamba_backend(cfg: dict) -> None:
+    """Require mamba-ssm whenever a config requests Mamba layers."""
     if mamba_layers_requested(cfg) <= 0:
         return
 
-    mamba_cfg = cfg.get("model", {}).get("dual_range", {}).get("mamba", {}) or {}
+    model_name = cfg.get("model", {}).get("name", "").lower()
+    model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
+    mamba_cfg = model_cfg.get("mamba", {}) or {}
     backend = str(mamba_cfg.get("backend", "auto")).lower()
-    if backend not in {"auto", "mamba_ssm", "local"}:
+    if backend not in {"auto", "mamba_ssm"}:
         raise ValueError(f"unknown mamba backend: {backend!r}")
 
-    has_mamba_ssm = find_spec("mamba_ssm") is not None
-    if backend == "local":
-        if allow_fallback:
-            return
-        raise RuntimeError(
-            f"{cfg['experiment']['name']} requests mamba.backend: local. "
-            "Use --allow-mamba-fallback only for CPU/smoke runs; official "
-            "Mamba rows must use mamba_ssm."
-        )
-    if backend == "auto" and not has_mamba_ssm and not allow_fallback:
+    import_error = mamba_ssm_import_error()
+    if backend == "auto" and import_error is not None:
         raise RuntimeError(
             f"{cfg['experiment']['name']} requests Mamba layers but mamba-ssm "
             "is not importable. Install mamba-ssm/causal-conv1d on the CUDA "
-            "runner, set mamba.backend: mamba_ssm, or pass "
-            "--allow-mamba-fallback for a non-final smoke run."
+            "runner, or set mamba.backend: mamba_ssm to require it explicitly. "
+            f"Import error: {import_error}"
         )
-    if backend == "mamba_ssm" and not has_mamba_ssm:
+    if backend == "mamba_ssm" and import_error is not None:
         raise RuntimeError(
             f"{cfg['experiment']['name']} requires mamba_ssm, but the package "
-            "is not importable."
+            f"is not importable. Import error: {import_error}"
         )
 
 
@@ -655,15 +673,6 @@ def main() -> None:
         action="store_true",
         help="Forward to evaluate.py --skip-occlusion.",
     )
-    ap.add_argument(
-        "--allow-mamba-fallback",
-        action="store_true",
-        help=(
-            "Allow Mamba configs to run with the local selective-sequence "
-            "fallback when mamba-ssm is unavailable. Use only for smoke tests, "
-            "not final Mamba claims."
-        ),
-    )
     args = ap.parse_args()
 
     env = os.environ.copy()
@@ -679,7 +688,7 @@ def main() -> None:
     for config_path_str in resolve_config_paths(args.preset, args.configs):
         config_path = Path(config_path_str)
         cfg = load_config(config_path)
-        validate_mamba_backend(cfg, allow_fallback=args.allow_mamba_fallback)
+        validate_mamba_backend(cfg)
         run_name = cfg["experiment"]["name"]
         print(f"\n=== {run_name}: {config_path} ===", flush=True)
         started_at = time.time()

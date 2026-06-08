@@ -20,8 +20,10 @@ import torch.nn.functional as F
 
 try:
     from mamba_ssm import Mamba as _MambaSSM
-except Exception:  # pragma: no cover - optional CUDA extension
+    _MambaSSM_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional CUDA extension
     _MambaSSM = None
+    _MambaSSM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 def _num_patches(signal_length: int, patch_len: int, stride: int) -> int:
@@ -335,51 +337,6 @@ class _ResNetFeatureEncoder(nn.Module):
         return F.adaptive_avg_pool1d(seq, 1).flatten(1)
 
 
-class _LocalSelectiveSSMBlock(nn.Module):
-    """A lightweight selective sequence mixer used when mamba-ssm is unavailable.
-
-    It preserves the Mamba placement and tensor contract for ablations: local
-    depthwise convolution gates a residual feed-forward path over the compressed
-    ResNet feature sequence.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        *,
-        expand: int = 2,
-        d_conv: int = 5,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if d_model <= 0:
-            raise ValueError("d_model must be positive")
-        if expand <= 0 or d_conv <= 0:
-            raise ValueError("expand and d_conv must be positive")
-        inner = int(d_model * expand)
-        self.norm = nn.LayerNorm(d_model)
-        self.in_proj = nn.Linear(d_model, inner * 2)
-        self.conv = nn.Conv1d(
-            inner,
-            inner,
-            kernel_size=d_conv,
-            padding=d_conv // 2,
-            groups=inner,
-        )
-        self.out_proj = nn.Linear(inner, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        value, gate = self.in_proj(x).chunk(2, dim=-1)
-        value = self.conv(value.transpose(1, 2)).transpose(1, 2)
-        if value.shape[1] != gate.shape[1]:
-            value = value[:, : gate.shape[1], :]
-        value = F.silu(value) * torch.sigmoid(gate)
-        return residual + self.dropout(self.out_proj(value))
-
-
 class _ResidualMambaSSMBlock(nn.Module):
     """LayerNorm + residual wrapper around the optional mamba-ssm block."""
 
@@ -394,7 +351,14 @@ class _ResidualMambaSSMBlock(nn.Module):
     ) -> None:
         super().__init__()
         if _MambaSSM is None:
-            raise ImportError("mamba_ssm is not installed")
+            raise ImportError(
+                "mamba_ssm is not importable"
+                + (
+                    f": {_MambaSSM_IMPORT_ERROR}"
+                    if _MambaSSM_IMPORT_ERROR
+                    else ""
+                )
+            )
         self.norm = nn.LayerNorm(d_model)
         self.mixer = _MambaSSM(
             d_model=d_model,
@@ -409,7 +373,7 @@ class _ResidualMambaSSMBlock(nn.Module):
 
 
 class _MambaSequenceMixer(nn.Module):
-    """Stacked Mamba blocks with an explicit local fallback backend."""
+    """Stacked Mamba blocks backed by mamba-ssm."""
 
     def __init__(
         self,
@@ -429,36 +393,30 @@ class _MambaSequenceMixer(nn.Module):
             self.blocks = nn.ModuleList()
             self.actual_backend = "none"
             return
-        if self.backend not in {"auto", "mamba_ssm", "local"}:
-            raise ValueError("mamba backend must be auto, mamba_ssm, or local")
+        if self.backend not in {"auto", "mamba_ssm"}:
+            raise ValueError("mamba backend must be auto or mamba_ssm")
 
-        use_mamba = self.backend in {"auto", "mamba_ssm"} and _MambaSSM is not None
-        if self.backend == "mamba_ssm" and not use_mamba:
+        if _MambaSSM is None:
             raise ImportError(
                 "mamba_ssm is not installed. Install mamba-ssm/causal-conv1d "
-                "or set mamba.backend: local."
+                "before running configs that request Mamba layers."
+                + (
+                    f" Import error: {_MambaSSM_IMPORT_ERROR}"
+                    if _MambaSSM_IMPORT_ERROR
+                    else ""
+                )
             )
 
         blocks: list[nn.Module] = []
-        if use_mamba:
-            for _ in range(self.num_layers):
-                blocks.append(_ResidualMambaSSMBlock(
-                    d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                    dropout=dropout,
-                ))
-            self.actual_backend = "mamba_ssm"
-        else:
-            for _ in range(self.num_layers):
-                blocks.append(_LocalSelectiveSSMBlock(
-                    d_model,
-                    expand=expand,
-                    d_conv=d_conv,
-                    dropout=dropout,
-                ))
-            self.actual_backend = "local"
+        for _ in range(self.num_layers):
+            blocks.append(_ResidualMambaSSMBlock(
+                d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout,
+            ))
+        self.actual_backend = "mamba_ssm"
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(d_model)
 
@@ -845,6 +803,378 @@ class DualRangePXRDClassifier(nn.Module):
         return outputs if len(outputs) > 1 else outputs["logits"]
 
 
+class _PlaneTokenResConvBranch(nn.Module):
+    """XRDMamba-style angle-token branch followed by optional Mamba and ResConv."""
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 16,
+        conv_channels: Sequence[int] = (32, 64, 128),
+        blocks_per_stage: Sequence[int] | int = 1,
+        pool_every_stage: bool = True,
+        pool_type: str = "max",
+        token_mode: str = "multiply",
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        if branch_length <= 0:
+            raise ValueError("branch_length must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        conv_channels = _as_tuple(conv_channels)
+        if not conv_channels:
+            raise ValueError("conv_channels must contain at least one channel")
+        blocks = _as_tuple(blocks_per_stage)
+        if len(blocks) == 1 and len(conv_channels) > 1:
+            blocks = blocks * len(conv_channels)
+        if len(blocks) != len(conv_channels):
+            raise ValueError("blocks_per_stage must be length 1 or match conv_channels")
+        pool_type = pool_type.lower()
+        if pool_type not in {"avg", "max"}:
+            raise ValueError("pool_type must be avg or max")
+        token_mode = token_mode.lower()
+        if token_mode not in {"add", "multiply"}:
+            raise ValueError("token_mode must be add or multiply")
+
+        self.branch_length = int(branch_length)
+        self.token_mode = token_mode
+        self.plane_embed = nn.Embedding(self.branch_length, int(d_model))
+        self.intensity_proj = (
+            nn.Linear(1, int(d_model))
+            if self.token_mode == "add"
+            else None
+        )
+        self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_dropout = nn.Dropout(float(token_dropout))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model),
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+
+        layers: list[nn.Module] = []
+        ch = int(d_model)
+        for out_ch, n_blocks in zip(conv_channels, blocks):
+            out_ch = int(out_ch)
+            for block_idx in range(int(n_blocks)):
+                layers.append(_ResBlock1D(
+                    ch if block_idx == 0 else out_ch,
+                    out_ch,
+                    stride=1,
+                ))
+            ch = out_ch
+            if pool_every_stage:
+                if pool_type == "avg":
+                    layers.append(nn.AvgPool1d(kernel_size=2, stride=2, ceil_mode=True))
+                else:
+                    layers.append(nn.MaxPool1d(kernel_size=2, stride=2, ceil_mode=True))
+        self.resconv = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(ch)
+        self.out_dim = ch
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(
+                f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
+            )
+
+        idx = torch.arange(self.branch_length, device=x.device)
+        pos = self.plane_embed(idx).unsqueeze(0).to(dtype=x.dtype)
+        if self.token_mode == "multiply":
+            tokens = pos * x.unsqueeze(-1)
+        else:
+            if self.intensity_proj is None:
+                raise RuntimeError("intensity projection is required for add token_mode")
+            value = self.intensity_proj(x.unsqueeze(-1))
+            tokens = value + pos.to(dtype=value.dtype)
+        tokens = self.token_norm(tokens)
+        tokens = self.token_dropout(tokens)
+        tokens = self.mixer(tokens)
+
+        seq = self.resconv(tokens.transpose(1, 2))
+        feat = self.pool(seq).flatten(1)
+        return self.feature_norm(self.dropout(feat))
+
+
+class DualPlaneMambaClassifier(nn.Module):
+    """SA/WA diffraction-angle token model with optional Mamba and KAN fusion.
+
+    This follows the XRDMamba ordering more closely than DualRangePXRDClassifier:
+    intensity-projected angle-position tokens are mixed as a sequence and then
+    summarized by a lightweight residual convolutional aggregator.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 10824,
+        num_classes: int = 230,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+        sa_range: Sequence[float] = (5.0, 15.0),
+        wa_range: Sequence[float] = (10.0, 90.0),
+        use_sa: bool = True,
+        use_wa: bool = True,
+        d_model: int = 16,
+        sa_conv_channels: Sequence[int] = (32, 64, 128),
+        wa_conv_channels: Sequence[int] = (32, 64, 128, 256),
+        sa_blocks_per_stage: Sequence[int] | int = 1,
+        wa_blocks_per_stage: Sequence[int] | int = 1,
+        pool_every_stage: bool = True,
+        pool_type: str = "max",
+        token_mode: str = "multiply",
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        fusion: str = "gated",
+        fusion_dim: int | None = None,
+        gate: str = "mlp",
+        gate_hidden: Sequence[int] = (256,),
+        gate_groups: int = 16,
+        gate_dropout: float = 0.1,
+        kan_grids: int = 8,
+        head: str = "mlp",
+        head_hidden: Sequence[int] = (512,),
+        head_dropout: float = 0.1,
+        aux_heads: bool = False,
+        sa_aux_weight: float = 0.1,
+        wa_aux_weight: float = 0.1,
+        mamba: dict | None = None,
+    ) -> None:
+        super().__init__()
+        if not use_sa and not use_wa:
+            raise ValueError("at least one branch must be enabled")
+        if len(sa_range) != 2 or len(wa_range) != 2:
+            raise ValueError("sa_range and wa_range must be [start, end]")
+
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        self.theta_min = float(theta_min)
+        self.theta_max = float(theta_max)
+        self.use_sa = bool(use_sa)
+        self.use_wa = bool(use_wa)
+        self.fusion = fusion.lower()
+        self.gate_type = gate.lower()
+        self.aux_heads_enabled = bool(aux_heads)
+
+        self.sa_slice = _range_to_slice(
+            start_deg=float(sa_range[0]),
+            end_deg=float(sa_range[1]),
+            signal_length=self.in_dim,
+            theta_min=self.theta_min,
+            theta_max=self.theta_max,
+        )
+        self.wa_slice = _range_to_slice(
+            start_deg=float(wa_range[0]),
+            end_deg=float(wa_range[1]),
+            signal_length=self.in_dim,
+            theta_min=self.theta_min,
+            theta_max=self.theta_max,
+        )
+
+        mamba_cfg = dict(mamba or {})
+        mamba_backend = mamba_cfg.get("backend", "auto")
+        common_mamba = dict(
+            mamba_d_state=int(mamba_cfg.get("d_state", 16)),
+            mamba_d_conv=int(mamba_cfg.get("d_conv", 4)),
+            mamba_expand=int(mamba_cfg.get("expand", 2)),
+            mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
+            mamba_backend=mamba_backend,
+        )
+        sa_layers = int(mamba_cfg.get("sa_layers", 0))
+        wa_layers = int(mamba_cfg.get("wa_layers", 0))
+
+        if self.use_sa:
+            self.sa_branch = _PlaneTokenResConvBranch(
+                branch_length=self.sa_slice.stop - self.sa_slice.start,
+                d_model=d_model,
+                conv_channels=sa_conv_channels,
+                blocks_per_stage=sa_blocks_per_stage,
+                pool_every_stage=pool_every_stage,
+                pool_type=pool_type,
+                token_mode=token_mode,
+                token_dropout=token_dropout,
+                branch_dropout=branch_dropout,
+                mamba_layers=sa_layers,
+                **common_mamba,
+            )
+            sa_dim = self.sa_branch.out_dim
+        else:
+            self.sa_branch = None
+            sa_dim = 0
+
+        if self.use_wa:
+            self.wa_branch = _PlaneTokenResConvBranch(
+                branch_length=self.wa_slice.stop - self.wa_slice.start,
+                d_model=d_model,
+                conv_channels=wa_conv_channels,
+                blocks_per_stage=wa_blocks_per_stage,
+                pool_every_stage=pool_every_stage,
+                pool_type=pool_type,
+                token_mode=token_mode,
+                token_dropout=token_dropout,
+                branch_dropout=branch_dropout,
+                mamba_layers=wa_layers,
+                **common_mamba,
+            )
+            wa_dim = self.wa_branch.out_dim
+        else:
+            self.wa_branch = None
+            wa_dim = 0
+
+        if self.fusion not in {"concat", "gated"}:
+            raise ValueError("fusion must be concat or gated")
+        if self.gate_type not in {"mlp", "kan"}:
+            raise ValueError("gate must be mlp or kan")
+
+        if self.use_sa and self.use_wa:
+            aligned_dim = int(fusion_dim or max(sa_dim, wa_dim))
+            self.sa_align = nn.Linear(sa_dim, aligned_dim) if sa_dim != aligned_dim else nn.Identity()
+            self.wa_align = nn.Linear(wa_dim, aligned_dim) if wa_dim != aligned_dim else nn.Identity()
+            if self.fusion == "concat":
+                fused_dim = aligned_dim * 2
+                self.gate = None
+                self.gate_groups = 0
+            else:
+                gate_groups = int(gate_groups)
+                if gate_groups <= 0:
+                    raise ValueError("gate_groups must be positive")
+                self.gate_groups = min(gate_groups, aligned_dim)
+                gate_in = aligned_dim * 4
+                hidden = _as_tuple(gate_hidden)
+                if self.gate_type == "mlp":
+                    layers: list[nn.Module] = [nn.LayerNorm(gate_in)]
+                    prev = gate_in
+                    for h in hidden:
+                        layers.extend([
+                            nn.Linear(prev, int(h)),
+                            nn.GELU(),
+                            nn.Dropout(gate_dropout),
+                        ])
+                        prev = int(h)
+                    layers.append(nn.Linear(prev, self.gate_groups))
+                    self.gate = nn.Sequential(*layers)
+                else:
+                    self.gate = nn.Sequential(
+                        nn.LayerNorm(gate_in),
+                        KANHead(
+                            gate_in,
+                            self.gate_groups,
+                            hidden=hidden,
+                            num_grids=kan_grids,
+                            dropout=gate_dropout,
+                        ),
+                    )
+                fused_dim = aligned_dim
+            self.branch_feature_dim = aligned_dim
+        else:
+            only_dim = sa_dim if self.use_sa else wa_dim
+            aligned_dim = int(fusion_dim or only_dim)
+            self.sa_align = nn.Linear(sa_dim, aligned_dim) if self.use_sa and sa_dim != aligned_dim else nn.Identity()
+            self.wa_align = nn.Linear(wa_dim, aligned_dim) if self.use_wa and wa_dim != aligned_dim else nn.Identity()
+            self.gate = None
+            self.gate_groups = 0
+            self.branch_feature_dim = aligned_dim
+            fused_dim = aligned_dim
+
+        self.head = _make_head(
+            name=head,
+            in_dim=fused_dim,
+            out_dim=self.num_classes,
+            hidden=head_hidden,
+            dropout=head_dropout,
+            kan_grids=kan_grids,
+        )
+        self.aux_loss_weights = {
+            "sa_logits": (
+                float(sa_aux_weight)
+                if self.aux_heads_enabled and self.use_sa
+                else 0.0
+            ),
+            "wa_logits": (
+                float(wa_aux_weight)
+                if self.aux_heads_enabled and self.use_wa
+                else 0.0
+            ),
+        }
+        if self.aux_heads_enabled:
+            if self.use_sa:
+                self.sa_head = _make_head(
+                    name="linear",
+                    in_dim=self.branch_feature_dim,
+                    out_dim=self.num_classes,
+                    dropout=head_dropout,
+                )
+            if self.use_wa:
+                self.wa_head = _make_head(
+                    name="linear",
+                    in_dim=self.branch_feature_dim,
+                    out_dim=self.num_classes,
+                    dropout=head_dropout,
+                )
+
+    def _expand_gate(self, gate: torch.Tensor) -> torch.Tensor:
+        if gate.shape[-1] == self.branch_feature_dim:
+            return gate
+        repeat = math.ceil(self.branch_feature_dim / gate.shape[-1])
+        return gate.repeat_interleave(repeat, dim=-1)[:, : self.branch_feature_dim]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | dict[str, torch.Tensor]:
+        if x.ndim == 3:
+            if x.shape[1] != 1:
+                raise ValueError("DualPlaneMambaClassifier expects a single intensity channel")
+            x = x.squeeze(1)
+        if x.ndim != 2:
+            raise ValueError(f"expected input shape (B, L), got {tuple(x.shape)}")
+
+        outputs: dict[str, torch.Tensor] = {}
+        f_sa = f_wa = None
+        parts: list[torch.Tensor] = []
+
+        if self.use_sa and self.sa_branch is not None:
+            f_sa = self.sa_align(self.sa_branch(x[:, self.sa_slice]))
+            parts.append(f_sa)
+        if self.use_wa and self.wa_branch is not None:
+            f_wa = self.wa_align(self.wa_branch(x[:, self.wa_slice]))
+            parts.append(f_wa)
+
+        if self.gate is not None and f_sa is not None and f_wa is not None:
+            gate_input = torch.cat([f_sa, f_wa, (f_sa - f_wa).abs(), f_sa * f_wa], dim=-1)
+            gate = torch.sigmoid(self.gate(gate_input))
+            gate_expanded = self._expand_gate(gate)
+            fused = gate_expanded * f_sa + (1.0 - gate_expanded) * f_wa
+            outputs["gate"] = gate.detach()
+            outputs["gate_mean"] = gate.detach().mean(dim=1)
+        elif self.fusion == "concat" and len(parts) > 1:
+            fused = torch.cat(parts, dim=-1)
+        else:
+            fused = parts[0]
+
+        outputs["logits"] = self.head(fused)
+        if self.aux_heads_enabled:
+            if f_sa is not None and hasattr(self, "sa_head"):
+                outputs["sa_logits"] = self.sa_head(f_sa)
+            if f_wa is not None and hasattr(self, "wa_head"):
+                outputs["wa_logits"] = self.wa_head(f_wa)
+        return outputs if len(outputs) > 1 else outputs["logits"]
+
+
 class BiGRUPatchClassifier(nn.Module):
     """Patch 化 PXRD 序列的双向 GRU 分类器。
 
@@ -963,6 +1293,7 @@ __all__ = [
     "MLPClassifier",
     "ResNet1D",
     "DualRangePXRDClassifier",
+    "DualPlaneMambaClassifier",
     "KANHead",
     "BiGRUPatchClassifier",
     "PatchTSTClassifier",
