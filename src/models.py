@@ -25,12 +25,32 @@ except Exception as exc:  # pragma: no cover - optional CUDA extension
     _MambaSSM = None
     _MambaSSM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
+try:
+    from efficient_kan import KAN as _EfficientKAN
+    _EFFICIENT_KAN_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional external KAN package
+    _EfficientKAN = None
+    _EFFICIENT_KAN_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
 
 def _num_patches(signal_length: int, patch_len: int, stride: int) -> int:
     if signal_length <= patch_len:
         return 1
     pad = (stride - ((signal_length - patch_len) % stride)) % stride
     return (signal_length + pad - patch_len) // stride + 1
+
+
+def _conv1d_out_length(
+    length: int,
+    *,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    dilation: int = 1,
+) -> int:
+    return math.floor(
+        (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1
+    )
 
 
 def _patchify_1d(x: torch.Tensor, patch_len: int, stride: int) -> torch.Tensor:
@@ -338,7 +358,7 @@ class _ResNetFeatureEncoder(nn.Module):
 
 
 class _ResidualMambaSSMBlock(nn.Module):
-    """LayerNorm + residual wrapper around the optional mamba-ssm block."""
+    """LayerNorm + residual wrapper around optional uni/bidirectional Mamba."""
 
     def __init__(
         self,
@@ -348,6 +368,7 @@ class _ResidualMambaSSMBlock(nn.Module):
         d_conv: int,
         expand: int,
         dropout: float,
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         if _MambaSSM is None:
@@ -366,10 +387,26 @@ class _ResidualMambaSSMBlock(nn.Module):
             d_conv=d_conv,
             expand=expand,
         )
+        self.bidirectional = bool(bidirectional)
+        self.reverse_mixer = (
+            _MambaSSM(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+            )
+            if self.bidirectional
+            else None
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.dropout(self.mixer(self.norm(x)))
+        z = self.norm(x)
+        mixed = self.mixer(z)
+        if self.reverse_mixer is not None:
+            rev = torch.flip(self.reverse_mixer(torch.flip(z, dims=[1])), dims=[1])
+            mixed = 0.5 * (mixed + rev)
+        return x + self.dropout(mixed)
 
 
 class _MambaSequenceMixer(nn.Module):
@@ -385,10 +422,12 @@ class _MambaSequenceMixer(nn.Module):
         expand: int = 2,
         dropout: float = 0.0,
         backend: str = "auto",
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.num_layers = int(num_layers)
         self.backend = backend.lower()
+        self.bidirectional = bool(bidirectional)
         if self.num_layers <= 0:
             self.blocks = nn.ModuleList()
             self.actual_backend = "none"
@@ -415,8 +454,11 @@ class _MambaSequenceMixer(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
+                bidirectional=self.bidirectional,
             ))
-        self.actual_backend = "mamba_ssm"
+        self.actual_backend = (
+            "mamba_ssm_bidirectional" if self.bidirectional else "mamba_ssm"
+        )
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(d_model)
 
@@ -490,6 +532,41 @@ class KANHead(nn.Module):
         return self.net(x)
 
 
+class EfficientKANHead(nn.Module):
+    """Classifier head backed by the external efficient-kan package."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        *,
+        hidden: Sequence[int] = (512,),
+        grid_size: int = 8,
+        spline_order: int = 3,
+    ) -> None:
+        super().__init__()
+        if _EfficientKAN is None:
+            raise ImportError(
+                "efficient-kan is not installed. Install it before using "
+                "head: efficient_kan, for example: "
+                "pip install git+https://github.com/Blealtan/efficient-kan.git"
+                + (
+                    f" Import error: {_EFFICIENT_KAN_IMPORT_ERROR}"
+                    if _EFFICIENT_KAN_IMPORT_ERROR
+                    else ""
+                )
+            )
+        layers_hidden = [int(h) for h in _as_tuple(hidden)]
+        self.net = _EfficientKAN(
+            [int(in_dim), *layers_hidden, int(out_dim)],
+            grid_size=int(grid_size),
+            spline_order=int(spline_order),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 def _make_head(
     *,
     name: str,
@@ -498,6 +575,7 @@ def _make_head(
     hidden: Sequence[int] = (512,),
     dropout: float = 0.1,
     kan_grids: int = 8,
+    efficient_kan_spline_order: int = 3,
 ) -> nn.Module:
     name = name.lower()
     if name == "linear":
@@ -521,6 +599,17 @@ def _make_head(
                 dropout=dropout,
             ),
         )
+    if name in {"efficient_kan", "efficient-kan"}:
+        return nn.Sequential(
+            nn.LayerNorm(in_dim),
+            EfficientKANHead(
+                in_dim,
+                out_dim,
+                hidden=hidden,
+                grid_size=kan_grids,
+                spline_order=efficient_kan_spline_order,
+            ),
+        )
     raise ValueError(f"unknown head type: {name!r}")
 
 
@@ -542,6 +631,7 @@ class _DualRangeBranch(nn.Module):
         mamba_expand: int = 2,
         mamba_dropout: float = 0.0,
         mamba_backend: str = "auto",
+        mamba_bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = _ResNetFeatureEncoder(
@@ -560,6 +650,7 @@ class _DualRangeBranch(nn.Module):
             expand=mamba_expand,
             dropout=mamba_dropout,
             backend=mamba_backend,
+            bidirectional=mamba_bidirectional,
         )
         self.out_dim = self.encoder.out_channels
         self.actual_mamba_backend = self.mixer.actual_backend
@@ -593,6 +684,7 @@ class DualRangePXRDClassifier(nn.Module):
         head_hidden: Sequence[int] = (512,),
         head_dropout: float = 0.1,
         kan_grids: int = 8,
+        efficient_kan_spline_order: int = 3,
         aux_heads: bool = False,
         sa_aux_weight: float = 0.2,
         wa_aux_weight: float = 0.2,
@@ -658,6 +750,7 @@ class DualRangePXRDClassifier(nn.Module):
             mamba_expand=int(mamba_cfg.get("expand", 2)),
             mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
             mamba_backend=mamba_backend,
+            mamba_bidirectional=bool(mamba_cfg.get("bidirectional", False)),
         )
 
         if self.use_sa:
@@ -724,6 +817,7 @@ class DualRangePXRDClassifier(nn.Module):
             hidden=head_hidden,
             dropout=head_dropout,
             kan_grids=kan_grids,
+            efficient_kan_spline_order=efficient_kan_spline_order,
         )
         if self.aux_heads_enabled:
             if self.use_sa:
@@ -825,6 +919,7 @@ class _PlaneTokenResConvBranch(nn.Module):
         mamba_expand: int = 2,
         mamba_dropout: float = 0.0,
         mamba_backend: str = "auto",
+        mamba_bidirectional: bool = False,
     ) -> None:
         super().__init__()
         if branch_length <= 0:
@@ -869,6 +964,7 @@ class _PlaneTokenResConvBranch(nn.Module):
             expand=mamba_expand,
             dropout=mamba_dropout,
             backend=mamba_backend,
+            bidirectional=mamba_bidirectional,
         )
         self.actual_mamba_backend = self.mixer.actual_backend
 
@@ -934,6 +1030,114 @@ class _PlaneTokenResConvBranch(nn.Module):
         return self.feature_norm(self.dropout(feat))
 
 
+class _LearnedDownsampleMambaBranch(nn.Module):
+    """Learned Conv/ResBlock downsampling frontend before a Mamba mixer."""
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 128,
+        stem_channels: int = 64,
+        mid_channels: int = 128,
+        final_channels: int = 256,
+        blocks_per_stage: Sequence[int] | int = (2, 2),
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+        if branch_length <= 0:
+            raise ValueError("branch_length must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        stem_channels = int(stem_channels)
+        mid_channels = int(mid_channels)
+        final_channels = int(final_channels)
+        if min(stem_channels, mid_channels, final_channels) <= 0:
+            raise ValueError("downsample channels must be positive")
+        blocks = _as_tuple(blocks_per_stage)
+        if len(blocks) == 1:
+            blocks = blocks * 2
+        if len(blocks) != 2:
+            raise ValueError("blocks_per_stage must be length 1 or 2")
+
+        self.branch_length = int(branch_length)
+        length = self.branch_length
+        length = _conv1d_out_length(length, kernel_size=7, stride=2, padding=3)
+        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
+        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
+        if length <= 0:
+            raise ValueError("downsampled token length must be positive")
+        self.token_stride = 8
+        self.token_length = length
+
+        layers: list[nn.Module] = [
+            nn.Conv1d(1, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(stem_channels),
+            nn.GELU(),
+        ]
+        for _ in range(int(blocks[0])):
+            layers.append(_ResBlock1D(stem_channels, stem_channels, stride=1))
+        layers.extend([
+            nn.Conv1d(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(mid_channels),
+            nn.GELU(),
+        ])
+        for _ in range(int(blocks[1])):
+            layers.append(_ResBlock1D(mid_channels, mid_channels, stride=1))
+        layers.extend([
+            nn.Conv1d(mid_channels, final_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(final_channels),
+            nn.GELU(),
+            nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False),
+        ])
+        self.frontend = nn.Sequential(*layers)
+        self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_dropout = nn.Dropout(float(token_dropout))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model),
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(int(d_model))
+        self.out_dim = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(
+                f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
+            )
+
+        seq = self.frontend(x.unsqueeze(1))
+        if seq.shape[-1] != self.token_length:
+            raise RuntimeError(
+                f"token length mismatch after learned downsampling: got {seq.shape[-1]}, "
+                f"expected {self.token_length}"
+            )
+        tokens = seq.transpose(1, 2)
+        tokens = self.token_dropout(self.token_norm(tokens))
+        tokens = self.mixer(tokens)
+        feat = self.pool(tokens.transpose(1, 2)).flatten(1)
+        return self.feature_norm(self.dropout(feat))
+
+
 class DualPlaneMambaClassifier(nn.Module):
     """SA/WA diffraction-angle token model with optional Mamba and KAN fusion.
 
@@ -952,13 +1156,16 @@ class DualPlaneMambaClassifier(nn.Module):
         wa_range: Sequence[float] = (10.0, 90.0),
         use_sa: bool = True,
         use_wa: bool = True,
+        frontend: str = "plane_token",
         d_model: int = 16,
         sa_d_model: int | None = None,
         wa_d_model: int | None = None,
         sa_conv_channels: Sequence[int] = (32, 64, 128),
         wa_conv_channels: Sequence[int] = (32, 64, 128, 256),
+        downsample_channels: Sequence[int] = (64, 128, 256),
         sa_blocks_per_stage: Sequence[int] | int = 1,
         wa_blocks_per_stage: Sequence[int] | int = 1,
+        downsample_blocks_per_stage: Sequence[int] | int = (2, 2),
         pool_every_stage: bool = True,
         pool_type: str = "max",
         token_mode: str = "multiply",
@@ -973,6 +1180,7 @@ class DualPlaneMambaClassifier(nn.Module):
         gate_groups: int = 16,
         gate_dropout: float = 0.1,
         kan_grids: int = 8,
+        efficient_kan_spline_order: int = 3,
         head: str = "mlp",
         head_hidden: Sequence[int] = (512,),
         head_dropout: float = 0.1,
@@ -998,6 +1206,7 @@ class DualPlaneMambaClassifier(nn.Module):
         self.theta_max = float(theta_max)
         self.use_sa = bool(use_sa)
         self.use_wa = bool(use_wa)
+        self.frontend = frontend.lower()
         self.fusion = fusion.lower()
         self.gate_type = gate.lower()
         self.aux_heads_enabled = bool(aux_heads)
@@ -1030,24 +1239,61 @@ class DualPlaneMambaClassifier(nn.Module):
             mamba_expand=int(mamba_cfg.get("expand", 2)),
             mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
             mamba_backend=mamba_backend,
+            mamba_bidirectional=bool(mamba_cfg.get("bidirectional", False)),
         )
         sa_layers = int(mamba_cfg.get("sa_layers", 0))
         wa_layers = int(mamba_cfg.get("wa_layers", 0))
+        if self.frontend not in {"plane_token", "learned_downsample"}:
+            raise ValueError("frontend must be plane_token or learned_downsample")
 
-        if self.use_sa:
-            self.sa_branch = _PlaneTokenResConvBranch(
-                branch_length=self.sa_slice.stop - self.sa_slice.start,
-                d_model=sa_d_model,
-                conv_channels=sa_conv_channels,
-                blocks_per_stage=sa_blocks_per_stage,
+        def make_branch(
+            *,
+            branch_length: int,
+            branch_d_model: int,
+            conv_channels: Sequence[int],
+            blocks_per_stage: Sequence[int] | int,
+            token_stride: int,
+            mamba_layers: int,
+        ) -> nn.Module:
+            if self.frontend == "learned_downsample":
+                channels = _as_tuple(downsample_channels)
+                if len(channels) != 3:
+                    raise ValueError("downsample_channels must be [stem, mid, final]")
+                return _LearnedDownsampleMambaBranch(
+                    branch_length=branch_length,
+                    d_model=branch_d_model,
+                    stem_channels=channels[0],
+                    mid_channels=channels[1],
+                    final_channels=channels[2],
+                    blocks_per_stage=downsample_blocks_per_stage,
+                    token_dropout=token_dropout,
+                    branch_dropout=branch_dropout,
+                    mamba_layers=mamba_layers,
+                    **common_mamba,
+                )
+            return _PlaneTokenResConvBranch(
+                branch_length=branch_length,
+                d_model=branch_d_model,
+                conv_channels=conv_channels,
+                blocks_per_stage=blocks_per_stage,
                 pool_every_stage=pool_every_stage,
                 pool_type=pool_type,
                 token_mode=token_mode,
-                token_stride=sa_token_stride,
+                token_stride=token_stride,
                 token_dropout=token_dropout,
                 branch_dropout=branch_dropout,
-                mamba_layers=sa_layers,
+                mamba_layers=mamba_layers,
                 **common_mamba,
+            )
+
+        if self.use_sa:
+            self.sa_branch = make_branch(
+                branch_length=self.sa_slice.stop - self.sa_slice.start,
+                branch_d_model=sa_d_model,
+                conv_channels=sa_conv_channels,
+                blocks_per_stage=sa_blocks_per_stage,
+                token_stride=sa_token_stride,
+                mamba_layers=sa_layers,
             )
             sa_dim = self.sa_branch.out_dim
         else:
@@ -1055,19 +1301,13 @@ class DualPlaneMambaClassifier(nn.Module):
             sa_dim = 0
 
         if self.use_wa:
-            self.wa_branch = _PlaneTokenResConvBranch(
+            self.wa_branch = make_branch(
                 branch_length=self.wa_slice.stop - self.wa_slice.start,
-                d_model=wa_d_model,
+                branch_d_model=wa_d_model,
                 conv_channels=wa_conv_channels,
                 blocks_per_stage=wa_blocks_per_stage,
-                pool_every_stage=pool_every_stage,
-                pool_type=pool_type,
-                token_mode=token_mode,
                 token_stride=wa_token_stride,
-                token_dropout=token_dropout,
-                branch_dropout=branch_dropout,
                 mamba_layers=wa_layers,
-                **common_mamba,
             )
             wa_dim = self.wa_branch.out_dim
         else:
@@ -1136,6 +1376,7 @@ class DualPlaneMambaClassifier(nn.Module):
             hidden=head_hidden,
             dropout=head_dropout,
             kan_grids=kan_grids,
+            efficient_kan_spline_order=efficient_kan_spline_order,
         )
         projection_dim = int(projection_dim)
         self.projection_head = (
@@ -1146,6 +1387,7 @@ class DualPlaneMambaClassifier(nn.Module):
                 hidden=projection_hidden,
                 dropout=projection_dropout,
                 kan_grids=kan_grids,
+                efficient_kan_spline_order=efficient_kan_spline_order,
             )
             if projection_dim > 0
             else None
@@ -1349,6 +1591,7 @@ __all__ = [
     "DualRangePXRDClassifier",
     "DualPlaneMambaClassifier",
     "KANHead",
+    "EfficientKANHead",
     "BiGRUPatchClassifier",
     "PatchTSTClassifier",
 ]

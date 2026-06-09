@@ -27,4 +27,5 @@ causal-conv1d>=1.2
 # install requirements-mamba.txt on the CUDA/H100 runner.
 
 # Optional: KAN reference implementations
-# efficient-kan
+# efficient-kan is not currently published on PyPI:
+# pip install git+https://github.com/Blealtan/efficient-kan.git

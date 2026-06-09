@@ -58,6 +58,11 @@ MAIN_CONFIGS = [
     "configs/main/m15_dual_plane_mamba_kan_gate_aux_supcon.yaml",
     "configs/main/m16_dual_plane_mamba_kan_gate_aux_supcon_d64.yaml",
     "configs/main/m17_wa_only_plane_mamba_kan_aux_supcon.yaml",
+    "configs/main/m18_single_plane_learned_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m19_single_plane_learned_downsample_mamba_d128_l8_kan_head_label_smoothing.yaml",
+    "configs/main/m20_single_plane_learned_downsample_bidirectional_mamba_d128_l8_kan_head_label_smoothing.yaml",
+    "configs/main/m21_single_plane_learned_downsample_mamba_d128_l8_efficient_kan_head_label_smoothing.yaml",
+    "configs/main/m22_single_plane_learned_downsample_mamba_d128_l8_ldam_drw.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -458,7 +463,9 @@ def summarize_config(cfg: dict) -> dict[str, str]:
         d_model = model_cfg.get("d_model")
         sa_d_model = model_cfg.get("sa_d_model", d_model)
         wa_d_model = model_cfg.get("wa_d_model", d_model)
+        frontend = model_cfg.get("frontend", "plane_token")
         model_params = (
+            f"frontend={frontend},"
             f"sa{model_cfg.get('use_sa', True)},"
             f"wa{model_cfg.get('use_wa', True)},"
             f"d={d_model},"
@@ -468,10 +475,18 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"wa_stride={model_cfg.get('wa_token_stride', 1)},"
             f"fusion={model_cfg.get('fusion', 'gated')},"
             f"gate={model_cfg.get('gate', 'mlp')},"
+            f"head={model_cfg.get('head', 'mlp')},"
             f"mamba={model_cfg.get('mamba', {})},"
             f"proj={model_cfg.get('projection_dim', 0)},"
             f"aux={model_cfg.get('aux_heads', False)}"
         )
+        if frontend == "learned_downsample":
+            model_params = (
+                f"{model_params},"
+                f"downsample_ch={model_cfg.get('downsample_channels', [64, 128, 256])},"
+                f"downsample_blocks={model_cfg.get('downsample_blocks_per_stage', [2, 2])},"
+                "effective_stride=8"
+            )
     else:
         model_params = str(model_cfg)
     optim_cfg = cfg.get("optim", {})
