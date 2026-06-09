@@ -816,6 +816,7 @@ class _PlaneTokenResConvBranch(nn.Module):
         pool_every_stage: bool = True,
         pool_type: str = "max",
         token_mode: str = "multiply",
+        token_stride: int = 1,
         token_dropout: float = 0.0,
         branch_dropout: float = 0.1,
         mamba_layers: int = 0,
@@ -844,10 +845,15 @@ class _PlaneTokenResConvBranch(nn.Module):
         token_mode = token_mode.lower()
         if token_mode not in {"add", "multiply"}:
             raise ValueError("token_mode must be add or multiply")
+        token_stride = int(token_stride)
+        if token_stride <= 0:
+            raise ValueError("token_stride must be positive")
 
         self.branch_length = int(branch_length)
+        self.token_stride = token_stride
+        self.token_length = math.ceil(self.branch_length / self.token_stride)
         self.token_mode = token_mode
-        self.plane_embed = nn.Embedding(self.branch_length, int(d_model))
+        self.plane_embed = nn.Embedding(self.token_length, int(d_model))
         self.intensity_proj = (
             nn.Linear(1, int(d_model))
             if self.token_mode == "add"
@@ -896,7 +902,21 @@ class _PlaneTokenResConvBranch(nn.Module):
                 f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
             )
 
-        idx = torch.arange(self.branch_length, device=x.device)
+        if self.token_stride > 1:
+            x = F.avg_pool1d(
+                x.unsqueeze(1),
+                kernel_size=self.token_stride,
+                stride=self.token_stride,
+                ceil_mode=True,
+                count_include_pad=False,
+            ).squeeze(1)
+        if x.shape[1] != self.token_length:
+            raise RuntimeError(
+                f"token length mismatch after downsampling: got {x.shape[1]}, "
+                f"expected {self.token_length}"
+            )
+
+        idx = torch.arange(self.token_length, device=x.device)
         pos = self.plane_embed(idx).unsqueeze(0).to(dtype=x.dtype)
         if self.token_mode == "multiply":
             tokens = pos * x.unsqueeze(-1)
@@ -933,6 +953,8 @@ class DualPlaneMambaClassifier(nn.Module):
         use_sa: bool = True,
         use_wa: bool = True,
         d_model: int = 16,
+        sa_d_model: int | None = None,
+        wa_d_model: int | None = None,
         sa_conv_channels: Sequence[int] = (32, 64, 128),
         wa_conv_channels: Sequence[int] = (32, 64, 128, 256),
         sa_blocks_per_stage: Sequence[int] | int = 1,
@@ -940,6 +962,8 @@ class DualPlaneMambaClassifier(nn.Module):
         pool_every_stage: bool = True,
         pool_type: str = "max",
         token_mode: str = "multiply",
+        sa_token_stride: int = 1,
+        wa_token_stride: int = 1,
         token_dropout: float = 0.0,
         branch_dropout: float = 0.1,
         fusion: str = "gated",
@@ -978,6 +1002,10 @@ class DualPlaneMambaClassifier(nn.Module):
         self.gate_type = gate.lower()
         self.aux_heads_enabled = bool(aux_heads)
         self.projection_normalize = bool(projection_normalize)
+        sa_d_model = int(d_model if sa_d_model is None else sa_d_model)
+        wa_d_model = int(d_model if wa_d_model is None else wa_d_model)
+        if sa_d_model <= 0 or wa_d_model <= 0:
+            raise ValueError("sa_d_model and wa_d_model must be positive")
 
         self.sa_slice = _range_to_slice(
             start_deg=float(sa_range[0]),
@@ -1009,12 +1037,13 @@ class DualPlaneMambaClassifier(nn.Module):
         if self.use_sa:
             self.sa_branch = _PlaneTokenResConvBranch(
                 branch_length=self.sa_slice.stop - self.sa_slice.start,
-                d_model=d_model,
+                d_model=sa_d_model,
                 conv_channels=sa_conv_channels,
                 blocks_per_stage=sa_blocks_per_stage,
                 pool_every_stage=pool_every_stage,
                 pool_type=pool_type,
                 token_mode=token_mode,
+                token_stride=sa_token_stride,
                 token_dropout=token_dropout,
                 branch_dropout=branch_dropout,
                 mamba_layers=sa_layers,
@@ -1028,12 +1057,13 @@ class DualPlaneMambaClassifier(nn.Module):
         if self.use_wa:
             self.wa_branch = _PlaneTokenResConvBranch(
                 branch_length=self.wa_slice.stop - self.wa_slice.start,
-                d_model=d_model,
+                d_model=wa_d_model,
                 conv_channels=wa_conv_channels,
                 blocks_per_stage=wa_blocks_per_stage,
                 pool_every_stage=pool_every_stage,
                 pool_type=pool_type,
                 token_mode=token_mode,
+                token_stride=wa_token_stride,
                 token_dropout=token_dropout,
                 branch_dropout=branch_dropout,
                 mamba_layers=wa_layers,

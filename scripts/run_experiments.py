@@ -455,10 +455,17 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"aux={model_cfg.get('aux_heads', False)}"
         )
     elif model_name == "dual_plane_mamba":
+        d_model = model_cfg.get("d_model")
+        sa_d_model = model_cfg.get("sa_d_model", d_model)
+        wa_d_model = model_cfg.get("wa_d_model", d_model)
         model_params = (
             f"sa{model_cfg.get('use_sa', True)},"
             f"wa{model_cfg.get('use_wa', True)},"
-            f"d={model_cfg.get('d_model')},"
+            f"d={d_model},"
+            f"sa_d={sa_d_model},"
+            f"wa_d={wa_d_model},"
+            f"sa_stride={model_cfg.get('sa_token_stride', 1)},"
+            f"wa_stride={model_cfg.get('wa_token_stride', 1)},"
             f"fusion={model_cfg.get('fusion', 'gated')},"
             f"gate={model_cfg.get('gate', 'mlp')},"
             f"mamba={model_cfg.get('mamba', {})},"

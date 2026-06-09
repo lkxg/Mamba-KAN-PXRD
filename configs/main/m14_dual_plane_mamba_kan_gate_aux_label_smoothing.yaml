@@ -21,6 +21,8 @@ model:
     use_sa: true
     use_wa: true
     d_model: 32
+    sa_d_model: 32
+    wa_d_model: 16
     sa_conv_channels: [32, 64, 128]
     wa_conv_channels: [32, 64, 128, 256]
     sa_blocks_per_stage: [1, 1, 1]
@@ -28,6 +30,8 @@ model:
     pool_every_stage: true
     pool_type: max
     token_mode: multiply
+    sa_token_stride: 1
+    wa_token_stride: 4
     token_dropout: 0.05
     branch_dropout: 0.1
     fusion: gated
