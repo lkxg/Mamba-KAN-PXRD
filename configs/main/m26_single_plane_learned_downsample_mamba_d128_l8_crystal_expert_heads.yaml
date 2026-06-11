@@ -1,0 +1,113 @@
+experiment:
+  name: m26_single_plane_learned_downsample_mamba_d128_l8_crystal_expert_heads
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 512
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: dual_plane_mamba
+  dual_plane_mamba:
+    frontend: learned_downsample
+    wa_range: [5.0, 90.0]
+    use_sa: false
+    d_model: 128
+    downsample_channels: [64, 128, 256]
+    downsample_blocks_per_stage: [2, 2]
+    token_dropout: 0.05
+    hierarchical:
+      enabled: true
+      crystal_head: mlp
+      crystal_head_hidden: [128]
+      crystal_head_dropout: 0.1
+      expert_heads: true
+      expert_head: mlp
+      expert_head_hidden: [256]
+      expert_head_dropout: 0.1
+    mamba:
+      wa_layers: 8
+      dropout: 0.05
+
+optim:
+  name: adamw
+  lr: 6.0e-4
+  weight_decay: 5.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 10
+
+train:
+  epochs: 100
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 100
+  drop_last: true
+
+early_stopping:
+  enabled: true
+  patience: 10
+  min_delta: 0.0
+  start_epoch: 40
+
+logging:
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: online
+    group: main_results
+    job_type: train
+    tags: [h100, m26, single-plane, learned-downsample, mamba, d128, crystal-experts, hierarchical, label-smoothing, main]
+    notes: >
+      M18 ablation with a crystal-system router and seven crystal-conditional
+      space-group expert heads. Each expert predicts only the space groups in
+      its crystal system; global logits are assembled with crystal-system
+      routing probabilities, and evaluation uses predicted-crystal hard masking.
+    dir: wandb
+    save_code: true
+    watch_model: false
+    watch_log: gradients
+    watch_log_freq: 100
+    log_best_checkpoint: false
+
+loss:
+  name: label_smoothing
+  label_smoothing: 0.05
+  hierarchical:
+    enabled: true
+    crystal_aux_weight: 0.2
+    consistency_weight: 0.0
+    expert_weight: 1.0
+    inference_mask: predicted
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: true
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5

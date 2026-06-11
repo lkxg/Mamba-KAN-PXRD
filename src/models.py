@@ -32,6 +32,16 @@ except Exception as exc:  # pragma: no cover - optional external KAN package
     _EfficientKAN = None
     _EFFICIENT_KAN_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
+_CRYSTAL_SYSTEM_SG_RANGES = (
+    (0, 2),
+    (2, 15),
+    (15, 74),
+    (74, 142),
+    (142, 167),
+    (167, 194),
+    (194, 230),
+)
+
 
 def _num_patches(signal_length: int, patch_len: int, stride: int) -> int:
     if signal_length <= patch_len:
@@ -1189,6 +1199,7 @@ class DualPlaneMambaClassifier(nn.Module):
         projection_hidden: Sequence[int] = (256,),
         projection_dropout: float = 0.1,
         projection_normalize: bool = True,
+        hierarchical: dict | None = None,
         aux_heads: bool = False,
         sa_aux_weight: float = 0.1,
         wa_aux_weight: float = 0.1,
@@ -1211,6 +1222,15 @@ class DualPlaneMambaClassifier(nn.Module):
         self.gate_type = gate.lower()
         self.aux_heads_enabled = bool(aux_heads)
         self.projection_normalize = bool(projection_normalize)
+        hierarchical_cfg = dict(hierarchical or {})
+        self.hierarchical_expert_heads = bool(hierarchical_cfg.get("expert_heads", False))
+        self.hierarchical_enabled = bool(
+            hierarchical_cfg.get("enabled", False)
+            or self.hierarchical_expert_heads
+        )
+        self.condition_space_group = bool(
+            hierarchical_cfg.get("condition_space_group", False)
+        )
         sa_d_model = int(d_model if sa_d_model is None else sa_d_model)
         wa_d_model = int(d_model if wa_d_model is None else wa_d_model)
         if sa_d_model <= 0 or wa_d_model <= 0:
@@ -1369,15 +1389,57 @@ class DualPlaneMambaClassifier(nn.Module):
             self.branch_feature_dim = aligned_dim
             fused_dim = aligned_dim
 
-        self.head = _make_head(
-            name=head,
-            in_dim=fused_dim,
-            out_dim=self.num_classes,
-            hidden=head_hidden,
-            dropout=head_dropout,
-            kan_grids=kan_grids,
-            efficient_kan_spline_order=efficient_kan_spline_order,
-        )
+        head_in_dim = fused_dim
+        if self.hierarchical_enabled:
+            if self.num_classes != 230:
+                raise ValueError("hierarchical classification expects 230 space-group classes")
+            crystal_context_dim = int(hierarchical_cfg.get("crystal_context_dim", 64))
+            self.crystal_head = _make_head(
+                name=str(hierarchical_cfg.get("crystal_head", "mlp")),
+                in_dim=fused_dim,
+                out_dim=7,
+                hidden=hierarchical_cfg.get("crystal_head_hidden", (128,)),
+                dropout=float(hierarchical_cfg.get("crystal_head_dropout", head_dropout)),
+                kan_grids=kan_grids,
+                efficient_kan_spline_order=efficient_kan_spline_order,
+            )
+            if self.condition_space_group and not self.hierarchical_expert_heads:
+                if crystal_context_dim <= 0:
+                    raise ValueError("hierarchical.crystal_context_dim must be positive")
+                self.crystal_context = nn.Sequential(
+                    nn.Linear(7, crystal_context_dim),
+                    nn.GELU(),
+                    nn.Dropout(float(hierarchical_cfg.get("crystal_context_dropout", 0.0))),
+                )
+                head_in_dim = fused_dim + crystal_context_dim
+
+        if self.hierarchical_expert_heads:
+            expert_head = str(hierarchical_cfg.get("expert_head", head))
+            expert_hidden = hierarchical_cfg.get("expert_head_hidden", head_hidden)
+            expert_dropout = float(hierarchical_cfg.get("expert_head_dropout", head_dropout))
+            self.expert_heads = nn.ModuleList(
+                _make_head(
+                    name=expert_head,
+                    in_dim=fused_dim,
+                    out_dim=end - start,
+                    hidden=expert_hidden,
+                    dropout=expert_dropout,
+                    kan_grids=kan_grids,
+                    efficient_kan_spline_order=efficient_kan_spline_order,
+                )
+                for start, end in _CRYSTAL_SYSTEM_SG_RANGES
+            )
+            self.head = None
+        else:
+            self.head = _make_head(
+                name=head,
+                in_dim=head_in_dim,
+                out_dim=self.num_classes,
+                hidden=head_hidden,
+                dropout=head_dropout,
+                kan_grids=kan_grids,
+                efficient_kan_spline_order=efficient_kan_spline_order,
+            )
         projection_dim = int(projection_dim)
         self.projection_head = (
             _make_head(
@@ -1457,7 +1519,24 @@ class DualPlaneMambaClassifier(nn.Module):
         else:
             fused = parts[0]
 
-        outputs["logits"] = self.head(fused)
+        head_input = fused
+        if self.hierarchical_enabled:
+            crystal_logits = self.crystal_head(fused)
+            outputs["crystal_logits"] = crystal_logits
+            if self.hierarchical_expert_heads:
+                expert_logits = [head(fused) for head in self.expert_heads]
+                outputs["expert_logits"] = expert_logits
+                crystal_log_prob = F.log_softmax(crystal_logits.float(), dim=-1).to(dtype=fused.dtype)
+                logits = fused.new_full((fused.shape[0], self.num_classes), float("-inf"))
+                for idx, (start, end) in enumerate(_CRYSTAL_SYSTEM_SG_RANGES):
+                    logits[:, start:end] = expert_logits[idx] + crystal_log_prob[:, idx:idx + 1]
+                outputs["logits"] = logits
+            elif self.condition_space_group:
+                crystal_prob = torch.softmax(crystal_logits.float(), dim=-1).to(dtype=fused.dtype)
+                head_input = torch.cat([fused, self.crystal_context(crystal_prob)], dim=-1)
+
+        if "logits" not in outputs:
+            outputs["logits"] = self.head(head_input)
         if self.projection_head is not None:
             embedding = self.projection_head(fused)
             if self.projection_normalize:

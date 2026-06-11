@@ -63,6 +63,9 @@ MAIN_CONFIGS = [
     "configs/main/m20_single_plane_learned_downsample_bidirectional_mamba_d128_l8_kan_head_label_smoothing.yaml",
     "configs/main/m21_single_plane_learned_downsample_mamba_d128_l8_efficient_kan_head_label_smoothing.yaml",
     "configs/main/m22_single_plane_learned_downsample_mamba_d128_l8_ldam_drw.yaml",
+    "configs/main/m23_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon.yaml",
+    "configs/main/m25_single_plane_learned_downsample_mamba_d128_l8_hierarchical_crystal_aux.yaml",
+    "configs/main/m26_single_plane_learned_downsample_mamba_d128_l8_crystal_expert_heads.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -104,32 +107,11 @@ RESULT_COLUMNS = [
     "loss",
     "sampler",
     "best_epoch",
-    "monitor",
-    "monitor_score",
-    "val_acc1",
-    "val_acc5",
-    "val_acc10",
-    "val_macro_acc1",
-    "val_rare_acc1",
-    "val_aux_loss",
-    "val_gate_mean",
-    "val_balanced_acc1_macro",
-    "test_loss",
     "test_acc1",
+    "test_macro_acc1",
     "test_acc5",
     "test_acc10",
-    "test_macro_acc1",
     "test_macro_f1",
-    "test_rare_acc1",
-    "test_aux_loss",
-    "test_gate_mean",
-    "occlusion_acc1",
-    "occlusion_acc10",
-    "occlusion_macro_acc1",
-    "occlusion_macro_f1",
-    "occlusion_rare_acc1",
-    "test_n",
-    "eval_metrics",
     "checkpoint",
     "wandb_run",
 ]
@@ -222,18 +204,6 @@ def checkpoint_metrics(best_path: Path) -> dict[str, str]:
     ckpt = torch.load(best_path, map_location="cpu")
     return {
         "best_epoch": str(int(ckpt["epoch"]) + 1),
-        "monitor": str(ckpt.get("monitor", "")),
-        "monitor_score": format_metric(ckpt.get("monitor_score")),
-        "val_acc1": format_metric(ckpt.get("val_acc1")),
-        "val_acc5": format_metric(ckpt.get("val_acc5")),
-        "val_acc10": format_metric(ckpt.get("val_acc10")),
-        "val_macro_acc1": format_metric(ckpt.get("val_macro_acc1")),
-        "val_rare_acc1": format_metric(ckpt.get("val_rare_acc1")),
-        "val_aux_loss": format_metric(ckpt.get("val_aux_loss")),
-        "val_gate_mean": format_metric(ckpt.get("val_gate_mean")),
-        "val_balanced_acc1_macro": format_metric(
-            ckpt.get("val_balanced_acc1_macro")
-        ),
     }
 
 
@@ -480,6 +450,10 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"proj={model_cfg.get('projection_dim', 0)},"
             f"aux={model_cfg.get('aux_heads', False)}"
         )
+        hierarchical_cfg = model_cfg.get("hierarchical", {}) or {}
+        if hierarchical_cfg.get("enabled", False):
+            hier_mode = "experts" if hierarchical_cfg.get("expert_heads", False) else "conditional"
+            model_params = f"{model_params},hier={hier_mode}"
         if frontend == "learned_downsample":
             model_params = (
                 f"{model_params},"
@@ -495,6 +469,8 @@ def summarize_config(cfg: dict) -> dict[str, str]:
         loss_name = f"{loss_name}+crt"
     if cfg.get("loss", {}).get("supervised_contrastive", {}).get("enabled", False):
         loss_name = f"{loss_name}+supcon"
+    if cfg.get("loss", {}).get("hierarchical", {}).get("enabled", False):
+        loss_name = f"{loss_name}+hierarchical"
     return {
         "experiment": cfg["experiment"]["name"],
         "model": model_name,
@@ -558,48 +534,21 @@ def metrics_row(
     metrics_path: Path | None,
     fallback: dict[str, str],
 ) -> dict[str, str]:
-    """Build test/occlusion result fields from metrics.json or stdout fallback."""
+    """Build the core test result fields from metrics.json or stdout fallback."""
     if metrics:
-        occlusion = metrics.get("occlusion", {}) or {}
         return {
-            "test_loss": format_metric(metrics.get("loss")),
             "test_acc1": format_metric(metrics.get("acc1")),
+            "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_acc5": format_metric(metrics.get("acc5")),
             "test_acc10": format_metric(metrics.get("acc10")),
-            "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_macro_f1": format_metric(metrics.get("macro_f1")),
-            "test_rare_acc1": format_metric(metrics.get("rare_acc1")),
-            "test_aux_loss": format_metric(metrics.get("aux_loss")),
-            "test_gate_mean": format_metric(metrics.get("gate_mean")),
-            "occlusion_acc1": format_metric(occlusion.get("acc1")),
-            "occlusion_acc10": format_metric(occlusion.get("acc10")),
-            "occlusion_macro_acc1": format_metric(occlusion.get("macro_acc1")),
-            "occlusion_macro_f1": format_metric(occlusion.get("macro_f1")),
-            "occlusion_rare_acc1": format_metric(occlusion.get("rare_acc1")),
-            "test_n": str(int(metrics.get("n", 0))),
-            "eval_metrics": (
-                display_path(metrics_path)
-                if metrics_path is not None
-                else ""
-            ),
         }
     return {
-        "test_loss": fallback["loss"],
         "test_acc1": fallback["acc1"],
+        "test_macro_acc1": fallback["macro"],
         "test_acc5": fallback["acc5"],
         "test_acc10": fallback.get("acc10") or "",
-        "test_macro_acc1": fallback["macro"],
         "test_macro_f1": fallback.get("macro_f1") or "",
-        "test_rare_acc1": fallback.get("rare") or "",
-        "test_aux_loss": fallback.get("aux") or "",
-        "test_gate_mean": fallback.get("gate") or "",
-        "occlusion_acc1": "",
-        "occlusion_acc10": "",
-        "occlusion_macro_acc1": "",
-        "occlusion_macro_f1": "",
-        "occlusion_rare_acc1": "",
-        "test_n": fallback["n"],
-        "eval_metrics": "",
     }
 
 

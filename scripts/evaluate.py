@@ -45,9 +45,12 @@ from src.training import (
     aux_loss_weights_from_model,
     build_loss_from_config,
     configure_backend,
+    apply_hierarchical_mask,
+    hierarchical_config,
     loss_with_auxiliary,
     output_gate_mean,
     rare_classes_from_counts,
+    space_group_to_crystal_system,
     StepStats,
 )
 from src.utils import set_seed
@@ -190,6 +193,10 @@ def evaluate_with_predictions(
     amp_dtype: torch.dtype | None = None,
     max_topk: int = 10,
     aux_loss_weights: dict[str, float] | None = None,
+    hierarchical_aux_weight: float = 0.0,
+    hierarchical_consistency_weight: float = 0.0,
+    hierarchical_expert_weight: float = 0.0,
+    hierarchical_mask_mode: str = "none",
     rare_classes: set[int] | None = None,
 ) -> tuple[StepStats, dict[str, np.ndarray]]:
     """评估模型，同时收集绘图所需的预测结果。"""
@@ -214,6 +221,8 @@ def evaluate_with_predictions(
     true_conf_parts: list[np.ndarray] = []
     correct_parts: list[np.ndarray] = []
     gate_mean_parts: list[np.ndarray] = []
+    crystal_true_parts: list[np.ndarray] = []
+    crystal_pred_parts: list[np.ndarray] = []
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -230,7 +239,22 @@ def evaluate_with_predictions(
                 y,
                 loss_fn,
                 aux_weights=aux_loss_weights,
+                hierarchical_aux_weight=hierarchical_aux_weight,
+                hierarchical_consistency_weight=hierarchical_consistency_weight,
+                hierarchical_expert_weight=hierarchical_expert_weight,
             )
+            if isinstance(output, dict) and "crystal_logits" in output:
+                crystal_logits = output["crystal_logits"]
+                crystal_true = space_group_to_crystal_system(y)
+                crystal_true_parts.append(crystal_true.detach().cpu().numpy())
+                crystal_pred_parts.append(
+                    crystal_logits.argmax(dim=1).detach().cpu().numpy()
+                )
+                logits = apply_hierarchical_mask(
+                    logits,
+                    crystal_logits,
+                    mode=hierarchical_mask_mode,
+                )
 
         bsz = y.size(0)
         num_classes = logits.shape[1]
@@ -239,8 +263,10 @@ def evaluate_with_predictions(
         top10 = min(10, num_classes)
         eval_topk = max(plot_topk, top5, top10)
 
+        top_values, top_idx = logits.float().topk(eval_topk, dim=1)
+        top_valid = torch.isfinite(top_values)
         probs = torch.softmax(logits.float(), dim=1)
-        top_probs, top_idx = probs.topk(eval_topk, dim=1)
+        top_probs = probs.gather(1, top_idx).masked_fill(~top_valid, 0.0)
         pred = top_idx[:, 0]
         correct_mask = pred == y
 
@@ -248,12 +274,25 @@ def evaluate_with_predictions(
         total_aux_loss += float(aux_loss.item()) * bsz
         n += bsz
         correct1 += int(correct_mask.sum().item())
-        correct5 += int((top_idx[:, :top5] == y.unsqueeze(1)).any(dim=1).sum().item())
-        correct10 += int((top_idx[:, :top10] == y.unsqueeze(1)).any(dim=1).sum().item())
+        correct5 += int(
+            (
+                (top_idx[:, :top5] == y.unsqueeze(1))
+                & top_valid[:, :top5]
+            ).any(dim=1).sum().item()
+        )
+        correct10 += int(
+            (
+                (top_idx[:, :top10] == y.unsqueeze(1))
+                & top_valid[:, :top10]
+            ).any(dim=1).sum().item()
+        )
 
         if topk_correct is None:
             topk_correct = np.zeros(plot_topk, dtype=np.int64)
-        hits = (top_idx[:, :plot_topk] == y.unsqueeze(1)).cumsum(dim=1).clamp(max=1)
+        hits = (
+            (top_idx[:, :plot_topk] == y.unsqueeze(1))
+            & top_valid[:, :plot_topk]
+        ).cumsum(dim=1).clamp(max=1)
         topk_correct += hits.sum(dim=0).detach().cpu().numpy()
 
         if class_total is None:
@@ -304,6 +343,12 @@ def evaluate_with_predictions(
         "topk_correct": topk_correct if topk_correct is not None else np.array([]),
         "gate_mean": (
             np.concatenate(gate_mean_parts) if gate_mean_parts else np.array([])
+        ),
+        "crystal_true": (
+            np.concatenate(crystal_true_parts) if crystal_true_parts else np.array([])
+        ),
+        "crystal_pred": (
+            np.concatenate(crystal_pred_parts) if crystal_pred_parts else np.array([])
         ),
     }
     stats = StepStats(
@@ -904,6 +949,23 @@ def main():
     if hasattr(loss_fn, "set_class_weights") and "ldam_drw_active" in ckpt:
         loss_fn.set_class_weights(bool(ckpt["ldam_drw_active"]))
         print(f"LDAM-DRW eval weights: {bool(ckpt['ldam_drw_active'])}")
+    loss_cfg = cfg.get("loss", {})
+    (
+        hierarchical_aux_weight,
+        hierarchical_consistency_weight,
+        hierarchical_expert_weight,
+    ) = hierarchical_config(loss_cfg)
+    hierarchical_mask_mode = str(
+        (loss_cfg.get("hierarchical", {}) or {}).get("inference_mask", "none")
+    )
+    if hierarchical_aux_weight or hierarchical_consistency_weight:
+        print(
+            "Hierarchical eval: "
+            f"aux={hierarchical_aux_weight:.3f} "
+            f"consistency={hierarchical_consistency_weight:.3f} "
+            f"expert={hierarchical_expert_weight:.3f} "
+            f"mask={hierarchical_mask_mode}"
+        )
     use_amp = cfg["train"].get("amp", True) and device.type == "cuda"
     amp_dtype = amp_dtype_from_config(cfg["train"].get("amp_dtype", "float16"), device)
     stats, outputs = evaluate_with_predictions(
@@ -912,6 +974,10 @@ def main():
         amp_dtype=amp_dtype,
         max_topk=max(1, args.topk_plot_max),
         aux_loss_weights=aux_loss_weights,
+        hierarchical_aux_weight=hierarchical_aux_weight,
+        hierarchical_consistency_weight=hierarchical_consistency_weight,
+        hierarchical_expert_weight=hierarchical_expert_weight,
+        hierarchical_mask_mode=hierarchical_mask_mode,
         rare_classes=rare_classes,
     )
     macro_f1 = f1_score(
@@ -923,6 +989,10 @@ def main():
     )
 
     # 打印测试结果
+    crystal_acc1 = float("nan")
+    if outputs["crystal_true"].size:
+        crystal_acc1 = float((outputs["crystal_true"] == outputs["crystal_pred"]).mean())
+
     print(f"Test loss={stats.loss:.4f}  acc1={stats.acc1:.4f}  "
           f"acc5={stats.acc5:.4f}  acc10={stats.acc10:.4f}  "
           f"macro={stats.macro_acc1:.4f}  "
@@ -955,6 +1025,8 @@ def main():
         "rare_acc1": float(stats.rare_acc1),
         "rare_total": int(stats.rare_total or 0),
         "rare_class_count": int(len(rare_classes)),
+        "crystal_acc1": crystal_acc1 if math.isfinite(crystal_acc1) else None,
+        "hierarchical_inference_mask": hierarchical_mask_mode,
         "aux_loss": float(stats.aux_loss),
         "gate_mean": (
             float(stats.gate_mean)
@@ -1000,6 +1072,10 @@ def main():
             amp_dtype=amp_dtype,
             max_topk=max(1, args.topk_plot_max),
             aux_loss_weights=aux_loss_weights,
+            hierarchical_aux_weight=hierarchical_aux_weight,
+            hierarchical_consistency_weight=hierarchical_consistency_weight,
+            hierarchical_expert_weight=hierarchical_expert_weight,
+            hierarchical_mask_mode=hierarchical_mask_mode,
             rare_classes=rare_classes,
         )
         occ_macro_f1 = f1_score(

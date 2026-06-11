@@ -10,6 +10,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+SPACE_GROUP_CRYSTAL_SYSTEM = torch.tensor(
+    [0] * 2
+    + [1] * 13
+    + [2] * 59
+    + [3] * 68
+    + [4] * 25
+    + [5] * 27
+    + [6] * 36,
+    dtype=torch.long,
+)
+CRYSTAL_SYSTEM_START = torch.tensor([0, 2, 15, 74, 142, 167, 194], dtype=torch.long)
+
 
 def configure_backend(cfg: dict, device: torch.device) -> None:
     """Enable optional CUDA backend optimizations from config."""
@@ -452,9 +464,10 @@ def _accuracy_topk(logits: torch.Tensor, target: torch.Tensor, k: int = 5) -> in
     """
     k = min(k, logits.shape[1])
     # 取 logits 最大的 k 个类别的索引
-    _, top = logits.topk(k, dim=1)
+    values, top = logits.topk(k, dim=1)
     # 检查真实类别是否在这 k 个中
-    return int((top == target.unsqueeze(1)).any(dim=1).sum().item())
+    hits = (top == target.unsqueeze(1)) & torch.isfinite(values)
+    return int(hits.any(dim=1).sum().item())
 
 
 def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
@@ -462,6 +475,93 @@ def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tens
     if isinstance(output, dict):
         return output["logits"]
     return output
+
+
+def space_group_to_crystal_system(target: torch.Tensor) -> torch.Tensor:
+    """Map 0-based space-group labels to 0-based crystal-system labels."""
+    mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=target.device)
+    return mapping[target.long()]
+
+
+def crystal_system_mask(
+    crystal_ids: torch.Tensor,
+    *,
+    num_space_groups: int = 230,
+) -> torch.Tensor:
+    """Return a boolean [B, 230] mask for allowed space groups per crystal system."""
+    mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=crystal_ids.device)
+    if int(num_space_groups) != int(mapping.numel()):
+        raise ValueError("hierarchical masking expects 230 space-group logits")
+    return mapping.unsqueeze(0).eq(crystal_ids.long().unsqueeze(1))
+
+
+def apply_hierarchical_mask(
+    logits: torch.Tensor,
+    crystal_logits: torch.Tensor,
+    *,
+    mode: str = "predicted",
+) -> torch.Tensor:
+    """Mask space-group logits to the predicted crystal system at inference."""
+    mode = mode.lower()
+    if mode in {"none", "off", "false"}:
+        return logits
+    if mode != "predicted":
+        raise ValueError(f"unknown hierarchical inference mask mode: {mode!r}")
+    crystal_ids = crystal_logits.float().argmax(dim=1)
+    mask = crystal_system_mask(crystal_ids, num_space_groups=logits.shape[1])
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def hierarchical_loss(
+    output: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    *,
+    crystal_aux_weight: float = 0.0,
+    consistency_weight: float = 0.0,
+    expert_weight: float = 0.0,
+) -> torch.Tensor:
+    """Crystal-system auxiliary and soft consistency loss for SG classifiers."""
+    if "crystal_logits" not in output:
+        return primary_logits(output).sum() * 0.0
+    crystal_target = space_group_to_crystal_system(target)
+    crystal_logits = output["crystal_logits"]
+    loss = crystal_logits.sum() * 0.0
+    if crystal_aux_weight > 0:
+        loss = loss + float(crystal_aux_weight) * F.cross_entropy(
+            crystal_logits,
+            crystal_target,
+        )
+    if expert_weight > 0 and "expert_logits" in output:
+        starts = CRYSTAL_SYSTEM_START.to(device=target.device)
+        expert_loss = crystal_logits.sum() * 0.0
+        expert_count = 0
+        for system_id, local_logits in enumerate(output["expert_logits"]):
+            mask = crystal_target == int(system_id)
+            if bool(mask.any()):
+                local_target = target[mask] - starts[system_id]
+                expert_loss = expert_loss + F.cross_entropy(
+                    local_logits[mask],
+                    local_target.long(),
+                )
+                expert_count += 1
+        if expert_count:
+            loss = loss + float(expert_weight) * (expert_loss / expert_count)
+    if consistency_weight > 0:
+        logits = primary_logits(output)
+        sg_probs = torch.softmax(logits.float(), dim=1)
+        mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=logits.device)
+        system_probs = sg_probs.new_zeros((sg_probs.shape[0], 7))
+        system_probs.scatter_add_(
+            1,
+            mapping.unsqueeze(0).expand(sg_probs.shape[0], -1),
+            sg_probs,
+        )
+        consistency = F.nll_loss(
+            torch.log(system_probs.clamp_min(1.0e-12)),
+            crystal_target,
+        )
+        loss = loss + float(consistency_weight) * consistency
+    return loss
 
 
 def supervised_contrastive_loss(
@@ -509,6 +609,9 @@ def loss_with_auxiliary(
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
+    hierarchical_aux_weight: float = 0.0,
+    hierarchical_consistency_weight: float = 0.0,
+    hierarchical_expert_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute main loss plus optional branch auxiliary and contrastive losses."""
     logits = primary_logits(output)
@@ -521,6 +624,13 @@ def loss_with_auxiliary(
             weight = float(weights.get(key, 0.0))
             if weight > 0 and key in output:
                 aux_loss = aux_loss + weight * loss_fn(output[key], target)
+        aux_loss = aux_loss + hierarchical_loss(
+            output,
+            target,
+            crystal_aux_weight=hierarchical_aux_weight,
+            consistency_weight=hierarchical_consistency_weight,
+            expert_weight=hierarchical_expert_weight,
+        )
         if contrastive_weight > 0:
             if contrastive_embedding_key not in output:
                 raise KeyError(
@@ -557,6 +667,18 @@ def supervised_contrastive_config(
     elif warmup_epochs > 0:
         weight *= min(1.0, (epoch - start_epoch + 1) / warmup_epochs)
     return weight, temperature, embedding_key
+
+
+def hierarchical_config(loss_cfg: dict) -> tuple[float, float, float]:
+    """Return crystal auxiliary, consistency, and expert-local loss weights."""
+    cfg = loss_cfg.get("hierarchical", {}) or {}
+    if not bool(cfg.get("enabled", False)):
+        return 0.0, 0.0, 0.0
+    return (
+        float(cfg.get("crystal_aux_weight", 0.2)),
+        float(cfg.get("consistency_weight", 0.05)),
+        float(cfg.get("expert_weight", 0.0)),
+    )
 
 
 def output_gate_mean(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor | None:
@@ -610,6 +732,9 @@ def train_one_epoch(
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
+    hierarchical_aux_weight: float = 0.0,
+    hierarchical_consistency_weight: float = 0.0,
+    hierarchical_expert_weight: float = 0.0,
     rare_classes: set[int] | None = None,
     freeze_batch_norm: bool = False,
 ) -> StepStats:
@@ -668,6 +793,9 @@ def train_one_epoch(
                 contrastive_weight=contrastive_weight,
                 contrastive_temperature=contrastive_temperature,
                 contrastive_embedding_key=contrastive_embedding_key,
+                hierarchical_aux_weight=hierarchical_aux_weight,
+                hierarchical_consistency_weight=hierarchical_consistency_weight,
+                hierarchical_expert_weight=hierarchical_expert_weight,
             )
 
         # 反向传播
@@ -735,6 +863,10 @@ def evaluate(
     use_amp: bool = True,
     amp_dtype: torch.dtype | None = None,
     aux_loss_weights: dict[str, float] | None = None,
+    hierarchical_aux_weight: float = 0.0,
+    hierarchical_consistency_weight: float = 0.0,
+    hierarchical_expert_weight: float = 0.0,
+    hierarchical_mask_mode: str = "none",
     rare_classes: set[int] | None = None,
 ) -> StepStats:
     """在验证集或测试集上评估模型。
@@ -774,7 +906,16 @@ def evaluate(
                 y,
                 loss_fn,
                 aux_weights=aux_loss_weights,
+                hierarchical_aux_weight=hierarchical_aux_weight,
+                hierarchical_consistency_weight=hierarchical_consistency_weight,
+                hierarchical_expert_weight=hierarchical_expert_weight,
             )
+            if isinstance(output, dict) and "crystal_logits" in output:
+                logits = apply_hierarchical_mask(
+                    logits,
+                    output["crystal_logits"],
+                    mode=hierarchical_mask_mode,
+                )
 
         bsz = y.size(0)
         total_loss += float(loss.item()) * bsz
@@ -828,6 +969,8 @@ __all__ = [
     "FocalLoss", "LDAMLoss", "build_loss", "build_loss_from_config",
     "StepStats", "primary_logits", "loss_with_auxiliary",
     "supervised_contrastive_config", "supervised_contrastive_loss",
-    "rare_classes_from_counts", "aux_loss_weights_from_model",
+    "hierarchical_config", "space_group_to_crystal_system",
+    "apply_hierarchical_mask", "rare_classes_from_counts",
+    "aux_loss_weights_from_model",
     "train_one_epoch", "evaluate",
 ]

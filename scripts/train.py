@@ -34,6 +34,7 @@ from src.training import (
     build_loss_from_config,
     configure_backend,
     evaluate,
+    hierarchical_config,
     rare_classes_from_counts,
     supervised_contrastive_config,
     train_one_epoch,
@@ -481,6 +482,14 @@ def main():
     crt_trainable_modules: list[str] = []
 
     loss_cfg = cfg.get("loss", {})
+    (
+        hierarchical_aux_weight,
+        hierarchical_consistency_weight,
+        hierarchical_expert_weight,
+    ) = hierarchical_config(loss_cfg)
+    hierarchical_mask_mode = str(
+        (loss_cfg.get("hierarchical", {}) or {}).get("inference_mask", "none")
+    )
     ldam_drw_start_epoch = loss_cfg.get("ldam_drw_start_epoch")
     if ldam_drw_start_epoch is not None:
         ldam_drw_start_epoch = int(ldam_drw_start_epoch)
@@ -640,6 +649,9 @@ def main():
             contrastive_weight=contrastive_weight,
             contrastive_temperature=contrastive_temperature,
             contrastive_embedding_key=contrastive_embedding_key,
+            hierarchical_aux_weight=hierarchical_aux_weight,
+            hierarchical_consistency_weight=hierarchical_consistency_weight,
+            hierarchical_expert_weight=hierarchical_expert_weight,
             rare_classes=rare_classes,
             freeze_batch_norm=freeze_batch_norm,
         )
@@ -652,6 +664,10 @@ def main():
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             aux_loss_weights=aux_loss_weights,
+            hierarchical_aux_weight=hierarchical_aux_weight,
+            hierarchical_consistency_weight=hierarchical_consistency_weight,
+            hierarchical_expert_weight=hierarchical_expert_weight,
+            hierarchical_mask_mode=hierarchical_mask_mode,
             rare_classes=rare_classes,
         )
         dt = time.time() - t0
