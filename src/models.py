@@ -26,6 +26,13 @@ except Exception as exc:  # pragma: no cover - optional CUDA extension
     _MambaSSM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:
+    from mamba_ssm import Mamba2 as _Mamba2SSM
+    _Mamba2SSM_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional CUDA extension
+    _Mamba2SSM = None
+    _Mamba2SSM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+try:
     from efficient_kan import KAN as _EfficientKAN
     _EFFICIENT_KAN_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - optional external KAN package
@@ -378,33 +385,53 @@ class _ResidualMambaSSMBlock(nn.Module):
         d_conv: int,
         expand: int,
         dropout: float,
+        backend: str,
+        headdim: int | None = None,
+        ngroups: int | None = None,
+        chunk_size: int | None = None,
         bidirectional: bool = False,
     ) -> None:
         super().__init__()
-        if _MambaSSM is None:
+        self.backend = backend.lower()
+        if self.backend in {"auto", "mamba_ssm"}:
+            mixer_cls = _MambaSSM
+            import_error = _MambaSSM_IMPORT_ERROR
+            backend_name = "mamba_ssm"
+        elif self.backend in {"mamba2", "mamba2_ssm"}:
+            mixer_cls = _Mamba2SSM
+            import_error = _Mamba2SSM_IMPORT_ERROR
+            backend_name = "mamba2_ssm"
+        else:
+            raise ValueError(
+                "mamba backend must be auto, mamba_ssm, mamba2, or mamba2_ssm"
+            )
+        if mixer_cls is None:
             raise ImportError(
-                "mamba_ssm is not importable"
+                f"{backend_name} is not importable"
                 + (
-                    f": {_MambaSSM_IMPORT_ERROR}"
-                    if _MambaSSM_IMPORT_ERROR
+                    f": {import_error}"
+                    if import_error
                     else ""
                 )
             )
         self.norm = nn.LayerNorm(d_model)
-        self.mixer = _MambaSSM(
+        mixer_kwargs = dict(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
         )
+        if backend_name == "mamba2_ssm":
+            if headdim is not None:
+                mixer_kwargs["headdim"] = int(headdim)
+            if ngroups is not None:
+                mixer_kwargs["ngroups"] = int(ngroups)
+            if chunk_size is not None:
+                mixer_kwargs["chunk_size"] = int(chunk_size)
+        self.mixer = mixer_cls(**mixer_kwargs)
         self.bidirectional = bool(bidirectional)
         self.reverse_mixer = (
-            _MambaSSM(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
+            mixer_cls(**mixer_kwargs)
             if self.bidirectional
             else None
         )
@@ -432,6 +459,9 @@ class _MambaSequenceMixer(nn.Module):
         expand: int = 2,
         dropout: float = 0.0,
         backend: str = "auto",
+        headdim: int | None = None,
+        ngroups: int | None = None,
+        chunk_size: int | None = None,
         bidirectional: bool = False,
     ) -> None:
         super().__init__()
@@ -442,16 +472,27 @@ class _MambaSequenceMixer(nn.Module):
             self.blocks = nn.ModuleList()
             self.actual_backend = "none"
             return
-        if self.backend not in {"auto", "mamba_ssm"}:
-            raise ValueError("mamba backend must be auto or mamba_ssm")
+        if self.backend not in {"auto", "mamba_ssm", "mamba2", "mamba2_ssm"}:
+            raise ValueError(
+                "mamba backend must be auto, mamba_ssm, mamba2, or mamba2_ssm"
+            )
 
-        if _MambaSSM is None:
+        is_mamba2 = self.backend in {"mamba2", "mamba2_ssm"}
+        if is_mamba2:
+            backend_name = "mamba2_ssm"
+            import_error = _Mamba2SSM_IMPORT_ERROR
+            backend_missing = _Mamba2SSM is None
+        else:
+            backend_name = "mamba_ssm"
+            import_error = _MambaSSM_IMPORT_ERROR
+            backend_missing = _MambaSSM is None
+        if backend_missing:
             raise ImportError(
-                "mamba_ssm is not installed. Install mamba-ssm/causal-conv1d "
+                f"{backend_name} is not installed. Install mamba-ssm/causal-conv1d "
                 "before running configs that request Mamba layers."
                 + (
-                    f" Import error: {_MambaSSM_IMPORT_ERROR}"
-                    if _MambaSSM_IMPORT_ERROR
+                    f" Import error: {import_error}"
+                    if import_error
                     else ""
                 )
             )
@@ -464,10 +505,14 @@ class _MambaSequenceMixer(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
+                backend=self.backend,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
                 bidirectional=self.bidirectional,
             ))
         self.actual_backend = (
-            "mamba_ssm_bidirectional" if self.bidirectional else "mamba_ssm"
+            f"{backend_name}_bidirectional" if self.bidirectional else backend_name
         )
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(d_model)
@@ -598,6 +643,9 @@ def _make_head(
             prev = int(h)
         layers.append(nn.Linear(prev, out_dim))
         return nn.Sequential(*layers)
+    if name in {"xrdmamba_repo", "xrdmamba-repo"}:
+        hidden_dim = int(_as_tuple(hidden)[0])
+        return nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.Linear(hidden_dim, out_dim))
     if name == "kan":
         return nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -641,6 +689,9 @@ class _DualRangeBranch(nn.Module):
         mamba_expand: int = 2,
         mamba_dropout: float = 0.0,
         mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
         mamba_bidirectional: bool = False,
     ) -> None:
         super().__init__()
@@ -660,6 +711,9 @@ class _DualRangeBranch(nn.Module):
             expand=mamba_expand,
             dropout=mamba_dropout,
             backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
             bidirectional=mamba_bidirectional,
         )
         self.out_dim = self.encoder.out_channels
@@ -760,6 +814,15 @@ class DualRangePXRDClassifier(nn.Module):
             mamba_expand=int(mamba_cfg.get("expand", 2)),
             mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
             mamba_backend=mamba_backend,
+            mamba_headdim=(
+                int(mamba_cfg["headdim"]) if "headdim" in mamba_cfg else None
+            ),
+            mamba_ngroups=(
+                int(mamba_cfg["ngroups"]) if "ngroups" in mamba_cfg else None
+            ),
+            mamba_chunk_size=(
+                int(mamba_cfg["chunk_size"]) if "chunk_size" in mamba_cfg else None
+            ),
             mamba_bidirectional=bool(mamba_cfg.get("bidirectional", False)),
         )
 
@@ -929,6 +992,9 @@ class _PlaneTokenResConvBranch(nn.Module):
         mamba_expand: int = 2,
         mamba_dropout: float = 0.0,
         mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
         mamba_bidirectional: bool = False,
     ) -> None:
         super().__init__()
@@ -974,6 +1040,9 @@ class _PlaneTokenResConvBranch(nn.Module):
             expand=mamba_expand,
             dropout=mamba_dropout,
             backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
             bidirectional=mamba_bidirectional,
         )
         self.actual_mamba_backend = self.mixer.actual_backend
@@ -1060,6 +1129,9 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         mamba_expand: int = 2,
         mamba_dropout: float = 0.0,
         mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
         mamba_bidirectional: bool = False,
     ) -> None:
         super().__init__()
@@ -1119,6 +1191,9 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             expand=mamba_expand,
             dropout=mamba_dropout,
             backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
             bidirectional=mamba_bidirectional,
         )
         self.actual_mamba_backend = self.mixer.actual_backend
@@ -1148,6 +1223,153 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         return self.feature_norm(self.dropout(feat))
 
 
+class _XRDMambaRepoResBlock1D(nn.Module):
+    """ResBlock matching the public XRDMamba repository's ResConv block."""
+
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.pre = (
+            nn.Identity()
+            if int(in_ch) == int(out_ch)
+            else nn.Conv1d(int(in_ch), int(out_ch), kernel_size=1, bias=False)
+        )
+        self.conv = nn.Sequential(
+            nn.Conv1d(int(out_ch), int(out_ch), kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm1d(int(out_ch)),
+            nn.LeakyReLU(),
+            nn.Conv1d(int(out_ch), int(out_ch), kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm1d(int(out_ch)),
+        )
+        self.relu = nn.LeakyReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pre(x)
+        return self.relu(x + self.conv(x))
+
+
+class _XRDMambaRepoResConvFeature(nn.Module):
+    """Feature extractor following XRDMamba's published repository ResConv."""
+
+    def __init__(self, in_channels: int, dropout: float = 0.15) -> None:
+        super().__init__()
+        p = float(dropout)
+        self.conv = nn.Sequential(
+            _XRDMambaRepoResBlock1D(in_channels, 32),
+            nn.MaxPool1d(2, 2),
+            _XRDMambaRepoResBlock1D(32, 32),
+            nn.MaxPool1d(2, 2),
+            _XRDMambaRepoResBlock1D(32, 64),
+            nn.MaxPool1d(2, 2),
+            _XRDMambaRepoResBlock1D(64, 64),
+            nn.AvgPool1d(2, 2, 1),
+            _XRDMambaRepoResBlock1D(64, 128),
+            nn.AvgPool1d(2, 2, 1),
+            _XRDMambaRepoResBlock1D(128, 128),
+            nn.AvgPool1d(2, 2, 1),
+            _XRDMambaRepoResBlock1D(128, 256),
+            nn.AvgPool1d(2, 2, 1),
+            _XRDMambaRepoResBlock1D(256, 256),
+            nn.AvgPool1d(2, 2),
+            nn.Dropout(p),
+            _XRDMambaRepoResBlock1D(256, 256),
+            nn.AvgPool1d(2, 2),
+            nn.Dropout(p),
+            _XRDMambaRepoResBlock1D(256, 512),
+            nn.AvgPool1d(2, 2),
+            nn.Dropout(p),
+            _XRDMambaRepoResBlock1D(512, 512),
+            nn.AvgPool1d(2, 2, 1),
+            nn.Dropout(p),
+            _XRDMambaRepoResBlock1D(512, 1024),
+            nn.AvgPool1d(2, 2, 1),
+            nn.Dropout(p),
+            _XRDMambaRepoResBlock1D(1024, 1024),
+            nn.AvgPool1d(2, 2),
+        )
+        self.out_dim = 1024
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        if x.shape[-1] != 1:
+            raise RuntimeError(
+                "XRDMamba repo ResConv expects a final sequence length of 1; "
+                f"got {x.shape[-1]}. Use xrdmamba_repo_length=5000 for repo-faithful runs."
+            )
+        return x.flatten(1)
+
+
+class _XRDMambaRepoBranch(nn.Module):
+    """Public XRDMamba repo-style plane embedding, Mamba mixer, and deep ResConv."""
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 8,
+        repo_length: int = 5000,
+        branch_dropout: float = 0.15,
+        mamba_layers: int = 4,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 3,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+        if branch_length <= 0:
+            raise ValueError("branch_length must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if repo_length <= 0:
+            raise ValueError("repo_length must be positive")
+        self.branch_length = int(branch_length)
+        self.repo_length = int(repo_length)
+        self.plane_embed = nn.Embedding(self.repo_length, int(d_model))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model),
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
+            bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        self.resconv = _XRDMambaRepoResConvFeature(
+            int(d_model),
+            dropout=branch_dropout,
+        )
+        self.out_dim = self.resconv.out_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(
+                f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
+            )
+        if x.shape[1] != self.repo_length:
+            x = F.interpolate(
+                x.unsqueeze(1),
+                size=self.repo_length,
+                mode="linear",
+                align_corners=True,
+            ).squeeze(1)
+
+        idx = torch.arange(self.repo_length, device=x.device)
+        tokens = self.plane_embed(idx).unsqueeze(0).to(dtype=x.dtype) * x.unsqueeze(-1)
+        tokens = self.mixer(tokens)
+        return self.resconv(tokens.transpose(1, 2))
+
+
 class DualPlaneMambaClassifier(nn.Module):
     """SA/WA diffraction-angle token model with optional Mamba and KAN fusion.
 
@@ -1167,6 +1389,7 @@ class DualPlaneMambaClassifier(nn.Module):
         use_sa: bool = True,
         use_wa: bool = True,
         frontend: str = "plane_token",
+        xrdmamba_repo_length: int = 5000,
         d_model: int = 16,
         sa_d_model: int | None = None,
         wa_d_model: int | None = None,
@@ -1259,12 +1482,21 @@ class DualPlaneMambaClassifier(nn.Module):
             mamba_expand=int(mamba_cfg.get("expand", 2)),
             mamba_dropout=float(mamba_cfg.get("dropout", 0.0)),
             mamba_backend=mamba_backend,
+            mamba_headdim=(
+                int(mamba_cfg["headdim"]) if "headdim" in mamba_cfg else None
+            ),
+            mamba_ngroups=(
+                int(mamba_cfg["ngroups"]) if "ngroups" in mamba_cfg else None
+            ),
+            mamba_chunk_size=(
+                int(mamba_cfg["chunk_size"]) if "chunk_size" in mamba_cfg else None
+            ),
             mamba_bidirectional=bool(mamba_cfg.get("bidirectional", False)),
         )
         sa_layers = int(mamba_cfg.get("sa_layers", 0))
         wa_layers = int(mamba_cfg.get("wa_layers", 0))
-        if self.frontend not in {"plane_token", "learned_downsample"}:
-            raise ValueError("frontend must be plane_token or learned_downsample")
+        if self.frontend not in {"plane_token", "learned_downsample", "xrdmamba_repo"}:
+            raise ValueError("frontend must be plane_token, learned_downsample, or xrdmamba_repo")
 
         def make_branch(
             *,
@@ -1275,6 +1507,15 @@ class DualPlaneMambaClassifier(nn.Module):
             token_stride: int,
             mamba_layers: int,
         ) -> nn.Module:
+            if self.frontend == "xrdmamba_repo":
+                return _XRDMambaRepoBranch(
+                    branch_length=branch_length,
+                    d_model=branch_d_model,
+                    repo_length=int(xrdmamba_repo_length),
+                    branch_dropout=branch_dropout,
+                    mamba_layers=mamba_layers,
+                    **common_mamba,
+                )
             if self.frontend == "learned_downsample":
                 channels = _as_tuple(downsample_channels)
                 if len(channels) != 3:

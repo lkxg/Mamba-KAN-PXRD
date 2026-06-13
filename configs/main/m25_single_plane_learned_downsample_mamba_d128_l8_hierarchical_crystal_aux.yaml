@@ -36,13 +36,13 @@ model:
 
 optim:
   name: adamw
-  lr: 6.0e-4
+  lr: 3.0e-4
   weight_decay: 5.0e-4
   betas: [0.9, 0.999]
 
 scheduler:
   name: cosine
-  warmup_epochs: 10
+  warmup_epochs: 15
 
 train:
   epochs: 100
@@ -56,7 +56,7 @@ early_stopping:
   enabled: true
   patience: 10
   min_delta: 0.0
-  start_epoch: 40
+  start_epoch: 50
 
 logging:
   wandb:

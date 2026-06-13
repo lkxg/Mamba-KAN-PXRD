@@ -1,0 +1,107 @@
+experiment:
+  name: m31_xrdmamba_repo_resconv_5000_ce
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 128
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: dual_plane_mamba
+  dual_plane_mamba:
+    # Public XRDMamba repository-style control:
+    # intensity-weighted position embeddings, 5000-token input, deep ResConv,
+    # and Linear(1024, 512) -> Linear(512, 230) classifier.
+    frontend: xrdmamba_repo
+    xrdmamba_repo_length: 5000
+    theta_min: 5.0
+    theta_max: 90.0
+    wa_range: [5.0, 90.0]
+    use_sa: false
+    use_wa: true
+    d_model: 8
+    wa_d_model: 8
+    branch_dropout: 0.15
+    fusion: concat
+    head: xrdmamba_repo
+    head_hidden: [512]
+    head_dropout: 0.0
+    aux_heads: false
+    mamba:
+      backend: auto
+      # The paper reports 8 Mamba blocks; the repository class default is 4,
+      # while its CLI default says 8 but contains an args.m_layer typo.
+      wa_layers: 8
+      d_state: 16
+      d_conv: 3
+      expand: 2
+      dropout: 0.0
+
+optim:
+  name: adam
+  lr: 5.0e-5
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 20
+
+train:
+  epochs: 100
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 100
+  drop_last: true
+
+early_stopping:
+  enabled: false
+
+logging:
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: online
+    group: main_results
+    job_type: train
+    tags: [h100, m31, xrdmamba-repo-resconv, resample-5000, mamba, ce, main]
+    notes: "XRDMamba repository-style ResConv control: resample SimPOD 10824-point curves to 5000 tokens, use intensity-weighted position embeddings and the public repo's deep ResConv schedule. Training uses paper-reported lr/wd/epochs/warmup because the public train.py defaults conflict with the paper and contain an args.m_layer typo."
+    dir: wandb
+    save_code: true
+    watch_model: false
+    watch_log: gradients
+    watch_log_freq: 100
+    log_best_checkpoint: false
+
+loss:
+  name: ce
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: false
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5

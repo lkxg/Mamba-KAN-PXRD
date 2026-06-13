@@ -3,6 +3,7 @@
 Usage:
     python3 scripts/run_experiments.py
     python3 scripts/run_experiments.py --preset non_mamba
+    python3 scripts/run_experiments.py --preset cs
     python3 scripts/run_experiments.py --configs configs/experiments/e02_resnet_deep_label_smoothing.yaml
 """
 from __future__ import annotations
@@ -31,6 +32,8 @@ DEFAULT_RESULTS = "experiments/dual_range_matrix/results.md"
 DEFAULT_LOGS_DIR = "experiments/dual_range_matrix/logs"
 MAIN_RESULTS = "experiments/main_results/results.md"
 MAIN_LOGS_DIR = "experiments/main_results/logs"
+CS_RESULTS = "experiments/cs_results/results.md"
+CS_LOGS_DIR = "experiments/cs_results/logs"
 
 DEFAULT_CONFIGS = [
     "configs/experiments/e02_resnet_deep_label_smoothing.yaml",
@@ -66,6 +69,9 @@ MAIN_CONFIGS = [
     "configs/main/m23_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon.yaml",
     "configs/main/m25_single_plane_learned_downsample_mamba_d128_l8_hierarchical_crystal_aux.yaml",
     "configs/main/m26_single_plane_learned_downsample_mamba_d128_l8_crystal_expert_heads.yaml",
+    "configs/main/m27_single_plane_learned_downsample_mamba2_d128_l8_label_smoothing.yaml",
+    "configs/main/m28_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon_lr3e4.yaml",
+    "configs/main/m29_single_plane_learned_downsample_mamba_d128_l8_focal_gamma15.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -77,7 +83,12 @@ NON_MAMBA_CONFIGS = [
     "configs/experiments/e11_dual_gated_kan.yaml",
 ]
 
+CS_CONFIGS = [
+    "configs/cs/c01_resnet1d_crystal_label_smoothing.yaml",
+]
+
 CONFIG_PRESETS = {
+    "cs": CS_CONFIGS,
     "full": DEFAULT_CONFIGS,
     "main": MAIN_CONFIGS,
     "non_mamba": NON_MAMBA_CONFIGS,
@@ -107,11 +118,32 @@ RESULT_COLUMNS = [
     "loss",
     "sampler",
     "best_epoch",
+    "monitor",
+    "monitor_score",
+    "val_acc1",
+    "val_acc5",
+    "val_acc10",
+    "val_macro_acc1",
+    "val_rare_acc1",
+    "val_aux_loss",
+    "val_gate_mean",
+    "val_balanced_acc1_macro",
+    "test_loss",
     "test_acc1",
-    "test_macro_acc1",
     "test_acc5",
     "test_acc10",
+    "test_macro_acc1",
     "test_macro_f1",
+    "test_rare_acc1",
+    "test_aux_loss",
+    "test_gate_mean",
+    "occlusion_acc1",
+    "occlusion_acc10",
+    "occlusion_macro_acc1",
+    "occlusion_macro_f1",
+    "occlusion_rare_acc1",
+    "test_n",
+    "eval_metrics",
     "checkpoint",
     "wandb_run",
 ]
@@ -204,6 +236,16 @@ def checkpoint_metrics(best_path: Path) -> dict[str, str]:
     ckpt = torch.load(best_path, map_location="cpu")
     return {
         "best_epoch": str(int(ckpt["epoch"]) + 1),
+        "monitor": str(ckpt.get("monitor", "")),
+        "monitor_score": format_metric(ckpt.get("monitor_score")),
+        "val_acc1": format_metric(ckpt.get("val_acc1")),
+        "val_acc5": format_metric(ckpt.get("val_acc5")),
+        "val_acc10": format_metric(ckpt.get("val_acc10")),
+        "val_macro_acc1": format_metric(ckpt.get("val_macro_acc1")),
+        "val_rare_acc1": format_metric(ckpt.get("val_rare_acc1")),
+        "val_aux_loss": format_metric(ckpt.get("val_aux_loss")),
+        "val_gate_mean": format_metric(ckpt.get("val_gate_mean")),
+        "val_balanced_acc1_macro": format_metric(ckpt.get("val_balanced_acc1_macro")),
     }
 
 
@@ -493,10 +535,13 @@ def mamba_layers_requested(cfg: dict) -> int:
     return int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
 
 
-def mamba_ssm_import_error() -> str | None:
-    """Return the mamba-ssm import error, or None when Mamba is usable."""
+def mamba_ssm_import_error(backend: str = "mamba_ssm") -> str | None:
+    """Return the mamba-ssm import error, or None when the backend is usable."""
     try:
-        from mamba_ssm import Mamba  # noqa: F401
+        if backend in {"mamba2", "mamba2_ssm"}:
+            from mamba_ssm import Mamba2  # noqa: F401
+        else:
+            from mamba_ssm import Mamba  # noqa: F401
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
@@ -511,10 +556,11 @@ def validate_mamba_backend(cfg: dict) -> None:
     model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
     mamba_cfg = model_cfg.get("mamba", {}) or {}
     backend = str(mamba_cfg.get("backend", "auto")).lower()
-    if backend not in {"auto", "mamba_ssm"}:
+    if backend not in {"auto", "mamba_ssm", "mamba2", "mamba2_ssm"}:
         raise ValueError(f"unknown mamba backend: {backend!r}")
 
-    import_error = mamba_ssm_import_error()
+    import_backend = "mamba2_ssm" if backend in {"mamba2", "mamba2_ssm"} else "mamba_ssm"
+    import_error = mamba_ssm_import_error(import_backend)
     if backend == "auto" and import_error is not None:
         raise RuntimeError(
             f"{cfg['experiment']['name']} requests Mamba layers but mamba-ssm "
@@ -522,9 +568,9 @@ def validate_mamba_backend(cfg: dict) -> None:
             "runner, or set mamba.backend: mamba_ssm to require it explicitly. "
             f"Import error: {import_error}"
         )
-    if backend == "mamba_ssm" and import_error is not None:
+    if backend in {"mamba_ssm", "mamba2", "mamba2_ssm"} and import_error is not None:
         raise RuntimeError(
-            f"{cfg['experiment']['name']} requires mamba_ssm, but the package "
+            f"{cfg['experiment']['name']} requires {import_backend}, but the package "
             f"is not importable. Import error: {import_error}"
         )
 
@@ -536,19 +582,36 @@ def metrics_row(
 ) -> dict[str, str]:
     """Build the core test result fields from metrics.json or stdout fallback."""
     if metrics:
+        occlusion = metrics.get("occlusion", {}) or {}
         return {
+            "test_loss": format_metric(metrics.get("loss")),
             "test_acc1": format_metric(metrics.get("acc1")),
-            "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_acc5": format_metric(metrics.get("acc5")),
             "test_acc10": format_metric(metrics.get("acc10")),
+            "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_macro_f1": format_metric(metrics.get("macro_f1")),
+            "test_rare_acc1": format_metric(metrics.get("rare_acc1")),
+            "test_aux_loss": format_metric(metrics.get("aux_loss")),
+            "test_gate_mean": format_metric(metrics.get("gate_mean")),
+            "occlusion_acc1": format_metric(occlusion.get("acc1")),
+            "occlusion_acc10": format_metric(occlusion.get("acc10")),
+            "occlusion_macro_acc1": format_metric(occlusion.get("macro_acc1")),
+            "occlusion_macro_f1": format_metric(occlusion.get("macro_f1")),
+            "occlusion_rare_acc1": format_metric(occlusion.get("rare_acc1")),
+            "test_n": str(metrics.get("n", "")),
+            "eval_metrics": display_path(metrics_path) if metrics_path else "",
         }
     return {
+        "test_loss": fallback["loss"],
         "test_acc1": fallback["acc1"],
-        "test_macro_acc1": fallback["macro"],
         "test_acc5": fallback["acc5"],
         "test_acc10": fallback.get("acc10") or "",
+        "test_macro_acc1": fallback["macro"],
         "test_macro_f1": fallback.get("macro_f1") or "",
+        "test_rare_acc1": fallback.get("rare") or "",
+        "test_aux_loss": fallback.get("aux") or "",
+        "test_gate_mean": fallback.get("gate") or "",
+        "test_n": fallback.get("n") or "",
     }
 
 
@@ -586,7 +649,8 @@ def main() -> None:
         default=None,
         help=(
             "Named config group. Omit both --preset and --configs to run full. "
-            "Use main for the unified main-result configs."
+            "Use main for the unified main-result configs, or cs for "
+            "crystal-system classifiers."
         ),
     )
     ap.add_argument(
@@ -603,13 +667,17 @@ def main() -> None:
         default=None,
         help=(
             "Result Markdown path. Defaults to main_results for --preset main, "
+            "cs_results for --preset cs, "
             "else dual_range_matrix. Legacy .csv paths are mapped to .md."
         ),
     )
     ap.add_argument(
         "--logs-dir",
         default=None,
-        help="Log directory. Defaults to main_results for --preset main, else dual_range_matrix.",
+        help=(
+            "Log directory. Defaults to main_results for --preset main, "
+            "cs_results for --preset cs, else dual_range_matrix."
+        ),
     )
     ap.add_argument(
         "--skip-train",
@@ -654,8 +722,15 @@ def main() -> None:
     env = os.environ.copy()
     env.setdefault("WANDB_DIR", str(PROJECT_ROOT / "wandb"))
 
-    default_results = MAIN_RESULTS if args.preset == "main" else DEFAULT_RESULTS
-    default_logs_dir = MAIN_LOGS_DIR if args.preset == "main" else DEFAULT_LOGS_DIR
+    if args.preset == "main":
+        default_results = MAIN_RESULTS
+        default_logs_dir = MAIN_LOGS_DIR
+    elif args.preset == "cs":
+        default_results = CS_RESULTS
+        default_logs_dir = CS_LOGS_DIR
+    else:
+        default_results = DEFAULT_RESULTS
+        default_logs_dir = DEFAULT_LOGS_DIR
     results_arg = args.results or default_results
     logs_dir_arg = args.logs_dir or default_logs_dir
 

@@ -1,5 +1,5 @@
 experiment:
-  name: m26_single_plane_learned_downsample_mamba_d128_l8_crystal_expert_heads
+  name: m27_single_plane_learned_downsample_mamba2_d128_l8_label_smoothing
   seed: 42
 
 data:
@@ -21,17 +21,12 @@ model:
     downsample_channels: [64, 128, 256]
     downsample_blocks_per_stage: [2, 2]
     token_dropout: 0.05
-    hierarchical:
-      enabled: true
-      crystal_head: mlp
-      crystal_head_hidden: [128]
-      crystal_head_dropout: 0.1
-      expert_heads: true
-      expert_head: mlp
-      expert_head_hidden: [256]
-      expert_head_dropout: 0.1
     mamba:
+      backend: mamba2_ssm
       wa_layers: 8
+      d_state: 16
+      headdim: 64
+      chunk_size: 256
       dropout: 0.05
 
 optim:
@@ -66,12 +61,12 @@ logging:
     mode: online
     group: main_results
     job_type: train
-    tags: [h100, m26, single-plane, learned-downsample, mamba, d128, crystal-experts, hierarchical, label-smoothing, main]
+    tags: [h100, m27, single-plane, learned-downsample, mamba2, d128, label-smoothing, main]
     notes: >
-      M18 ablation with a crystal-system router and seven crystal-conditional
-      space-group expert heads. Each expert predicts only the space groups in
-      its crystal system; global logits are assembled with crystal-system
-      routing probabilities, and evaluation uses predicted-crystal hard masking.
+      M18 controlled ablation replacing the 8-layer WA Mamba mixer with
+      Mamba2 while keeping the learned downsampling frontend, D=128,
+      label-smoothing loss, optimizer, scheduler, and d_state=16 matched to
+      M18.
     dir: wandb
     save_code: true
     watch_model: false
@@ -82,12 +77,6 @@ logging:
 loss:
   name: label_smoothing
   label_smoothing: 0.05
-  hierarchical:
-    enabled: true
-    crystal_aux_weight: 0.2
-    consistency_weight: 0.0
-    expert_weight: 1.0
-    inference_mask: predicted
 
 sampler:
   name: none
@@ -100,7 +89,9 @@ performance:
   tf32: true
   cudnn_benchmark: true
   matmul_precision: high
-  compile: true
+  # Mamba2 + torch.compile hits a causal-conv1d backward stride assertion
+  # at the main batch size on this runner.
+  compile: false
   compile_mode: default
 
 checkpoint:
