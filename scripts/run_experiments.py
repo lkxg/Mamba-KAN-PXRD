@@ -72,6 +72,8 @@ MAIN_CONFIGS = [
     "configs/main/m27_single_plane_learned_downsample_mamba2_d128_l8_label_smoothing.yaml",
     "configs/main/m28_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon_lr3e4.yaml",
     "configs/main/m29_single_plane_learned_downsample_mamba_d128_l8_focal_gamma15.yaml",
+    "configs/main/m32_single_plane_learned_downsample_mamba_d128_l8_kan_residual_adapter_label_smoothing.yaml",
+    "configs/main/m33_single_plane_learned_downsample_mamba_d128_l8_mlp_kan_logit_residual_label_smoothing.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [
@@ -492,6 +494,20 @@ def summarize_config(cfg: dict) -> dict[str, str]:
             f"proj={model_cfg.get('projection_dim', 0)},"
             f"aux={model_cfg.get('aux_heads', False)}"
         )
+        feature_adapter_cfg = model_cfg.get("feature_adapter", {}) or {}
+        if feature_adapter_cfg.get("enabled", False):
+            model_params = (
+                f"{model_params},"
+                f"feature_adapter={feature_adapter_cfg.get('name', 'kan')},"
+                f"adapter_scale={feature_adapter_cfg.get('init_scale', 0.05)}"
+            )
+        logit_residual_cfg = model_cfg.get("logit_residual", {}) or {}
+        if logit_residual_cfg.get("enabled", False):
+            model_params = (
+                f"{model_params},"
+                f"logit_residual={logit_residual_cfg.get('head', 'kan')},"
+                f"residual_scale={logit_residual_cfg.get('init_scale', 0.05)}"
+            )
         hierarchical_cfg = model_cfg.get("hierarchical", {}) or {}
         if hierarchical_cfg.get("enabled", False):
             hier_mode = "experts" if hierarchical_cfg.get("expert_heads", False) else "conditional"

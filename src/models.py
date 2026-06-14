@@ -1417,6 +1417,8 @@ class DualPlaneMambaClassifier(nn.Module):
         head: str = "mlp",
         head_hidden: Sequence[int] = (512,),
         head_dropout: float = 0.1,
+        feature_adapter: dict | None = None,
+        logit_residual: dict | None = None,
         projection_head: str = "kan",
         projection_dim: int = 0,
         projection_hidden: Sequence[int] = (256,),
@@ -1630,6 +1632,28 @@ class DualPlaneMambaClassifier(nn.Module):
             self.branch_feature_dim = aligned_dim
             fused_dim = aligned_dim
 
+        feature_adapter_cfg = dict(feature_adapter or {})
+        self.feature_adapter_enabled = bool(feature_adapter_cfg.get("enabled", False))
+        if self.feature_adapter_enabled:
+            adapter_name = str(feature_adapter_cfg.get("name", "kan")).lower()
+            if adapter_name != "kan":
+                raise ValueError("feature_adapter.name must be kan")
+            adapter_grids = int(feature_adapter_cfg.get("kan_grids", kan_grids))
+            self.feature_adapter_norm = nn.LayerNorm(fused_dim)
+            self.feature_adapter = KANHead(
+                fused_dim,
+                fused_dim,
+                hidden=feature_adapter_cfg.get("hidden", (128,)),
+                num_grids=adapter_grids,
+                dropout=float(feature_adapter_cfg.get("dropout", 0.05)),
+            )
+            self.feature_adapter_scale = nn.Parameter(
+                torch.tensor(
+                    float(feature_adapter_cfg.get("init_scale", 0.05)),
+                    dtype=torch.float32,
+                )
+            )
+
         head_in_dim = fused_dim
         if self.hierarchical_enabled:
             if self.num_classes != 230:
@@ -1680,6 +1704,27 @@ class DualPlaneMambaClassifier(nn.Module):
                 dropout=head_dropout,
                 kan_grids=kan_grids,
                 efficient_kan_spline_order=efficient_kan_spline_order,
+            )
+        logit_residual_cfg = dict(logit_residual or {})
+        self.logit_residual_enabled = bool(logit_residual_cfg.get("enabled", False))
+        if self.logit_residual_enabled:
+            if self.hierarchical_expert_heads:
+                raise ValueError("logit_residual is not supported with expert heads")
+            residual_grids = int(logit_residual_cfg.get("kan_grids", kan_grids))
+            self.logit_residual_head = _make_head(
+                name=str(logit_residual_cfg.get("head", "kan")),
+                in_dim=head_in_dim,
+                out_dim=self.num_classes,
+                hidden=logit_residual_cfg.get("hidden", (128,)),
+                dropout=float(logit_residual_cfg.get("dropout", 0.05)),
+                kan_grids=residual_grids,
+                efficient_kan_spline_order=efficient_kan_spline_order,
+            )
+            self.logit_residual_scale = nn.Parameter(
+                torch.tensor(
+                    float(logit_residual_cfg.get("init_scale", 0.05)),
+                    dtype=torch.float32,
+                )
             )
         projection_dim = int(projection_dim)
         self.projection_head = (
@@ -1760,6 +1805,14 @@ class DualPlaneMambaClassifier(nn.Module):
         else:
             fused = parts[0]
 
+        if self.feature_adapter_enabled:
+            adapter_delta = self.feature_adapter(self.feature_adapter_norm(fused))
+            adapter_scale = self.feature_adapter_scale.to(
+                dtype=fused.dtype,
+                device=fused.device,
+            )
+            fused = fused + adapter_scale * adapter_delta
+
         head_input = fused
         if self.hierarchical_enabled:
             crystal_logits = self.crystal_head(fused)
@@ -1777,7 +1830,14 @@ class DualPlaneMambaClassifier(nn.Module):
                 head_input = torch.cat([fused, self.crystal_context(crystal_prob)], dim=-1)
 
         if "logits" not in outputs:
-            outputs["logits"] = self.head(head_input)
+            logits = self.head(head_input)
+            if self.logit_residual_enabled:
+                residual_scale = self.logit_residual_scale.to(
+                    dtype=head_input.dtype,
+                    device=head_input.device,
+                )
+                logits = logits + residual_scale * self.logit_residual_head(head_input)
+            outputs["logits"] = logits
         if self.projection_head is not None:
             embedding = self.projection_head(fused)
             if self.projection_normalize:
