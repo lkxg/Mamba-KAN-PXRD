@@ -6,6 +6,7 @@
 3. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
 4. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
 5. DualRangePXRDClassifier：SA/WA 双分支 + 可选 selective SSM + KAN head
+6. DualPlaneMambaClassifier：可选 dense 谱图分支 + peak-token 分支
 
 这些模型为项目提供了基线性能，后续可以添加更先进的架构（如 Mamba-KAN 混合模型）。
 """
@@ -1370,6 +1371,178 @@ class _XRDMambaRepoBranch(nn.Module):
         return self.resconv(tokens.transpose(1, 2))
 
 
+class _PeakTokenBranch(nn.Module):
+    """Sparse Bragg-evidence token encoder built from the strongest local peaks."""
+
+    def __init__(
+        self,
+        *,
+        signal_length: int,
+        theta_min: float,
+        theta_max: float,
+        top_k: int = 128,
+        d_model: int = 128,
+        encoder: str = "mamba",
+        wavelength: float = 1.5406,
+        smoothing_kernel: int = 5,
+        local_window: int = 17,
+        token_dropout: float = 0.05,
+        branch_dropout: float = 0.05,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+        self.signal_length = int(signal_length)
+        self.top_k = int(top_k)
+        self.d_model = int(d_model)
+        self.encoder = encoder.lower()
+        self.smoothing_kernel = int(smoothing_kernel)
+        self.local_window = int(local_window)
+        if self.signal_length <= 0:
+            raise ValueError("signal_length must be positive")
+        if self.top_k <= 0 or self.top_k > self.signal_length:
+            raise ValueError("top_k must satisfy 0 < top_k <= signal_length")
+        if self.d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if self.encoder not in {"mamba", "pool", "mean", "mlp"}:
+            raise ValueError("peak encoder must be mamba, pool, mean, or mlp")
+        if self.smoothing_kernel < 1:
+            raise ValueError("smoothing_kernel must be positive")
+        if self.smoothing_kernel % 2 == 0:
+            self.smoothing_kernel += 1
+        if self.local_window < 1:
+            raise ValueError("local_window must be positive")
+        if self.local_window % 2 == 0:
+            self.local_window += 1
+        if wavelength <= 0:
+            raise ValueError("wavelength must be positive")
+
+        two_theta = torch.linspace(float(theta_min), float(theta_max), self.signal_length)
+        theta_rad = torch.deg2rad(two_theta * 0.5)
+        q = (4.0 * math.pi * torch.sin(theta_rad)) / float(wavelength)
+
+        def normalize(v: torch.Tensor) -> torch.Tensor:
+            return ((v - v.min()) / (v.max() - v.min()).clamp_min(1e-6)) * 2.0 - 1.0
+
+        self.register_buffer("q_norm", normalize(q), persistent=False)
+        self.register_buffer(
+            "low_angle_flag",
+            (two_theta <= 15.0).to(dtype=torch.float32),
+            persistent=False,
+        )
+        radius = self.local_window // 2
+        self.register_buffer(
+            "patch_offsets",
+            torch.arange(-radius, radius + 1, dtype=torch.long),
+            persistent=False,
+        )
+
+        self.num_peak_features = 5
+        self.token_proj = nn.Sequential(
+            nn.LayerNorm(self.num_peak_features),
+            nn.Linear(self.num_peak_features, self.d_model),
+            nn.GELU(),
+            nn.Dropout(float(token_dropout)),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.mixer = _MambaSequenceMixer(
+            self.d_model,
+            num_layers=mamba_layers if self.encoder == "mamba" else 0,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
+            bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(self.d_model)
+        self.out_dim = self.d_model
+
+    def _gather_positions(self, values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        source = values.to(device=index.device).unsqueeze(0).expand(index.shape[0], -1)
+        return source.gather(1, index)
+
+    def _smooth(self, x: torch.Tensor) -> torch.Tensor:
+        if self.smoothing_kernel <= 1:
+            return x
+        return F.avg_pool1d(
+            x.unsqueeze(1),
+            kernel_size=self.smoothing_kernel,
+            stride=1,
+            padding=self.smoothing_kernel // 2,
+        ).squeeze(1)
+
+    def _extract_peak_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        x_work = x.float().clamp_min(0.0)
+        smooth = self._smooth(x_work)
+        local_mean = F.avg_pool1d(
+            x_work.unsqueeze(1),
+            kernel_size=self.local_window,
+            stride=1,
+            padding=self.local_window // 2,
+        ).squeeze(1)
+
+        left = F.pad(smooth[:, :-1], (1, 0), value=-1.0)
+        right = F.pad(smooth[:, 1:], (0, 1), value=-1.0)
+        local_max = (smooth >= left) & (smooth >= right)
+        scores = smooth.masked_fill(~local_max, -1.0)
+        _, peak_idx = torch.topk(scores, k=self.top_k, dim=1, largest=True, sorted=False)
+        peak_idx = torch.sort(peak_idx, dim=1).values
+
+        intensity = x_work.gather(1, peak_idx)
+        smooth_intensity = smooth.gather(1, peak_idx)
+        mean_at_peak = local_mean.gather(1, peak_idx)
+        prominence = (smooth_intensity - mean_at_peak).clamp_min(0.0)
+
+        patch_idx = peak_idx.unsqueeze(-1) + self.patch_offsets.to(device=x.device)
+        patch_idx = patch_idx.clamp(0, self.signal_length - 1)
+        patch = x_work.gather(1, patch_idx.flatten(1)).view(
+            x.shape[0],
+            self.top_k,
+            self.local_window,
+        )
+        width_proxy = (patch >= (smooth_intensity.unsqueeze(-1) * 0.5)).float().mean(dim=-1)
+
+        log_intensity = torch.log1p(9.0 * intensity) / math.log(10.0)
+
+        features = torch.stack(
+            [
+                self._gather_positions(self.q_norm, peak_idx),
+                log_intensity,
+                prominence,
+                width_proxy,
+                self._gather_positions(self.low_angle_flag, peak_idx),
+            ],
+            dim=-1,
+        )
+        return features.to(dtype=x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected peak input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.signal_length:
+            raise ValueError(
+                f"signal length mismatch: got {x.shape[1]}, expected {self.signal_length}"
+            )
+        tokens = self.token_proj(self._extract_peak_tokens(x))
+        tokens = self.mixer(tokens)
+        feat = tokens.mean(dim=1)
+        return self.feature_norm(self.dropout(feat))
+
+
 class DualPlaneMambaClassifier(nn.Module):
     """SA/WA diffraction-angle token model with optional Mamba and KAN fusion.
 
@@ -1419,6 +1592,7 @@ class DualPlaneMambaClassifier(nn.Module):
         head_dropout: float = 0.1,
         feature_adapter: dict | None = None,
         logit_residual: dict | None = None,
+        peak_branch: dict | None = None,
         projection_head: str = "kan",
         projection_dim: int = 0,
         projection_hidden: Sequence[int] = (256,),
@@ -1632,6 +1806,88 @@ class DualPlaneMambaClassifier(nn.Module):
             self.branch_feature_dim = aligned_dim
             fused_dim = aligned_dim
 
+        peak_branch_cfg = dict(peak_branch or {})
+        self.peak_branch_enabled = bool(peak_branch_cfg.get("enabled", False))
+        if self.peak_branch_enabled:
+            peak_encoder = str(peak_branch_cfg.get("encoder", "mamba")).lower()
+            peak_mamba_cfg = dict(peak_branch_cfg.get("mamba", {}) or {})
+            peak_layers = int(
+                peak_mamba_cfg.get(
+                    "layers",
+                    peak_branch_cfg.get(
+                        "mamba_layers",
+                        2 if peak_encoder == "mamba" else 0,
+                    ),
+                )
+            )
+            self.peak_branch = _PeakTokenBranch(
+                signal_length=self.in_dim,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                top_k=int(peak_branch_cfg.get("top_k", 128)),
+                d_model=int(peak_branch_cfg.get("d_model", fused_dim)),
+                encoder=peak_encoder,
+                wavelength=float(peak_branch_cfg.get("wavelength", 1.5406)),
+                smoothing_kernel=int(peak_branch_cfg.get("smoothing_kernel", 5)),
+                local_window=int(peak_branch_cfg.get("local_window", 17)),
+                token_dropout=float(peak_branch_cfg.get("token_dropout", token_dropout)),
+                branch_dropout=float(peak_branch_cfg.get("branch_dropout", branch_dropout)),
+                mamba_layers=peak_layers,
+                mamba_d_state=int(peak_mamba_cfg.get("d_state", mamba_cfg.get("d_state", 16))),
+                mamba_d_conv=int(peak_mamba_cfg.get("d_conv", mamba_cfg.get("d_conv", 4))),
+                mamba_expand=int(peak_mamba_cfg.get("expand", mamba_cfg.get("expand", 2))),
+                mamba_dropout=float(peak_mamba_cfg.get("dropout", mamba_cfg.get("dropout", 0.0))),
+                mamba_backend=peak_mamba_cfg.get("backend", mamba_backend),
+                mamba_headdim=(
+                    int(peak_mamba_cfg["headdim"]) if "headdim" in peak_mamba_cfg else None
+                ),
+                mamba_ngroups=(
+                    int(peak_mamba_cfg["ngroups"]) if "ngroups" in peak_mamba_cfg else None
+                ),
+                mamba_chunk_size=(
+                    int(peak_mamba_cfg["chunk_size"])
+                    if "chunk_size" in peak_mamba_cfg
+                    else None
+                ),
+                mamba_bidirectional=bool(
+                    peak_mamba_cfg.get("bidirectional", mamba_cfg.get("bidirectional", False))
+                ),
+            )
+            self.peak_align = (
+                nn.Linear(self.peak_branch.out_dim, fused_dim)
+                if self.peak_branch.out_dim != fused_dim
+                else nn.Identity()
+            )
+            self.peak_fusion = str(peak_branch_cfg.get("fusion", "residual_gated")).lower()
+            if self.peak_fusion not in {"residual", "residual_gated"}:
+                raise ValueError("peak_branch.fusion must be residual or residual_gated")
+            self.peak_scale = nn.Parameter(
+                torch.tensor(
+                    float(peak_branch_cfg.get("init_scale", 0.05)),
+                    dtype=torch.float32,
+                )
+            )
+            if self.peak_fusion == "residual_gated":
+                peak_gate_hidden = _as_tuple(peak_branch_cfg.get("gate_hidden", (128,)))
+                peak_gate_layers: list[nn.Module] = [nn.LayerNorm(fused_dim * 4)]
+                prev = fused_dim * 4
+                for h in peak_gate_hidden:
+                    peak_gate_layers.extend([
+                        nn.Linear(prev, int(h)),
+                        nn.GELU(),
+                        nn.Dropout(float(peak_branch_cfg.get("gate_dropout", 0.05))),
+                    ])
+                    prev = int(h)
+                peak_gate_layers.append(nn.Linear(prev, fused_dim))
+                self.peak_gate = nn.Sequential(*peak_gate_layers)
+            else:
+                self.peak_gate = None
+        else:
+            self.peak_branch = None
+            self.peak_align = None
+            self.peak_gate = None
+            self.peak_fusion = "none"
+
         feature_adapter_cfg = dict(feature_adapter or {})
         self.feature_adapter_enabled = bool(feature_adapter_cfg.get("enabled", False))
         if self.feature_adapter_enabled:
@@ -1804,6 +2060,20 @@ class DualPlaneMambaClassifier(nn.Module):
             fused = torch.cat(parts, dim=-1)
         else:
             fused = parts[0]
+
+        if self.peak_branch_enabled and self.peak_branch is not None:
+            f_peak = self.peak_align(self.peak_branch(x))
+            peak_scale = self.peak_scale.to(dtype=fused.dtype, device=fused.device)
+            if self.peak_gate is not None:
+                peak_gate_input = torch.cat(
+                    [fused, f_peak, (fused - f_peak).abs(), fused * f_peak],
+                    dim=-1,
+                )
+                peak_gate = torch.sigmoid(self.peak_gate(peak_gate_input))
+                fused = fused + peak_scale * peak_gate * f_peak
+                outputs["peak_gate_mean"] = peak_gate.detach().mean(dim=1)
+            else:
+                fused = fused + peak_scale * f_peak
 
         if self.feature_adapter_enabled:
             adapter_delta = self.feature_adapter(self.feature_adapter_norm(fused))

@@ -34,6 +34,8 @@ MAIN_RESULTS = "experiments/main_results/results.md"
 MAIN_LOGS_DIR = "experiments/main_results/logs"
 CS_RESULTS = "experiments/cs_results/results.md"
 CS_LOGS_DIR = "experiments/cs_results/logs"
+PEAK_TOKEN_RESULTS = "experiments/peak_token/results.md"
+PEAK_TOKEN_LOGS_DIR = "experiments/peak_token/logs"
 
 DEFAULT_CONFIGS = [
     "configs/experiments/e02_resnet_deep_label_smoothing.yaml",
@@ -89,11 +91,17 @@ CS_CONFIGS = [
     "configs/cs/c01_resnet1d_crystal_label_smoothing.yaml",
 ]
 
+PEAK_TOKEN_CONFIGS = [
+    "configs/main/m34_single_plane_learned_downsample_mamba_peak_mamba_label_smoothing.yaml",
+    "configs/main/m35_single_plane_learned_downsample_mamba_peak_pool_label_smoothing.yaml",
+]
+
 CONFIG_PRESETS = {
     "cs": CS_CONFIGS,
     "full": DEFAULT_CONFIGS,
     "main": MAIN_CONFIGS,
     "non_mamba": NON_MAMBA_CONFIGS,
+    "peak_token": PEAK_TOKEN_CONFIGS,
 }
 
 TEST_RE = re.compile(
@@ -512,6 +520,18 @@ def summarize_config(cfg: dict) -> dict[str, str]:
         if hierarchical_cfg.get("enabled", False):
             hier_mode = "experts" if hierarchical_cfg.get("expert_heads", False) else "conditional"
             model_params = f"{model_params},hier={hier_mode}"
+        peak_cfg = model_cfg.get("peak_branch", {}) or {}
+        if peak_cfg.get("enabled", False):
+            peak_mamba_cfg = peak_cfg.get("mamba", {}) or {}
+            model_params = (
+                f"{model_params},"
+                f"peak={peak_cfg.get('encoder', 'mamba')},"
+                f"topK={peak_cfg.get('top_k', 128)},"
+                f"peak_d={peak_cfg.get('d_model', d_model)},"
+                f"peak_layers={peak_mamba_cfg.get('layers', peak_cfg.get('mamba_layers', ''))},"
+                f"peak_fusion={peak_cfg.get('fusion', 'residual_gated')},"
+                f"peak_scale={peak_cfg.get('init_scale', 0.05)}"
+            )
         if frontend == "learned_downsample":
             model_params = (
                 f"{model_params},"
@@ -548,7 +568,12 @@ def mamba_layers_requested(cfg: dict) -> int:
         return 0
     model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
     mamba_cfg = model_cfg.get("mamba", {}) or {}
-    return int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
+    layers = int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
+    peak_cfg = model_cfg.get("peak_branch", {}) or {}
+    if peak_cfg.get("enabled", False) and str(peak_cfg.get("encoder", "mamba")).lower() == "mamba":
+        peak_mamba_cfg = peak_cfg.get("mamba", {}) or {}
+        layers += int(peak_mamba_cfg.get("layers", peak_cfg.get("mamba_layers", 2)))
+    return layers
 
 
 def mamba_ssm_import_error(backend: str = "mamba_ssm") -> str | None:
@@ -666,7 +691,8 @@ def main() -> None:
         help=(
             "Named config group. Omit both --preset and --configs to run full. "
             "Use main for the unified main-result configs, or cs for "
-            "crystal-system classifiers."
+            "crystal-system classifiers. Use peak_token for the compressed "
+            "peak-branch validation pair."
         ),
     )
     ap.add_argument(
@@ -683,7 +709,7 @@ def main() -> None:
         default=None,
         help=(
             "Result Markdown path. Defaults to main_results for --preset main, "
-            "cs_results for --preset cs, "
+            "cs_results for --preset cs, peak_token for --preset peak_token, "
             "else dual_range_matrix. Legacy .csv paths are mapped to .md."
         ),
     )
@@ -692,7 +718,8 @@ def main() -> None:
         default=None,
         help=(
             "Log directory. Defaults to main_results for --preset main, "
-            "cs_results for --preset cs, else dual_range_matrix."
+            "cs_results for --preset cs, peak_token for --preset peak_token, "
+            "else dual_range_matrix."
         ),
     )
     ap.add_argument(
@@ -744,6 +771,9 @@ def main() -> None:
     elif args.preset == "cs":
         default_results = CS_RESULTS
         default_logs_dir = CS_LOGS_DIR
+    elif args.preset == "peak_token":
+        default_results = PEAK_TOKEN_RESULTS
+        default_logs_dir = PEAK_TOKEN_LOGS_DIR
     else:
         default_results = DEFAULT_RESULTS
         default_logs_dir = DEFAULT_LOGS_DIR

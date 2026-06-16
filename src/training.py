@@ -685,6 +685,8 @@ def output_gate_mean(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Te
     """Return batch gate means when a gated dual-range model exposes them."""
     if isinstance(output, dict) and "gate_mean" in output:
         return output["gate_mean"].detach()
+    if isinstance(output, dict) and "peak_gate_mean" in output:
+        return output["peak_gate_mean"].detach()
     return None
 
 
