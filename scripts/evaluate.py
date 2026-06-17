@@ -988,18 +988,28 @@ def main():
         zero_division=0,
     )
 
-    # 打印测试结果
     crystal_acc1 = float("nan")
     if outputs["crystal_true"].size:
         crystal_acc1 = float((outputs["crystal_true"] == outputs["crystal_pred"]).mean())
 
-    print(f"Test loss={stats.loss:.4f}  acc1={stats.acc1:.4f}  "
-          f"acc5={stats.acc5:.4f}  acc10={stats.acc10:.4f}  "
-          f"macro={stats.macro_acc1:.4f}  "
-          f"macro_f1={macro_f1:.4f}  rare={stats.rare_acc1:.4f}  "
-          f"aux={stats.aux_loss:.4f}  "
-          f"gate={stats.gate_mean if stats.gate_mean is not None else float('nan'):.4f}  "
-          f"(N={stats.n})")
+    # 核心指标
+    parts = [
+        f"Test loss={stats.loss:.4f}",
+        f"acc1={stats.acc1:.4f}",
+        f"acc5={stats.acc5:.4f}",
+        f"macro_f1={macro_f1:.4f}",
+    ]
+    # 条件指标（仅在启用时输出）
+    if stats.rare_total:
+        parts.append(f"rare_acc1={stats.rare_acc1:.4f}")
+    if stats.aux_loss:
+        parts.append(f"aux={stats.aux_loss:.4f}")
+    if stats.gate_mean is not None:
+        parts.append(f"gate={stats.gate_mean:.4f}")
+    if math.isfinite(crystal_acc1):
+        parts.append(f"crystal_acc1={crystal_acc1:.4f}")
+    parts.append(f"(N={stats.n})")
+    print("  ".join(parts))
 
     plot_dir = (
         Path(args.plot_dir)
@@ -1012,28 +1022,30 @@ def main():
         "epoch": int(ckpt["epoch"]),
         "task": task,
         "split": args.split,
-        "only_rare": bool(args.only_rare),
-        "sa_mamba_backend": sa_mamba_backend or None,
-        "wa_mamba_backend": wa_mamba_backend or None,
         "n": int(stats.n),
         "loss": float(stats.loss),
         "acc1": float(stats.acc1),
         "acc5": float(stats.acc5),
-        "acc10": float(stats.acc10),
-        "macro_acc1": float(stats.macro_acc1),
         "macro_f1": float(macro_f1),
-        "rare_acc1": float(stats.rare_acc1),
-        "rare_total": int(stats.rare_total or 0),
-        "rare_class_count": int(len(rare_classes)),
-        "crystal_acc1": crystal_acc1 if math.isfinite(crystal_acc1) else None,
-        "hierarchical_inference_mask": hierarchical_mask_mode,
-        "aux_loss": float(stats.aux_loss),
-        "gate_mean": (
-            float(stats.gate_mean)
-            if stats.gate_mean is not None
-            else None
-        ),
     }
+    # 条件指标（仅在启用时输出）
+    if args.only_rare:
+        metrics["only_rare"] = True
+    if sa_mamba_backend:
+        metrics["sa_mamba_backend"] = sa_mamba_backend
+    if wa_mamba_backend:
+        metrics["wa_mamba_backend"] = wa_mamba_backend
+    if stats.rare_total:
+        metrics["rare_acc1"] = float(stats.rare_acc1)
+        metrics["rare_total"] = int(stats.rare_total)
+        metrics["rare_class_count"] = len(rare_classes)
+    if stats.aux_loss:
+        metrics["aux_loss"] = float(stats.aux_loss)
+    if stats.gate_mean is not None:
+        metrics["gate_mean"] = float(stats.gate_mean)
+    if math.isfinite(crystal_acc1):
+        metrics["crystal_acc1"] = crystal_acc1
+        metrics["hierarchical_inference_mask"] = hierarchical_mask_mode
 
     if not args.no_plots:
         plot_paths = save_eval_plots(
@@ -1087,33 +1099,30 @@ def main():
         )
         metrics["occlusion"] = {
             "range_deg": [float(occ_start), float(occ_end)],
-            "loss": float(occ_stats.loss),
             "acc1": float(occ_stats.acc1),
             "acc5": float(occ_stats.acc5),
-            "acc10": float(occ_stats.acc10),
-            "macro_acc1": float(occ_stats.macro_acc1),
             "macro_f1": float(occ_macro_f1),
-            "rare_acc1": float(occ_stats.rare_acc1),
-            "aux_loss": float(occ_stats.aux_loss),
-            "gate_mean": (
-                float(occ_stats.gate_mean)
-                if occ_stats.gate_mean is not None
-                else None
-            ),
             "delta_acc1": float(occ_stats.acc1 - stats.acc1),
-            "delta_macro_acc1": float(occ_stats.macro_acc1 - stats.macro_acc1),
             "delta_macro_f1": float(occ_macro_f1 - macro_f1),
-            "delta_rare_acc1": float(occ_stats.rare_acc1 - stats.rare_acc1),
         }
-        print(
-            f"Occlusion {occ_start:.1f}-{occ_end:.1f} deg  "
-            f"acc1={occ_stats.acc1:.4f}  acc5={occ_stats.acc5:.4f}  "
-            f"acc10={occ_stats.acc10:.4f}  "
-            f"macro={occ_stats.macro_acc1:.4f}  macro_f1={occ_macro_f1:.4f}  "
-            f"rare={occ_stats.rare_acc1:.4f}  "
-            f"delta_acc1={occ_stats.acc1 - stats.acc1:+.4f}  "
-            f"delta_macro={occ_stats.macro_acc1 - stats.macro_acc1:+.4f}"
-        )
+        if occ_stats.rare_total:
+            metrics["occlusion"]["rare_acc1"] = float(occ_stats.rare_acc1)
+            metrics["occlusion"]["delta_rare_acc1"] = float(
+                occ_stats.rare_acc1 - stats.rare_acc1
+            )
+        if occ_stats.gate_mean is not None:
+            metrics["occlusion"]["gate_mean"] = float(occ_stats.gate_mean)
+        occ_parts = [
+            f"Occlusion {occ_start:.1f}-{occ_end:.1f} deg",
+            f"acc1={occ_stats.acc1:.4f}",
+            f"acc5={occ_stats.acc5:.4f}",
+            f"macro_f1={occ_macro_f1:.4f}",
+            f"delta_acc1={occ_stats.acc1 - stats.acc1:+.4f}",
+            f"delta_f1={occ_macro_f1 - macro_f1:+.4f}",
+        ]
+        if occ_stats.rare_total:
+            occ_parts.append(f"rare_acc1={occ_stats.rare_acc1:.4f}")
+        print("  ".join(occ_parts))
 
     if not args.no_plots:
         plot_dir.mkdir(parents=True, exist_ok=True)

@@ -2,8 +2,6 @@
 
 Usage:
     python3 scripts/run_experiments.py
-    python3 scripts/run_experiments.py --preset non_mamba
-    python3 scripts/run_experiments.py --preset cs
     python3 scripts/run_experiments.py --configs configs/experiments/e02_resnet_deep_label_smoothing.yaml
 """
 from __future__ import annotations
@@ -109,64 +107,22 @@ TEST_RE = re.compile(
     r"acc1=(?P<acc1>[0-9.]+)\s+"
     r"acc5=(?P<acc5>[0-9.]+)\s+"
     r"(?:acc10=(?P<acc10>[0-9.]+)\s+)?"
-    r"macro=(?P<macro>[0-9.]+)\s+"
+    r"(?:macro=(?P<macro>[0-9.]+)\s+)?"
     r"(?:macro_f1=(?P<macro_f1>[0-9.]+)\s+)?"
     r"(?:rare=(?P<rare>[0-9.]+|nan)\s+)?"
+    r"(?:rare_acc1=(?P<rare_acc1>[0-9.]+|nan)\s+)?"
     r"(?:aux=(?P<aux>[0-9.]+|nan)\s+)?"
     r"(?:gate=(?P<gate>[0-9.]+|nan)\s+)?"
+    r"(?:crystal_acc1=(?P<crystal_acc1>[0-9.]+|nan)\s+)?"
     r"\(N=(?P<n>[0-9]+)\)"
 )
 
 RESULT_COLUMNS = [
     "experiment",
-    "config",
-    "model",
-    "model_params",
-    "optimizer",
-    "lr",
-    "weight_decay",
-    "loss",
-    "sampler",
-    "best_epoch",
-    "monitor",
-    "monitor_score",
-    "val_acc1",
-    "val_acc5",
-    "val_acc10",
-    "val_macro_acc1",
-    "val_rare_acc1",
-    "val_aux_loss",
-    "val_gate_mean",
-    "val_balanced_acc1_macro",
-    "test_loss",
     "test_acc1",
     "test_acc5",
-    "test_acc10",
-    "test_macro_acc1",
     "test_macro_f1",
-    "test_rare_acc1",
-    "test_aux_loss",
-    "test_gate_mean",
-    "occlusion_acc1",
-    "occlusion_acc10",
-    "occlusion_macro_acc1",
-    "occlusion_macro_f1",
-    "occlusion_rare_acc1",
-    "test_n",
-    "eval_metrics",
-    "checkpoint",
-    "wandb_run",
 ]
-
-LEGACY_MARKDOWN_ALIASES = {
-    "val_macro": "val_macro_acc1",
-    "val_rare": "val_rare_acc1",
-    "test_macro": "test_macro_acc1",
-    "test_f1": "test_macro_f1",
-    "test_rare": "test_rare_acc1",
-    "gate": "test_gate_mean",
-}
-
 
 def run_and_log(cmd: list[str], log_path: Path, env: dict[str, str]) -> str:
     """Run a command, stream stdout, and write a log file."""
@@ -205,21 +161,6 @@ def newest_checkpoint(run_name: str, started_at: float) -> Path:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def newest_wandb_run(started_at: float) -> str:
-    """Return the newest local W&B run directory created after started_at."""
-    candidates: list[Path] = []
-    for wandb_dir in [PROJECT_ROOT / "wandb", PROJECT_ROOT / "wandb" / "wandb"]:
-        if not wandb_dir.exists():
-            continue
-        candidates.extend(
-            p for p in wandb_dir.glob("*run-*")
-            if p.is_dir() and p.stat().st_mtime >= started_at
-        )
-    if not candidates:
-        return ""
-    return str(max(candidates, key=lambda p: p.stat().st_mtime).relative_to(PROJECT_ROOT))
-
-
 def parse_test_metrics(output: str) -> dict[str, str]:
     """Parse evaluate.py metrics from stdout."""
     match = TEST_RE.search(output)
@@ -239,24 +180,6 @@ def format_metric(value, *, digits: int = 6) -> str:
     if not math.isfinite(numeric):
         return ""
     return f"{numeric:.{digits}f}"
-
-
-def checkpoint_metrics(best_path: Path) -> dict[str, str]:
-    """Load validation metrics from a checkpoint."""
-    ckpt = torch.load(best_path, map_location="cpu")
-    return {
-        "best_epoch": str(int(ckpt["epoch"]) + 1),
-        "monitor": str(ckpt.get("monitor", "")),
-        "monitor_score": format_metric(ckpt.get("monitor_score")),
-        "val_acc1": format_metric(ckpt.get("val_acc1")),
-        "val_acc5": format_metric(ckpt.get("val_acc5")),
-        "val_acc10": format_metric(ckpt.get("val_acc10")),
-        "val_macro_acc1": format_metric(ckpt.get("val_macro_acc1")),
-        "val_rare_acc1": format_metric(ckpt.get("val_rare_acc1")),
-        "val_aux_loss": format_metric(ckpt.get("val_aux_loss")),
-        "val_gate_mean": format_metric(ckpt.get("val_gate_mean")),
-        "val_balanced_acc1_macro": format_metric(ckpt.get("val_balanced_acc1_macro")),
-    }
 
 
 def display_path(path: Path) -> str:
@@ -296,9 +219,10 @@ def normalize_result_row(row: dict[str, str]) -> dict[str, str]:
     """Return a row with exactly the current Markdown result columns."""
     normalized: dict[str, str] = {}
     for key, value in row.items():
-        column = LEGACY_MARKDOWN_ALIASES.get(key, key)
-        if column in RESULT_COLUMNS:
-            normalized[column] = "" if value is None else str(value)
+        if key in RESULT_COLUMNS:
+            normalized[key] = "" if value is None else str(value)
+    if "experiment" in normalized and normalized["experiment"]:
+        normalized["experiment"] = normalized["experiment"].split("_")[0]
     return {column: normalized.get(column, "") for column in RESULT_COLUMNS}
 
 
@@ -449,115 +373,8 @@ def write_results_markdown(results_path: Path, rows: list[dict[str, str]]) -> No
 
 def summarize_config(cfg: dict) -> dict[str, str]:
     """Return config fields used in result rows."""
-    model_name = cfg["model"]["name"]
-    model_cfg = cfg["model"].get(model_name, {})
-    if model_name == "resnet1d":
-        model_params = (
-            f"base{model_cfg.get('base_channels')},"
-            f"blocks{model_cfg.get('blocks_per_stage')}"
-        )
-    elif model_name == "bigru_patch":
-        model_params = (
-            f"patch{model_cfg.get('patch_len')},"
-            f"stride{model_cfg.get('stride')},"
-            f"d{model_cfg.get('d_model')},"
-            f"h{model_cfg.get('hidden_size')},"
-            f"layers{model_cfg.get('num_layers')}"
-        )
-    elif model_name == "patchtst":
-        model_params = (
-            f"patch{model_cfg.get('patch_len')},"
-            f"stride{model_cfg.get('stride')},"
-            f"d{model_cfg.get('d_model')},"
-            f"heads{model_cfg.get('n_heads')},"
-            f"layers{model_cfg.get('num_layers')}"
-        )
-    elif model_name == "dual_range":
-        model_params = (
-            f"sa{model_cfg.get('use_sa', True)},"
-            f"wa{model_cfg.get('use_wa', True)},"
-            f"fusion={model_cfg.get('fusion', 'concat')},"
-            f"head={model_cfg.get('head', 'mlp')},"
-            f"mamba={model_cfg.get('mamba', {})},"
-            f"aux={model_cfg.get('aux_heads', False)}"
-        )
-    elif model_name == "dual_plane_mamba":
-        d_model = model_cfg.get("d_model")
-        sa_d_model = model_cfg.get("sa_d_model", d_model)
-        wa_d_model = model_cfg.get("wa_d_model", d_model)
-        frontend = model_cfg.get("frontend", "plane_token")
-        model_params = (
-            f"frontend={frontend},"
-            f"sa{model_cfg.get('use_sa', True)},"
-            f"wa{model_cfg.get('use_wa', True)},"
-            f"d={d_model},"
-            f"sa_d={sa_d_model},"
-            f"wa_d={wa_d_model},"
-            f"sa_stride={model_cfg.get('sa_token_stride', 1)},"
-            f"wa_stride={model_cfg.get('wa_token_stride', 1)},"
-            f"fusion={model_cfg.get('fusion', 'gated')},"
-            f"gate={model_cfg.get('gate', 'mlp')},"
-            f"head={model_cfg.get('head', 'mlp')},"
-            f"mamba={model_cfg.get('mamba', {})},"
-            f"proj={model_cfg.get('projection_dim', 0)},"
-            f"aux={model_cfg.get('aux_heads', False)}"
-        )
-        feature_adapter_cfg = model_cfg.get("feature_adapter", {}) or {}
-        if feature_adapter_cfg.get("enabled", False):
-            model_params = (
-                f"{model_params},"
-                f"feature_adapter={feature_adapter_cfg.get('name', 'kan')},"
-                f"adapter_scale={feature_adapter_cfg.get('init_scale', 0.05)}"
-            )
-        logit_residual_cfg = model_cfg.get("logit_residual", {}) or {}
-        if logit_residual_cfg.get("enabled", False):
-            model_params = (
-                f"{model_params},"
-                f"logit_residual={logit_residual_cfg.get('head', 'kan')},"
-                f"residual_scale={logit_residual_cfg.get('init_scale', 0.05)}"
-            )
-        hierarchical_cfg = model_cfg.get("hierarchical", {}) or {}
-        if hierarchical_cfg.get("enabled", False):
-            hier_mode = "experts" if hierarchical_cfg.get("expert_heads", False) else "conditional"
-            model_params = f"{model_params},hier={hier_mode}"
-        peak_cfg = model_cfg.get("peak_branch", {}) or {}
-        if peak_cfg.get("enabled", False):
-            peak_mamba_cfg = peak_cfg.get("mamba", {}) or {}
-            model_params = (
-                f"{model_params},"
-                f"peak={peak_cfg.get('encoder', 'mamba')},"
-                f"topK={peak_cfg.get('top_k', 128)},"
-                f"peak_d={peak_cfg.get('d_model', d_model)},"
-                f"peak_layers={peak_mamba_cfg.get('layers', peak_cfg.get('mamba_layers', ''))},"
-                f"peak_fusion={peak_cfg.get('fusion', 'residual_gated')},"
-                f"peak_scale={peak_cfg.get('init_scale', 0.05)}"
-            )
-        if frontend == "learned_downsample":
-            model_params = (
-                f"{model_params},"
-                f"downsample_ch={model_cfg.get('downsample_channels', [64, 128, 256])},"
-                f"downsample_blocks={model_cfg.get('downsample_blocks_per_stage', [2, 2])},"
-                "effective_stride=8"
-            )
-    else:
-        model_params = str(model_cfg)
-    optim_cfg = cfg.get("optim", {})
-    loss_name = str(cfg["loss"]["name"])
-    if cfg.get("train", {}).get("crt", {}).get("enabled", False):
-        loss_name = f"{loss_name}+crt"
-    if cfg.get("loss", {}).get("supervised_contrastive", {}).get("enabled", False):
-        loss_name = f"{loss_name}+supcon"
-    if cfg.get("loss", {}).get("hierarchical", {}).get("enabled", False):
-        loss_name = f"{loss_name}+hierarchical"
     return {
         "experiment": cfg["experiment"]["name"],
-        "model": model_name,
-        "model_params": model_params,
-        "optimizer": optim_cfg.get("name", "adamw"),
-        "lr": str(optim_cfg.get("lr", "")),
-        "weight_decay": str(optim_cfg.get("weight_decay", "")),
-        "loss": loss_name,
-        "sampler": cfg.get("sampler", {}).get("name", "none"),
     }
 
 
@@ -618,41 +435,19 @@ def validate_mamba_backend(cfg: dict) -> None:
 
 def metrics_row(
     metrics: dict,
-    metrics_path: Path | None,
     fallback: dict[str, str],
 ) -> dict[str, str]:
     """Build the core test result fields from metrics.json or stdout fallback."""
     if metrics:
-        occlusion = metrics.get("occlusion", {}) or {}
         return {
-            "test_loss": format_metric(metrics.get("loss")),
             "test_acc1": format_metric(metrics.get("acc1")),
             "test_acc5": format_metric(metrics.get("acc5")),
-            "test_acc10": format_metric(metrics.get("acc10")),
-            "test_macro_acc1": format_metric(metrics.get("macro_acc1")),
             "test_macro_f1": format_metric(metrics.get("macro_f1")),
-            "test_rare_acc1": format_metric(metrics.get("rare_acc1")),
-            "test_aux_loss": format_metric(metrics.get("aux_loss")),
-            "test_gate_mean": format_metric(metrics.get("gate_mean")),
-            "occlusion_acc1": format_metric(occlusion.get("acc1")),
-            "occlusion_acc10": format_metric(occlusion.get("acc10")),
-            "occlusion_macro_acc1": format_metric(occlusion.get("macro_acc1")),
-            "occlusion_macro_f1": format_metric(occlusion.get("macro_f1")),
-            "occlusion_rare_acc1": format_metric(occlusion.get("rare_acc1")),
-            "test_n": str(metrics.get("n", "")),
-            "eval_metrics": display_path(metrics_path) if metrics_path else "",
         }
     return {
-        "test_loss": fallback["loss"],
-        "test_acc1": fallback["acc1"],
-        "test_acc5": fallback["acc5"],
-        "test_acc10": fallback.get("acc10") or "",
-        "test_macro_acc1": fallback["macro"],
+        "test_acc1": fallback.get("acc1") or "",
+        "test_acc5": fallback.get("acc5") or "",
         "test_macro_f1": fallback.get("macro_f1") or "",
-        "test_rare_acc1": fallback.get("rare") or "",
-        "test_aux_loss": fallback.get("aux") or "",
-        "test_gate_mean": fallback.get("gate") or "",
-        "test_n": fallback.get("n") or "",
     }
 
 
@@ -831,22 +626,9 @@ def main() -> None:
             best_path,
             plot_dir=eval_plot_dir,
         )
-        val_metrics = checkpoint_metrics(best_path)
-        previous_wandb_run = next(
-            (
-                existing.get("wandb_run", "")
-                for existing in rows
-                if existing.get("experiment") == run_name
-            ),
-            "",
-        )
         row = {
             **summarize_config(cfg),
-            "config": str(config_path),
-            **val_metrics,
-            **metrics_row(eval_metrics, eval_metrics_path, test_metrics),
-            "checkpoint": str(best_path.relative_to(PROJECT_ROOT)),
-            "wandb_run": newest_wandb_run(started_at) or previous_wandb_run,
+            **metrics_row(eval_metrics, test_metrics),
         }
         upsert_result(rows, row)
         write_results_markdown(results_path, rows)

@@ -120,6 +120,107 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
+class AsymmetricLoss(nn.Module):
+    """Asymmetric Loss for single-label multi-class long-tail classification.
+
+    Adapts ASL (Ben-Baruch et al., 2021) from multi-label to softmax-based
+    single-label classification, combined with class-frequency positive sample
+    weighting for long-tailed distributions.
+
+    Loss decomposition:
+        L_pos = -α_y · (1 - p_y)^{γ+} · log(p_y)
+        L_neg = Σ_{j≠y} max(p_j - m, 0)^{γ-} · (-log(1 - max(p_j - m, 0)))
+        L = L_pos + L_neg
+
+    Key design for long-tail:
+        - γ+ small (0~1): preserve gradients from hard rare-class positives
+        - γ- large (2~4): suppress easy head-class negative contributions
+        - Probability shift m: further dampen low-confidence negative noise
+        - α_y (class weights): frequency-based positive sample reweighting
+
+    Parameters:
+        gamma_pos: Focusing parameter for the positive (true) class
+        gamma_neg: Focusing parameter for negative (non-true) classes
+        prob_shift: Probability shifting margin for negatives
+        alpha: Per-class weight tensor for positive sample weighting
+        ignore_index: Target value to ignore
+    """
+
+    def __init__(
+        self,
+        gamma_pos: float = 0.0,
+        gamma_neg: float = 4.0,
+        prob_shift: float = 0.05,
+        alpha: torch.Tensor | None = None,
+        ignore_index: int = -100,
+    ) -> None:
+        super().__init__()
+        if gamma_pos < 0:
+            raise ValueError("gamma_pos must be non-negative")
+        if gamma_neg < 0:
+            raise ValueError("gamma_neg must be non-negative")
+        if prob_shift < 0 or prob_shift >= 1:
+            raise ValueError("prob_shift must satisfy 0 <= prob_shift < 1")
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.prob_shift = prob_shift
+        self.register_buffer(
+            "alpha", alpha if alpha is not None else torch.tensor(1.0)
+        )
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算非对称损失。
+
+        参数:
+            logits: 模型输出的未归一化 logits，形状 (batch_size, num_classes)
+            target: 真实类别索引，形状 (batch_size,)
+
+        返回:
+            标量损失值
+        """
+        if self.ignore_index is not None:
+            valid_mask = target != self.ignore_index
+            logits = logits[valid_mask]
+            target = target[valid_mask]
+            if target.numel() == 0:
+                return logits.sum() * 0.0
+
+        num_classes = logits.shape[1]
+
+        # Softmax 概率和 log 概率
+        probs = torch.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        # One-hot 编码
+        one_hot = F.one_hot(target, num_classes=num_classes).to(dtype=probs.dtype)
+
+        # --- 正样本损失：真实类 ---
+        pos_probs = (probs * one_hot).sum(dim=-1)           # (B,)
+        pos_log_probs = (log_probs * one_hot).sum(dim=-1)   # (B,)
+        pos_focal = (1.0 - pos_probs).clamp(min=1e-7).pow(self.gamma_pos)
+
+        # 类频率正样本加权
+        alpha_y = self.alpha[target] if self.alpha.ndim > 0 else self.alpha
+        pos_loss = -alpha_y * pos_focal * pos_log_probs     # (B,)
+
+        # --- 负样本损失：非真实类 ---
+        neg_probs = probs * (1.0 - one_hot)                 # (B, C)
+
+        # 概率偏移：将低置信度负样本概率裁剪到零
+        neg_probs_shifted = (neg_probs - self.prob_shift).clamp(min=0.0)
+
+        # 负样本聚焦加权
+        neg_focal = neg_probs_shifted.pow(self.gamma_neg)
+
+        # 负样本贡献：-p^{γ-} · log(1 - p_shifted)
+        neg_log = torch.log(1.0 - neg_probs_shifted + 1e-7)
+        neg_loss = -(neg_focal * neg_log).sum(dim=-1)        # (B,)
+
+        loss = pos_loss + neg_loss
+        return loss.mean()
+
+
 def _positive_class_counts(class_counts: np.ndarray | None, *, name: str) -> np.ndarray:
     """Return finite positive class counts for prior/logit adjustment losses."""
     if class_counts is None:
@@ -280,6 +381,7 @@ def build_loss(
         "logit_adjustment",
         "ldam",
         "focal",
+        "asl",
     ] = "ce",
     *,
     class_counts: np.ndarray | None = None,
@@ -292,6 +394,9 @@ def build_loss(
     ldam_scale: float = 30.0,
     ldam_class_weight_beta: float = 0.9999,
     ldam_use_class_weights: bool = False,
+    asl_gamma_pos: float = 0.0,
+    asl_gamma_neg: float = 4.0,
+    asl_prob_shift: float = 0.05,
 ) -> nn.Module:
     """根据名称构建损失函数。
 
@@ -365,6 +470,20 @@ def build_loss(
         )
     if name == "focal":
         return FocalLoss(gamma=gamma)
+    if name == "asl":
+        if class_counts is None:
+            raise ValueError("`class_counts` required for asl")
+        alpha = _effective_number_weights(
+            class_counts,
+            beta=class_weight_beta,
+            name="asl",
+        )
+        return AsymmetricLoss(
+            gamma_pos=asl_gamma_pos,
+            gamma_neg=asl_gamma_neg,
+            prob_shift=asl_prob_shift,
+            alpha=alpha,
+        )
     raise ValueError(f"unknown loss: {name!r}")
 
 
@@ -381,6 +500,7 @@ def build_loss_from_config(
         "balanced_softmax",
         "logit_adjustment",
         "ldam",
+        "asl",
     }
     return build_loss(
         name,
@@ -394,6 +514,9 @@ def build_loss_from_config(
         ldam_scale=loss_cfg.get("ldam_scale", 30.0),
         ldam_class_weight_beta=loss_cfg.get("ldam_class_weight_beta", 0.9999),
         ldam_use_class_weights=loss_cfg.get("ldam_use_class_weights", False),
+        asl_gamma_pos=float(loss_cfg.get("asl_gamma_pos", 0.0)),
+        asl_gamma_neg=float(loss_cfg.get("asl_gamma_neg", 4.0)),
+        asl_prob_shift=float(loss_cfg.get("asl_prob_shift", 0.05)),
     )
 
 
@@ -968,7 +1091,7 @@ def evaluate(
 
 __all__ = [
     "configure_backend", "amp_dtype_from_config",
-    "FocalLoss", "LDAMLoss", "build_loss", "build_loss_from_config",
+    "FocalLoss", "AsymmetricLoss", "LDAMLoss", "build_loss", "build_loss_from_config",
     "StepStats", "primary_logits", "loss_with_auxiliary",
     "supervised_contrastive_config", "supervised_contrastive_loss",
     "hierarchical_config", "space_group_to_crystal_system",
