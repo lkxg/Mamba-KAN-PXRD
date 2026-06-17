@@ -1,5 +1,5 @@
 experiment:
-  name: m37_single_plane_learned_downsample_mamba_asl
+  name: m41_single_plane_learned_downsample_mamba_gated_pool_label_smoothing
   seed: 42
 
 data:
@@ -20,6 +20,10 @@ model:
     d_model: 128
     downsample_channels: [64, 128, 256]
     downsample_blocks_per_stage: [2, 2]
+    downsample_pooling:
+      name: gated_attention
+      hidden: 128
+      dropout: 0.05
     token_dropout: 0.05
     mamba:
       wa_layers: 8
@@ -27,14 +31,13 @@ model:
 
 optim:
   name: adamw
-  lr: 3.0e-4
+  lr: 6.0e-4
   weight_decay: 5.0e-4
   betas: [0.9, 0.999]
 
 scheduler:
   name: cosine
-  warmup_epochs: 20
-  min_lr: 1.0e-6
+  warmup_epochs: 15
 
 train:
   epochs: 120
@@ -56,14 +59,13 @@ logging:
     project: mamba-kan-pxrd
     entity: null
     mode: online
-    group: longtail_loss
+    group: main_results
     job_type: train
-    tags: [h100, m37, single-plane, learned-downsample, mamba, d128, asl, longtail]
+    tags: [h100, m41, single-plane, learned-downsample, mamba, gated-pooling, d128, label-smoothing, main]
     notes: >
-      M18 architecture with ASL (Asymmetric Loss) + effective-number positive
-      sample weighting. gamma_pos=1.0 preserves rare-class hard-positive
-      gradients, gamma_neg=4.0 suppresses easy head-class negatives,
-      prob_shift=0.05 clips low-confidence negative noise.
+      M18 controlled ablation replacing final mean pooling over Mamba tokens
+      with gated-attention pooling so the model can emphasize diagnostic
+      angle regions and peaks.
     dir: wandb
     save_code: true
     watch_model: false
@@ -72,11 +74,8 @@ logging:
     log_best_checkpoint: false
 
 loss:
-  name: asl
-  asl_gamma_pos: 1.0
-  asl_gamma_neg: 4.0
-  asl_prob_shift: 0.05
-  class_weight_beta: 0.999
+  name: label_smoothing
+  label_smoothing: 0.05
 
 sampler:
   name: none

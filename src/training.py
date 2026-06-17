@@ -215,7 +215,7 @@ class AsymmetricLoss(nn.Module):
 
         # 负样本贡献：-p^{γ-} · log(1 - p_shifted)
         neg_log = torch.log(1.0 - neg_probs_shifted + 1e-7)
-        neg_loss = -(neg_focal * neg_log).sum(dim=-1)        # (B,)
+        neg_loss = -(neg_focal * neg_log).mean(dim=-1)       # (B,)
 
         loss = pos_loss + neg_loss
         return loss.mean()

@@ -74,6 +74,10 @@ MAIN_CONFIGS = [
     "configs/main/m29_single_plane_learned_downsample_mamba_d128_l8_focal_gamma15.yaml",
     "configs/main/m32_single_plane_learned_downsample_mamba_d128_l8_kan_residual_adapter_label_smoothing.yaml",
     "configs/main/m33_single_plane_learned_downsample_mamba_d128_l8_mlp_kan_logit_residual_label_smoothing.yaml",
+    "configs/main/m38_single_plane_learned_downsample_mamba_token_kan_adapter_label_smoothing.yaml",
+    "configs/main/m39_single_plane_learned_downsample_mamba_local_kan_adapter_label_smoothing.yaml",
+    "configs/main/m40_single_plane_learned_downsample_mamba_angle_pos_label_smoothing.yaml",
+    "configs/main/m41_single_plane_learned_downsample_mamba_gated_pool_label_smoothing.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [

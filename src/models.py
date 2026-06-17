@@ -230,6 +230,55 @@ class _ResBlock1D(nn.Module):
         return F.gelu(out)
 
 
+class _LocalKANResidualAdapter1D(nn.Module):
+    """Lightweight local-window KAN adapter for 1D feature maps."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        bottleneck: int = 4,
+        kernel_size: int = 5,
+        num_grids: int = 4,
+        dropout: float = 0.05,
+        init_scale: float = 0.05,
+    ) -> None:
+        super().__init__()
+        channels = int(channels)
+        bottleneck = int(bottleneck)
+        kernel_size = int(kernel_size)
+        if channels <= 0 or bottleneck <= 0:
+            raise ValueError("channels and bottleneck must be positive")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size must be positive")
+        self.kernel_size = kernel_size
+        self.left_pad = kernel_size // 2
+        self.right_pad = kernel_size - 1 - self.left_pad
+        self.norm = nn.LayerNorm(channels)
+        self.reduce = nn.Linear(channels, bottleneck)
+        self.local_kan = _RBFLayer(
+            bottleneck * kernel_size,
+            bottleneck,
+            num_grids=int(num_grids),
+        )
+        self.expand = nn.Linear(bottleneck, channels)
+        self.dropout = nn.Dropout(float(dropout))
+        self.scale = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"expected feature map shape (B, C, L), got {tuple(x.shape)}")
+        z = self.reduce(self.norm(x.transpose(1, 2)))
+        z = z.transpose(1, 2)
+        z = F.pad(z, (self.left_pad, self.right_pad))
+        windows = z.unfold(dimension=2, size=self.kernel_size, step=1)
+        windows = windows.permute(0, 2, 1, 3).flatten(2)
+        delta = self.local_kan(windows)
+        delta = self.expand(self.dropout(F.gelu(delta))).transpose(1, 2)
+        scale = self.scale.to(dtype=x.dtype, device=x.device)
+        return x + scale * delta
+
+
 class ResNet1D(nn.Module):
     """适合一维 PXRD 信号分类的 ResNet 风格模型。
 
@@ -555,7 +604,7 @@ class _RBFLayer(nn.Module):
         basis = torch.exp(
             -F.softplus(self.gamma) * (x_norm.unsqueeze(-1) - self.centers).pow(2)
         )
-        basis = basis.flatten(1)
+        basis = basis.reshape(*x.shape[:-1], x.shape[-1] * self.centers.numel())
         return self.norm(self.base(x) + self.spline(basis))
 
 
@@ -586,6 +635,148 @@ class KANHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class _TokenKANResidualAdapter(nn.Module):
+    """Token-wise residual KAN bottleneck for sequence features."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        bottleneck: int = 32,
+        num_grids: int = 4,
+        dropout: float = 0.05,
+        init_scale: float = 0.05,
+    ) -> None:
+        super().__init__()
+        d_model = int(d_model)
+        bottleneck = int(bottleneck)
+        if d_model <= 0 or bottleneck <= 0:
+            raise ValueError("d_model and bottleneck must be positive")
+        self.norm = nn.LayerNorm(d_model)
+        self.reduce = nn.Linear(d_model, bottleneck)
+        self.kan = _RBFLayer(bottleneck, bottleneck, num_grids=int(num_grids))
+        self.expand = nn.Linear(bottleneck, d_model)
+        self.dropout = nn.Dropout(float(dropout))
+        self.scale = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"expected token shape (B, T, D), got {tuple(x.shape)}")
+        z = self.reduce(self.norm(x))
+        delta = self.expand(self.dropout(F.gelu(self.kan(z))))
+        scale = self.scale.to(dtype=x.dtype, device=x.device)
+        return x + scale * delta
+
+
+class _AnglePositionEncoding(nn.Module):
+    """Absolute 2theta-aware token position encoding."""
+
+    def __init__(
+        self,
+        token_length: int,
+        d_model: int,
+        *,
+        theta_start: float,
+        theta_end: float,
+        theta_min: float,
+        theta_max: float,
+        mode: str = "angle_mlp",
+        learned: bool = True,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        token_length = int(token_length)
+        d_model = int(d_model)
+        if token_length <= 0 or d_model <= 0:
+            raise ValueError("token_length and d_model must be positive")
+        if theta_min >= theta_max:
+            raise ValueError("theta_min must be smaller than theta_max")
+        mode = mode.lower()
+        if mode not in {"angle_linear", "angle_mlp", "learned"}:
+            raise ValueError("position encoding mode must be angle_linear, angle_mlp, or learned")
+        angles = torch.linspace(float(theta_start), float(theta_end), token_length)
+        angles = ((angles - float(theta_min)) / (float(theta_max) - float(theta_min))) * 2 - 1
+        self.register_buffer("angles", angles.unsqueeze(-1))
+        self.mode = mode
+        self.angle_proj: nn.Module | None
+        if mode == "angle_linear":
+            self.angle_proj = nn.Linear(1, d_model)
+        elif mode == "angle_mlp":
+            self.angle_proj = nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.angle_proj = None
+        self.learned = nn.Embedding(token_length, d_model) if learned or mode == "learned" else None
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"expected token shape (B, T, D), got {tuple(tokens.shape)}")
+        pos = tokens.new_zeros(tokens.shape[1], tokens.shape[2])
+        if self.angle_proj is not None:
+            pos = pos + self.angle_proj(self.angles.to(dtype=tokens.dtype, device=tokens.device))
+        if self.learned is not None:
+            idx = torch.arange(tokens.shape[1], device=tokens.device)
+            pos = pos + self.learned(idx).to(dtype=tokens.dtype)
+        return tokens + self.dropout(pos.unsqueeze(0))
+
+
+class _TokenSequencePool(nn.Module):
+    """Mean, attention, or gated-attention pooling over token sequences."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        name: str = "mean",
+        hidden: int | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        d_model = int(d_model)
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        self.name = name.lower()
+        if self.name not in {"mean", "attention", "gated_attention"}:
+            raise ValueError("pooling name must be mean, attention, or gated_attention")
+        self.norm = nn.LayerNorm(d_model)
+        if self.name == "mean":
+            self.attn = None
+            return
+        hidden = int(hidden or d_model)
+        if hidden <= 0:
+            raise ValueError("pooling hidden must be positive")
+        if self.name == "attention":
+            self.attn = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(hidden, 1),
+            )
+        else:
+            self.value = nn.Linear(d_model, hidden)
+            self.gate = nn.Linear(d_model, hidden)
+            self.dropout = nn.Dropout(float(dropout))
+            self.score = nn.Linear(hidden, 1)
+            self.attn = None
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"expected token shape (B, T, D), got {tuple(tokens.shape)}")
+        if self.name == "mean":
+            return tokens.mean(dim=1)
+        z = self.norm(tokens)
+        if self.name == "attention":
+            scores = self.attn(z)
+        else:
+            scores = self.score(self.dropout(torch.tanh(self.value(z)) * torch.sigmoid(self.gate(z))))
+        weights = torch.softmax(scores.float(), dim=1).to(dtype=tokens.dtype)
+        return (tokens * weights).sum(dim=1)
 
 
 class EfficientKANHead(nn.Module):
@@ -1134,6 +1325,14 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         mamba_ngroups: int | None = None,
         mamba_chunk_size: int | None = None,
         mamba_bidirectional: bool = False,
+        token_kan_adapter: dict | None = None,
+        local_kan_adapter: dict | None = None,
+        position_encoding: dict | None = None,
+        pooling: dict | None = None,
+        theta_start: float = 5.0,
+        theta_end: float = 90.0,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
     ) -> None:
         super().__init__()
         if branch_length <= 0:
@@ -1161,6 +1360,32 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         self.token_stride = 8
         self.token_length = length
 
+        token_kan_cfg = dict(token_kan_adapter or {})
+        self.token_kan_adapter_enabled = bool(token_kan_cfg.get("enabled", False))
+        local_kan_cfg = dict(local_kan_adapter or {})
+        local_kan_enabled = bool(local_kan_cfg.get("enabled", False))
+        local_kan_positions = local_kan_cfg.get("positions", ("after_stage2",))
+        if isinstance(local_kan_positions, str):
+            local_kan_positions = (local_kan_positions,)
+        local_kan_positions = {str(pos).lower() for pos in local_kan_positions}
+        valid_local_positions = {"after_stage1", "after_stage2", "after_projection"}
+        unknown_positions = local_kan_positions - valid_local_positions
+        if unknown_positions:
+            raise ValueError(
+                "unknown local_kan_adapter positions: "
+                f"{sorted(unknown_positions)}; choose from {sorted(valid_local_positions)}"
+            )
+
+        def make_local_kan(channels: int) -> nn.Module:
+            return _LocalKANResidualAdapter1D(
+                channels,
+                bottleneck=int(local_kan_cfg.get("bottleneck", 4)),
+                kernel_size=int(local_kan_cfg.get("kernel_size", 5)),
+                num_grids=int(local_kan_cfg.get("num_grids", 4)),
+                dropout=float(local_kan_cfg.get("dropout", 0.05)),
+                init_scale=float(local_kan_cfg.get("init_scale", 0.05)),
+            )
+
         layers: list[nn.Module] = [
             nn.Conv1d(1, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm1d(stem_channels),
@@ -1168,6 +1393,8 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         ]
         for _ in range(int(blocks[0])):
             layers.append(_ResBlock1D(stem_channels, stem_channels, stride=1))
+        if local_kan_enabled and "after_stage1" in local_kan_positions:
+            layers.append(make_local_kan(stem_channels))
         layers.extend([
             nn.Conv1d(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm1d(mid_channels),
@@ -1175,14 +1402,45 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         ])
         for _ in range(int(blocks[1])):
             layers.append(_ResBlock1D(mid_channels, mid_channels, stride=1))
+        if local_kan_enabled and "after_stage2" in local_kan_positions:
+            layers.append(make_local_kan(mid_channels))
         layers.extend([
             nn.Conv1d(mid_channels, final_channels, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm1d(final_channels),
             nn.GELU(),
             nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False),
         ])
+        if local_kan_enabled and "after_projection" in local_kan_positions:
+            layers.append(make_local_kan(int(d_model)))
         self.frontend = nn.Sequential(*layers)
+        position_cfg = dict(position_encoding or {})
+        self.position_encoding = (
+            _AnglePositionEncoding(
+                self.token_length,
+                int(d_model),
+                theta_start=float(theta_start),
+                theta_end=float(theta_end),
+                theta_min=float(theta_min),
+                theta_max=float(theta_max),
+                mode=str(position_cfg.get("mode", "angle_mlp")),
+                learned=bool(position_cfg.get("learned", True)),
+                dropout=float(position_cfg.get("dropout", 0.0)),
+            )
+            if bool(position_cfg.get("enabled", False))
+            else None
+        )
         self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_kan_adapter = (
+            _TokenKANResidualAdapter(
+                int(d_model),
+                bottleneck=int(token_kan_cfg.get("bottleneck", 32)),
+                num_grids=int(token_kan_cfg.get("num_grids", 4)),
+                dropout=float(token_kan_cfg.get("dropout", 0.05)),
+                init_scale=float(token_kan_cfg.get("init_scale", 0.05)),
+            )
+            if self.token_kan_adapter_enabled
+            else None
+        )
         self.token_dropout = nn.Dropout(float(token_dropout))
         self.mixer = _MambaSequenceMixer(
             int(d_model),
@@ -1198,7 +1456,13 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             bidirectional=mamba_bidirectional,
         )
         self.actual_mamba_backend = self.mixer.actual_backend
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        pooling_cfg = dict(pooling or {})
+        self.pool = _TokenSequencePool(
+            int(d_model),
+            name=str(pooling_cfg.get("name", "mean")),
+            hidden=pooling_cfg.get("hidden"),
+            dropout=float(pooling_cfg.get("dropout", 0.0)),
+        )
         self.dropout = nn.Dropout(float(branch_dropout))
         self.feature_norm = nn.LayerNorm(int(d_model))
         self.out_dim = int(d_model)
@@ -1218,9 +1482,14 @@ class _LearnedDownsampleMambaBranch(nn.Module):
                 f"expected {self.token_length}"
             )
         tokens = seq.transpose(1, 2)
-        tokens = self.token_dropout(self.token_norm(tokens))
+        tokens = self.token_norm(tokens)
+        if self.position_encoding is not None:
+            tokens = self.position_encoding(tokens)
+        if self.token_kan_adapter is not None:
+            tokens = self.token_kan_adapter(tokens)
+        tokens = self.token_dropout(tokens)
         tokens = self.mixer(tokens)
-        feat = self.pool(tokens.transpose(1, 2)).flatten(1)
+        feat = self.pool(tokens)
         return self.feature_norm(self.dropout(feat))
 
 
@@ -1572,6 +1841,10 @@ class DualPlaneMambaClassifier(nn.Module):
         sa_blocks_per_stage: Sequence[int] | int = 1,
         wa_blocks_per_stage: Sequence[int] | int = 1,
         downsample_blocks_per_stage: Sequence[int] | int = (2, 2),
+        downsample_token_kan_adapter: dict | None = None,
+        downsample_local_kan_adapter: dict | None = None,
+        downsample_position_encoding: dict | None = None,
+        downsample_pooling: dict | None = None,
         pool_every_stage: bool = True,
         pool_type: str = "max",
         token_mode: str = "multiply",
@@ -1678,6 +1951,7 @@ class DualPlaneMambaClassifier(nn.Module):
             *,
             branch_length: int,
             branch_d_model: int,
+            theta_range: Sequence[float],
             conv_channels: Sequence[int],
             blocks_per_stage: Sequence[int] | int,
             token_stride: int,
@@ -1706,6 +1980,14 @@ class DualPlaneMambaClassifier(nn.Module):
                     token_dropout=token_dropout,
                     branch_dropout=branch_dropout,
                     mamba_layers=mamba_layers,
+                    token_kan_adapter=downsample_token_kan_adapter,
+                    local_kan_adapter=downsample_local_kan_adapter,
+                    position_encoding=downsample_position_encoding,
+                    pooling=downsample_pooling,
+                    theta_start=float(theta_range[0]),
+                    theta_end=float(theta_range[1]),
+                    theta_min=self.theta_min,
+                    theta_max=self.theta_max,
                     **common_mamba,
                 )
             return _PlaneTokenResConvBranch(
@@ -1727,6 +2009,7 @@ class DualPlaneMambaClassifier(nn.Module):
             self.sa_branch = make_branch(
                 branch_length=self.sa_slice.stop - self.sa_slice.start,
                 branch_d_model=sa_d_model,
+                theta_range=sa_range,
                 conv_channels=sa_conv_channels,
                 blocks_per_stage=sa_blocks_per_stage,
                 token_stride=sa_token_stride,
@@ -1741,6 +2024,7 @@ class DualPlaneMambaClassifier(nn.Module):
             self.wa_branch = make_branch(
                 branch_length=self.wa_slice.stop - self.wa_slice.start,
                 branch_d_model=wa_d_model,
+                theta_range=wa_range,
                 conv_channels=wa_conv_channels,
                 blocks_per_stage=wa_blocks_per_stage,
                 token_stride=wa_token_stride,
