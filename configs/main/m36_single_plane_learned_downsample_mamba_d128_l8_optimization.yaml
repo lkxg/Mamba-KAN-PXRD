@@ -1,0 +1,110 @@
+experiment:
+  name: m36_single_plane_learned_downsample_mamba_d128_l8_optimization
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 512
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: dual_plane_mamba
+  dual_plane_mamba:
+    frontend: learned_downsample
+    wa_range: [5.0, 90.0]
+    use_sa: false
+    d_model: 128
+    downsample_channels: [64, 128, 256]
+    downsample_blocks_per_stage: [2, 2]
+    token_dropout: 0.05
+    mamba:
+      wa_layers: 8
+      dropout: 0.05
+
+optim:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  betas: [0.95, 0.99]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 20
+  min_lr: 1.0e-6
+
+train:
+  epochs: 150
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 100
+  drop_last: true
+
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 0.0
+  start_epoch: 60
+
+logging:
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: online
+    group: main_results
+    job_type: train
+    tags: [h100, m36, single-plane, learned-downsample, mamba, d128, optimization, weighted-ce, label-smoothing, main]
+    notes: >
+      M18 → M36 combined ablation. Architecture, frontend, Mamba backbone,
+      MLP head, and sampler are held fixed from M18. Two changes are
+      stacked on top of M18 to target the long-tail space-group
+      distribution. (1) Optimizer and training schedule are re-tuned for a
+      longer horizon: AdamW lr is halved to 3e-4, weight decay is doubled
+      to 1e-3, betas are relaxed to (0.95, 0.99), cosine warmup is doubled
+      to 20 epochs with an explicit min_lr floor of 1e-6, gradient
+      clipping is held at 1.0 (not tightened), the budget is extended to
+      150 epochs, and early stopping is delayed to start_epoch=60 with
+      patience=15. (2) The loss is switched from pure label_smoothing to
+      weighted_ce with class_weight_power=0.30, while keeping
+      label_smoothing=0.05 inside the weighted CE (same recipe as
+      e09/e11). Sampler stays at "none" to avoid double-correcting the
+      long tail.
+    dir: wandb
+    save_code: true
+    watch_model: false
+    watch_log: gradients
+    watch_log_freq: 100
+    log_best_checkpoint: false
+
+loss:
+  name: weighted_ce
+  label_smoothing: 0.05
+  class_weight_power: 0.30
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: true
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5
