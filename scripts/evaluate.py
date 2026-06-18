@@ -111,6 +111,43 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
     raise ValueError(f"unknown model: {name!r}")
 
 
+def load_model_state_compatible(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """Load checkpoints across the no-op mean-pooling LayerNorm cleanup."""
+    result = model.load_state_dict(state_dict, strict=False)
+    model_keys = set(model.state_dict())
+
+    def is_legacy_unexpected_mean_pool_norm(key: str) -> bool:
+        is_pool_norm = (
+            key.endswith(".pool.norm.weight")
+            or key.endswith(".pool.norm.bias")
+        )
+        return is_pool_norm and key not in model_keys
+
+    missing = list(result.missing_keys)
+    unexpected = [
+        key for key in result.unexpected_keys
+        if not is_legacy_unexpected_mean_pool_norm(key)
+    ]
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"Missing key(s): {missing}")
+        if unexpected:
+            details.append(f"Unexpected key(s): {unexpected}")
+        raise RuntimeError("Error(s) in loading state_dict: " + "; ".join(details))
+
+    ignored = len(result.missing_keys) + len(result.unexpected_keys)
+    if ignored:
+        print(
+            "Ignored legacy mean-pooling LayerNorm keys: "
+            f"missing={list(result.missing_keys)} "
+            f"unexpected={list(result.unexpected_keys)}"
+        )
+
+
 def class_labels(task: str, num_classes: int) -> list[str]:
     """返回绘图用类别标签。"""
     if task == "space_group":
@@ -917,7 +954,7 @@ def main():
     # ---------- 加载模型权重 ----------
     model = build_model(cfg, in_dim=test_ds.signal_length,
                         num_classes=test_ds.num_classes).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    load_model_state_compatible(model, ckpt["model_state"])
     print(f"Loaded checkpoint from epoch {ckpt['epoch']}, "
           f"val acc1={ckpt.get('val_acc1', float('nan')):.4f}")
     sa_mamba_backend = ""

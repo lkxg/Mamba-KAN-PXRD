@@ -744,10 +744,11 @@ class _TokenSequencePool(nn.Module):
         self.name = name.lower()
         if self.name not in {"mean", "attention", "gated_attention"}:
             raise ValueError("pooling name must be mean, attention, or gated_attention")
-        self.norm = nn.LayerNorm(d_model)
         if self.name == "mean":
+            self.norm = nn.Identity()
             self.attn = None
             return
+        self.norm = nn.LayerNorm(d_model)
         hidden = int(hidden or d_model)
         if hidden <= 0:
             raise ValueError("pooling hidden must be positive")
