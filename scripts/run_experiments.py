@@ -78,6 +78,8 @@ MAIN_CONFIGS = [
     "configs/main/m39_single_plane_learned_downsample_mamba_local_kan_adapter_label_smoothing.yaml",
     "configs/main/m40_single_plane_learned_downsample_mamba_angle_pos_label_smoothing.yaml",
     "configs/main/m41_single_plane_learned_downsample_mamba_gated_pool_label_smoothing.yaml",
+    "configs/main/m42_dual_plane_sa_raw_wa_learned_downsample_mamba_label_smoothing.yaml",
+    "configs/main/m43_single_plane_convnext_downsample_mamba_d128_l8_label_smoothing.yaml",
 ]
 
 NON_MAMBA_CONFIGS = [

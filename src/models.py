@@ -3,10 +3,11 @@
 当前提供多个基准模型：
 1. MLPClassifier：简单的全连接多层感知机
 2. ResNet1D：适合一维信号（如 PXRD 曲线）的残差网络
-3. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
-4. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
-5. DualRangePXRDClassifier：SA/WA 双分支 + 可选 selective SSM + KAN head
-6. DualPlaneMambaClassifier：可选 dense 谱图分支 + peak-token 分支
+3. ConvNeXt1D：标准 ConvNeXt block 的一维 PXRD baseline
+4. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
+5. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
+6. DualRangePXRDClassifier：SA/WA 双分支 + 可选 selective SSM + KAN head
+7. DualPlaneMambaClassifier：可选 dense 谱图分支 + peak-token 分支
 
 这些模型为项目提供了基线性能，后续可以添加更先进的架构（如 Mamba-KAN 混合模型）。
 """
@@ -1494,6 +1495,326 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         return self.feature_norm(self.dropout(feat))
 
 
+class _ChannelLayerNorm1D(nn.Module):
+    """LayerNorm over channels for tensors shaped (B, C, L)."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(int(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
+class _ConvNeXtBlock1D(nn.Module):
+    """A compact ConvNeXt-style block for one-dimensional PXRD features."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernel_size: int = 7,
+        expansion: int = 4,
+        layer_scale_init: float = 1.0e-6,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        channels = int(channels)
+        kernel_size = int(kernel_size)
+        expansion = int(expansion)
+        if channels <= 0:
+            raise ValueError("ConvNeXt channels must be positive")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("ConvNeXt kernel_size must be a positive odd integer")
+        if expansion <= 0:
+            raise ValueError("ConvNeXt expansion must be positive")
+
+        self.dwconv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=channels,
+        )
+        self.norm = nn.LayerNorm(channels)
+        self.pwconv1 = nn.Linear(channels, expansion * channels)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(expansion * channels, channels)
+        self.gamma = (
+            nn.Parameter(float(layer_scale_init) * torch.ones(channels))
+            if float(layer_scale_init) > 0
+            else None
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = x * self.gamma
+        x = self.dropout(x).transpose(1, 2)
+        return residual + x
+
+
+class ConvNeXt1D(nn.Module):
+    """Standard ConvNeXt-style classifier adapted to one-dimensional PXRD curves."""
+
+    def __init__(
+        self,
+        num_classes: int = 230,
+        in_channels: int = 1,
+        base_channels: int = 64,
+        depths: Sequence[int] = (3, 3, 9, 3),
+        dims: Sequence[int] | None = None,
+        kernel_size: int = 7,
+        expansion: int = 4,
+        layer_scale_init: float = 1.0e-6,
+        block_dropout: float = 0.0,
+        head_dropout: float = 0.0,
+        head_init_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        depths = _as_tuple(depths)
+        if dims is None:
+            dims = tuple(int(base_channels) * (2 ** i) for i in range(len(depths)))
+        else:
+            dims = _as_tuple(dims)
+        if len(depths) != len(dims):
+            raise ValueError("ConvNeXt1D depths and dims must have the same length")
+        if not depths:
+            raise ValueError("ConvNeXt1D must contain at least one stage")
+        if min(depths) < 0 or min(dims) <= 0:
+            raise ValueError("ConvNeXt1D depths must be non-negative and dims positive")
+
+        self.downsample_layers = nn.ModuleList()
+        self.downsample_layers.append(
+            nn.Sequential(
+                nn.Conv1d(
+                    int(in_channels),
+                    dims[0],
+                    kernel_size=4,
+                    stride=4,
+                ),
+                _ChannelLayerNorm1D(dims[0]),
+            )
+        )
+        for idx in range(len(dims) - 1):
+            self.downsample_layers.append(
+                nn.Sequential(
+                    _ChannelLayerNorm1D(dims[idx]),
+                    nn.Conv1d(dims[idx], dims[idx + 1], kernel_size=2, stride=2),
+                )
+            )
+
+        self.stages = nn.ModuleList([
+            nn.Sequential(*[
+                _ConvNeXtBlock1D(
+                    dim,
+                    kernel_size=kernel_size,
+                    expansion=expansion,
+                    layer_scale_init=layer_scale_init,
+                    dropout=block_dropout,
+                )
+                for _ in range(depth)
+            ])
+            for dim, depth in zip(dims, depths)
+        ])
+        self.norm = nn.LayerNorm(dims[-1])
+        self.head_dropout = nn.Dropout(float(head_dropout))
+        self.head = nn.Linear(dims[-1], int(num_classes))
+        self.apply(self._init_weights)
+        self.head.weight.data.mul_(float(head_init_scale))
+        self.head.bias.data.mul_(float(head_init_scale))
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv1d, nn.Linear)):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        if x.ndim != 3:
+            raise ValueError(f"expected (B, L) or (B, C, L), got {tuple(x.shape)}")
+        for downsample, stage in zip(self.downsample_layers, self.stages):
+            x = stage(downsample(x))
+        x = x.mean(dim=-1)
+        x = self.norm(x)
+        return self.head(self.head_dropout(x))
+
+
+class _ConvNeXtDownsampleMambaBranch(nn.Module):
+    """ConvNeXt-style downsampling frontend before a Mamba mixer."""
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 128,
+        stem_channels: int = 64,
+        mid_channels: int = 128,
+        final_channels: int = 256,
+        blocks_per_stage: Sequence[int] | int = (2, 2),
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+        position_encoding: dict | None = None,
+        pooling: dict | None = None,
+        theta_start: float = 5.0,
+        theta_end: float = 90.0,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+        convnext: dict | None = None,
+    ) -> None:
+        super().__init__()
+        if branch_length <= 0:
+            raise ValueError("branch_length must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        stem_channels = int(stem_channels)
+        mid_channels = int(mid_channels)
+        final_channels = int(final_channels)
+        if min(stem_channels, mid_channels, final_channels) <= 0:
+            raise ValueError("downsample channels must be positive")
+        blocks = _as_tuple(blocks_per_stage)
+        if len(blocks) == 1:
+            blocks = blocks * 2
+        if len(blocks) != 2:
+            raise ValueError("blocks_per_stage must be length 1 or 2")
+
+        convnext_cfg = dict(convnext or {})
+        block_kernel = int(convnext_cfg.get("kernel_size", 7))
+        expansion = int(convnext_cfg.get("expansion", 4))
+        layer_scale_init = float(convnext_cfg.get("layer_scale_init", 1.0e-6))
+        block_dropout = float(convnext_cfg.get("block_dropout", 0.0))
+
+        self.branch_length = int(branch_length)
+        length = self.branch_length
+        length = _conv1d_out_length(length, kernel_size=7, stride=2, padding=3)
+        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
+        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
+        if length <= 0:
+            raise ValueError("downsampled token length must be positive")
+        self.token_stride = 8
+        self.token_length = length
+
+        layers: list[nn.Module] = [
+            nn.Conv1d(1, stem_channels, kernel_size=7, stride=2, padding=3),
+            _ChannelLayerNorm1D(stem_channels),
+        ]
+        for _ in range(int(blocks[0])):
+            layers.append(
+                _ConvNeXtBlock1D(
+                    stem_channels,
+                    kernel_size=block_kernel,
+                    expansion=expansion,
+                    layer_scale_init=layer_scale_init,
+                    dropout=block_dropout,
+                )
+            )
+        layers.extend([
+            _ChannelLayerNorm1D(stem_channels),
+            nn.Conv1d(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1),
+        ])
+        for _ in range(int(blocks[1])):
+            layers.append(
+                _ConvNeXtBlock1D(
+                    mid_channels,
+                    kernel_size=block_kernel,
+                    expansion=expansion,
+                    layer_scale_init=layer_scale_init,
+                    dropout=block_dropout,
+                )
+            )
+        layers.extend([
+            _ChannelLayerNorm1D(mid_channels),
+            nn.Conv1d(mid_channels, final_channels, kernel_size=4, stride=2, padding=1),
+            _ChannelLayerNorm1D(final_channels),
+            nn.Conv1d(final_channels, int(d_model), kernel_size=1),
+        ])
+        self.frontend = nn.Sequential(*layers)
+        position_cfg = dict(position_encoding or {})
+        self.position_encoding = (
+            _AnglePositionEncoding(
+                self.token_length,
+                int(d_model),
+                theta_start=float(theta_start),
+                theta_end=float(theta_end),
+                theta_min=float(theta_min),
+                theta_max=float(theta_max),
+                mode=str(position_cfg.get("mode", "angle_mlp")),
+                learned=bool(position_cfg.get("learned", True)),
+                dropout=float(position_cfg.get("dropout", 0.0)),
+            )
+            if bool(position_cfg.get("enabled", False))
+            else None
+        )
+        self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_dropout = nn.Dropout(float(token_dropout))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model),
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
+            bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        pooling_cfg = dict(pooling or {})
+        self.pool = _TokenSequencePool(
+            int(d_model),
+            name=str(pooling_cfg.get("name", "mean")),
+            hidden=pooling_cfg.get("hidden"),
+            dropout=float(pooling_cfg.get("dropout", 0.0)),
+        )
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(int(d_model))
+        self.out_dim = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(
+                f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
+            )
+        seq = self.frontend(x.unsqueeze(1))
+        if seq.shape[-1] != self.token_length:
+            raise RuntimeError(
+                f"token length mismatch after ConvNeXt downsampling: got {seq.shape[-1]}, "
+                f"expected {self.token_length}"
+            )
+        tokens = seq.transpose(1, 2)
+        tokens = self.token_norm(tokens)
+        if self.position_encoding is not None:
+            tokens = self.position_encoding(tokens)
+        tokens = self.token_dropout(tokens)
+        tokens = self.mixer(tokens)
+        feat = self.pool(tokens)
+        return self.feature_norm(self.dropout(feat))
+
+
 class _XRDMambaRepoResBlock1D(nn.Module):
     """ResBlock matching the public XRDMamba repository's ResConv block."""
 
@@ -1948,6 +2269,7 @@ class DualPlaneMambaClassifier(nn.Module):
         downsample_blocks_per_stage: Sequence[int] | int = (2, 2),
         downsample_token_kan_adapter: dict | None = None,
         downsample_local_kan_adapter: dict | None = None,
+        downsample_convnext: dict | None = None,
         downsample_position_encoding: dict | None = None,
         downsample_pooling: dict | None = None,
         pool_every_stage: bool = True,
@@ -2051,18 +2373,27 @@ class DualPlaneMambaClassifier(nn.Module):
         )
         sa_layers = int(mamba_cfg.get("sa_layers", 0))
         wa_layers = int(mamba_cfg.get("wa_layers", 0))
-        _valid_frontends = {"plane_token", "learned_downsample", "xrdmamba_repo", "raw"}
+        _valid_frontends = {
+            "plane_token",
+            "learned_downsample",
+            "convnext_downsample",
+            "xrdmamba_repo",
+            "raw",
+        }
         if self.frontend not in _valid_frontends:
             raise ValueError(
-                "frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+                "frontend must be plane_token, learned_downsample, convnext_downsample, "
+                "xrdmamba_repo, or raw"
             )
         if self.sa_frontend not in _valid_frontends:
             raise ValueError(
-                "sa_frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+                "sa_frontend must be plane_token, learned_downsample, convnext_downsample, "
+                "xrdmamba_repo, or raw"
             )
         if self.wa_frontend not in _valid_frontends:
             raise ValueError(
-                "wa_frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+                "wa_frontend must be plane_token, learned_downsample, convnext_downsample, "
+                "xrdmamba_repo, or raw"
             )
 
         def make_branch(
@@ -2122,6 +2453,29 @@ class DualPlaneMambaClassifier(nn.Module):
                     theta_end=float(theta_range[1]),
                     theta_min=self.theta_min,
                     theta_max=self.theta_max,
+                    **common_mamba,
+                )
+            if frontend == "convnext_downsample":
+                channels = _as_tuple(downsample_channels)
+                if len(channels) != 3:
+                    raise ValueError("downsample_channels must be [stem, mid, final]")
+                return _ConvNeXtDownsampleMambaBranch(
+                    branch_length=branch_length,
+                    d_model=branch_d_model,
+                    stem_channels=channels[0],
+                    mid_channels=channels[1],
+                    final_channels=channels[2],
+                    blocks_per_stage=downsample_blocks_per_stage,
+                    token_dropout=token_dropout,
+                    branch_dropout=branch_dropout,
+                    mamba_layers=mamba_layers,
+                    position_encoding=downsample_position_encoding,
+                    pooling=downsample_pooling,
+                    theta_start=float(theta_range[0]),
+                    theta_end=float(theta_range[1]),
+                    theta_min=self.theta_min,
+                    theta_max=self.theta_max,
+                    convnext=downsample_convnext,
                     **common_mamba,
                 )
             return _PlaneTokenResConvBranch(
@@ -2658,6 +3012,7 @@ class PatchTSTClassifier(nn.Module):
 __all__ = [
     "MLPClassifier",
     "ResNet1D",
+    "ConvNeXt1D",
     "DualRangePXRDClassifier",
     "DualPlaneMambaClassifier",
     "KANHead",

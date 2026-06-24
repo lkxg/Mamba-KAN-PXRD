@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
 from src.models import (
     BiGRUPatchClassifier,
+    ConvNeXt1D,
     DualPlaneMambaClassifier,
     DualRangePXRDClassifier,
     MLPClassifier,
@@ -84,6 +85,8 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
                              **cfg["model"].get("mlp", {}))
     if name == "resnet1d":
         return ResNet1D(num_classes=num_classes, **cfg["model"].get("resnet1d", {}))
+    if name == "convnext1d":
+        return ConvNeXt1D(num_classes=num_classes, **cfg["model"].get("convnext1d", {}))
     if name == "dual_range":
         return DualRangePXRDClassifier(
             in_dim=in_dim,
