@@ -1,0 +1,128 @@
+experiment:
+  name: m42_dual_plane_sa_raw_wa_learned_downsample_mamba_label_smoothing
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 512
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: dual_plane_mamba
+  dual_plane_mamba:
+    frontend: learned_downsample
+    sa_frontend: raw
+    wa_frontend: learned_downsample
+    theta_min: 5.0
+    theta_max: 90.0
+    sa_range: [5.0, 15.0]
+    wa_range: [10.0, 90.0]
+    use_sa: true
+    use_wa: true
+    d_model: 128
+    sa_d_model: 64
+    wa_d_model: 128
+    downsample_channels: [64, 128, 256]
+    downsample_blocks_per_stage: [2, 2]
+    downsample_position_encoding:
+      enabled: true
+      mode: angle_mlp
+      learned: true
+      dropout: 0.0
+    downsample_pooling:
+      name: mean
+    token_dropout: 0.05
+    branch_dropout: 0.1
+    fusion: gated
+    gate: mlp
+    gate_hidden: [256]
+    gate_groups: 16
+    gate_dropout: 0.1
+    head: mlp
+    head_hidden: [512]
+    head_dropout: 0.1
+    mamba:
+      backend: auto
+      sa_layers: 2
+      wa_layers: 8
+      d_state: 16
+      d_conv: 4
+      expand: 2
+      dropout: 0.05
+
+optim:
+  name: adamw
+  lr: 6.0e-4
+  weight_decay: 5.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 10
+
+train:
+  epochs: 100
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 100
+  drop_last: true
+
+early_stopping:
+  enabled: true
+  patience: 10
+  min_delta: 0.0
+  start_epoch: 40
+
+logging:
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: online
+    group: main_results
+    job_type: train
+    tags: [h100, m42, dual-plane, sa-raw, wa-learned-downsample, mamba, label-smoothing, main]
+    notes: >
+      Dual-plane ablation of M18. WA branch keeps the M18 learned-downsample
+      frontend (D=128, 8 Mamba layers). SA branch uses the new raw frontend
+      (no downsampling, D=64, 2 Mamba layers) so the low-angle 5-15 deg range
+      is fed to Mamba at full resolution without conv blurring. Gated MLP
+      fusion, label smoothing, optimizer and schedule matched to M18.
+    dir: wandb
+    save_code: true
+    watch_model: false
+    watch_log: gradients
+    watch_log_freq: 100
+    log_best_checkpoint: false
+
+loss:
+  name: label_smoothing
+  label_smoothing: 0.05
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: true
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5

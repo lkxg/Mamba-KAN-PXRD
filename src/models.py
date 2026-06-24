@@ -1518,6 +1518,108 @@ class _XRDMambaRepoResBlock1D(nn.Module):
         return self.relu(x + self.conv(x))
 
 
+class _RawMambaBranch(nn.Module):
+    """No-downsampling branch: intensity projected to tokens then Mamba.
+
+    Each raw sample point becomes one token via a linear intensity projection,
+    an optional angle-aware position encoding is added, and a Mamba mixer
+    processes the full-resolution sequence. Suitable for short, sparse-angle
+    sub-ranges (e.g. low-angle SA) where downsampling would blur peak positions.
+    """
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 64,
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+        position_encoding: dict | None = None,
+        pooling: dict | None = None,
+        theta_start: float = 5.0,
+        theta_end: float = 15.0,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+    ) -> None:
+        super().__init__()
+        if branch_length <= 0:
+            raise ValueError("branch_length must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
+        self.branch_length = int(branch_length)
+        self.token_length = self.branch_length
+
+        self.intensity_proj = nn.Linear(1, int(d_model))
+        position_cfg = dict(position_encoding or {})
+        self.position_encoding = (
+            _AnglePositionEncoding(
+                self.token_length,
+                int(d_model),
+                theta_start=float(theta_start),
+                theta_end=float(theta_end),
+                theta_min=float(theta_min),
+                theta_max=float(theta_max),
+                mode=str(position_cfg.get("mode", "angle_mlp")),
+                learned=bool(position_cfg.get("learned", True)),
+                dropout=float(position_cfg.get("dropout", 0.0)),
+            )
+            if bool(position_cfg.get("enabled", False))
+            else None
+        )
+        self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_dropout = nn.Dropout(float(token_dropout))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model),
+            num_layers=mamba_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
+            bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        pooling_cfg = dict(pooling or {})
+        self.pool = _TokenSequencePool(
+            int(d_model),
+            name=str(pooling_cfg.get("name", "mean")),
+            hidden=pooling_cfg.get("hidden"),
+            dropout=float(pooling_cfg.get("dropout", 0.0)),
+        )
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(int(d_model))
+        self.out_dim = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(
+                f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}"
+            )
+        tokens = self.intensity_proj(x.unsqueeze(-1))
+        tokens = self.token_norm(tokens)
+        if self.position_encoding is not None:
+            tokens = self.position_encoding(tokens)
+        tokens = self.token_dropout(tokens)
+        tokens = self.mixer(tokens)
+        feat = self.pool(tokens)
+        return self.feature_norm(self.dropout(feat))
+
+
 class _XRDMambaRepoResConvFeature(nn.Module):
     """Feature extractor following XRDMamba's published repository ResConv."""
 
@@ -1832,6 +1934,8 @@ class DualPlaneMambaClassifier(nn.Module):
         use_sa: bool = True,
         use_wa: bool = True,
         frontend: str = "plane_token",
+        sa_frontend: str | None = None,
+        wa_frontend: str | None = None,
         xrdmamba_repo_length: int = 5000,
         d_model: int = 16,
         sa_d_model: int | None = None,
@@ -1891,6 +1995,8 @@ class DualPlaneMambaClassifier(nn.Module):
         self.use_sa = bool(use_sa)
         self.use_wa = bool(use_wa)
         self.frontend = frontend.lower()
+        self.sa_frontend = (sa_frontend.lower() if sa_frontend else self.frontend)
+        self.wa_frontend = (wa_frontend.lower() if wa_frontend else self.frontend)
         self.fusion = fusion.lower()
         self.gate_type = gate.lower()
         self.aux_heads_enabled = bool(aux_heads)
@@ -1945,8 +2051,19 @@ class DualPlaneMambaClassifier(nn.Module):
         )
         sa_layers = int(mamba_cfg.get("sa_layers", 0))
         wa_layers = int(mamba_cfg.get("wa_layers", 0))
-        if self.frontend not in {"plane_token", "learned_downsample", "xrdmamba_repo"}:
-            raise ValueError("frontend must be plane_token, learned_downsample, or xrdmamba_repo")
+        _valid_frontends = {"plane_token", "learned_downsample", "xrdmamba_repo", "raw"}
+        if self.frontend not in _valid_frontends:
+            raise ValueError(
+                "frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+            )
+        if self.sa_frontend not in _valid_frontends:
+            raise ValueError(
+                "sa_frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+            )
+        if self.wa_frontend not in _valid_frontends:
+            raise ValueError(
+                "wa_frontend must be plane_token, learned_downsample, xrdmamba_repo, or raw"
+            )
 
         def make_branch(
             *,
@@ -1957,8 +2074,9 @@ class DualPlaneMambaClassifier(nn.Module):
             blocks_per_stage: Sequence[int] | int,
             token_stride: int,
             mamba_layers: int,
+            frontend: str,
         ) -> nn.Module:
-            if self.frontend == "xrdmamba_repo":
+            if frontend == "xrdmamba_repo":
                 return _XRDMambaRepoBranch(
                     branch_length=branch_length,
                     d_model=branch_d_model,
@@ -1967,7 +2085,7 @@ class DualPlaneMambaClassifier(nn.Module):
                     mamba_layers=mamba_layers,
                     **common_mamba,
                 )
-            if self.frontend == "learned_downsample":
+            if frontend == "learned_downsample":
                 channels = _as_tuple(downsample_channels)
                 if len(channels) != 3:
                     raise ValueError("downsample_channels must be [stem, mid, final]")
@@ -1983,6 +2101,21 @@ class DualPlaneMambaClassifier(nn.Module):
                     mamba_layers=mamba_layers,
                     token_kan_adapter=downsample_token_kan_adapter,
                     local_kan_adapter=downsample_local_kan_adapter,
+                    position_encoding=downsample_position_encoding,
+                    pooling=downsample_pooling,
+                    theta_start=float(theta_range[0]),
+                    theta_end=float(theta_range[1]),
+                    theta_min=self.theta_min,
+                    theta_max=self.theta_max,
+                    **common_mamba,
+                )
+            if frontend == "raw":
+                return _RawMambaBranch(
+                    branch_length=branch_length,
+                    d_model=branch_d_model,
+                    token_dropout=token_dropout,
+                    branch_dropout=branch_dropout,
+                    mamba_layers=mamba_layers,
                     position_encoding=downsample_position_encoding,
                     pooling=downsample_pooling,
                     theta_start=float(theta_range[0]),
@@ -2015,6 +2148,7 @@ class DualPlaneMambaClassifier(nn.Module):
                 blocks_per_stage=sa_blocks_per_stage,
                 token_stride=sa_token_stride,
                 mamba_layers=sa_layers,
+                frontend=self.sa_frontend,
             )
             sa_dim = self.sa_branch.out_dim
         else:
@@ -2030,6 +2164,7 @@ class DualPlaneMambaClassifier(nn.Module):
                 blocks_per_stage=wa_blocks_per_stage,
                 token_stride=wa_token_stride,
                 mamba_layers=wa_layers,
+                frontend=self.wa_frontend,
             )
             wa_dim = self.wa_branch.out_dim
         else:
