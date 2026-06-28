@@ -737,6 +737,8 @@ class _TokenSequencePool(nn.Module):
         name: str = "mean",
         hidden: int | None = None,
         dropout: float = 0.0,
+        residual_mean: bool = False,
+        residual_init: float = 0.5,
     ) -> None:
         super().__init__()
         d_model = int(d_model)
@@ -745,10 +747,20 @@ class _TokenSequencePool(nn.Module):
         self.name = name.lower()
         if self.name not in {"mean", "attention", "gated_attention"}:
             raise ValueError("pooling name must be mean, attention, or gated_attention")
+        self.residual_mean = bool(residual_mean)
         if self.name == "mean":
             self.norm = nn.Identity()
             self.attn = None
+            self.residual_logit = None
             return
+        if self.residual_mean:
+            init = float(residual_init)
+            init = min(max(init, 1.0e-4), 1.0 - 1.0e-4)
+            self.residual_logit = nn.Parameter(
+                torch.logit(torch.tensor(init, dtype=torch.float32))
+            )
+        else:
+            self.residual_logit = None
         self.norm = nn.LayerNorm(d_model)
         hidden = int(hidden or d_model)
         if hidden <= 0:
@@ -778,7 +790,12 @@ class _TokenSequencePool(nn.Module):
         else:
             scores = self.score(self.dropout(torch.tanh(self.value(z)) * torch.sigmoid(self.gate(z))))
         weights = torch.softmax(scores.float(), dim=1).to(dtype=tokens.dtype)
-        return (tokens * weights).sum(dim=1)
+        pooled = (tokens * weights).sum(dim=1)
+        if self.residual_logit is not None:
+            mean = tokens.mean(dim=1)
+            alpha = torch.sigmoid(self.residual_logit).to(dtype=tokens.dtype)
+            pooled = mean + alpha * (pooled - mean)
+        return pooled
 
 
 class EfficientKANHead(nn.Module):
@@ -1303,6 +1320,373 @@ class _PlaneTokenResConvBranch(nn.Module):
         return self.feature_norm(self.dropout(feat))
 
 
+
+class _SignalChannelTransform1D(nn.Module):
+    """Build optional physics-inspired input channels for PXRD frontends."""
+
+    def __init__(self, mode: str = "intensity", *, peak_window: int = 9) -> None:
+        super().__init__()
+        self.mode = str(mode).lower()
+        peak_window = int(peak_window)
+        if peak_window <= 0:
+            raise ValueError("peak_window must be positive")
+        if peak_window % 2 == 0:
+            peak_window += 1
+        self.peak_window = peak_window
+        if self.mode not in {"intensity", "peak_aware"}:
+            raise ValueError("signal channel mode must be intensity or peak_aware")
+        self.out_channels = 4 if self.mode == "peak_aware" else 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected signal shape (B, L), got {tuple(x.shape)}")
+        x0 = x.unsqueeze(1)
+        if self.mode == "intensity":
+            return x0
+        # Robust finite-difference features.  They are normalized per sample so
+        # derivative channels do not dominate raw intensity.
+        dx = F.pad(x[:, 1:] - x[:, :-1], (1, 0)).unsqueeze(1)
+        d2 = F.pad(dx[:, :, 1:] - dx[:, :, :-1], (1, 0))
+        local_mean = F.avg_pool1d(
+            x0, kernel_size=self.peak_window, stride=1, padding=self.peak_window // 2
+        )
+        peakness = (x0 - local_mean).clamp_min(0.0)
+        chans = [x0, dx, d2, peakness]
+        normed = []
+        for c in chans:
+            scale = c.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            normed.append(c / scale)
+        return torch.cat(normed, dim=1)
+
+
+class _MultiScaleConv1D(nn.Module):
+    """Parallel multi-kernel/dilated Conv1d stem for peak-shape extraction."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        *,
+        kernels: Sequence[int] = (3, 7, 15),
+        dilations: Sequence[int] = (1,),
+        stride: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        kernels = tuple(int(k) for k in kernels)
+        dilations = tuple(int(d) for d in dilations)
+        if not kernels or not dilations:
+            raise ValueError("multi-scale kernels and dilations must be non-empty")
+        branches = []
+        n = len(kernels) * len(dilations)
+        branch_ch = max(1, int(math.ceil(int(out_ch) / n)))
+        for k in kernels:
+            if k <= 0 or k % 2 == 0:
+                raise ValueError("multi-scale kernels must be positive odd integers")
+            for d in dilations:
+                if d <= 0:
+                    raise ValueError("multi-scale dilations must be positive")
+                branches.append(nn.Sequential(
+                    nn.Conv1d(
+                        int(in_ch), branch_ch, kernel_size=k, stride=int(stride),
+                        padding=(k // 2) * d, dilation=d, bias=False,
+                    ),
+                    nn.BatchNorm1d(branch_ch),
+                    nn.GELU(),
+                ))
+        self.branches = nn.ModuleList(branches)
+        self.project = nn.Sequential(
+            nn.Conv1d(branch_ch * len(branches), int(out_ch), kernel_size=1, bias=False),
+            nn.BatchNorm1d(int(out_ch)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(torch.cat([branch(x) for branch in self.branches], dim=1))
+
+
+class _InceptionBlock1D(nn.Module):
+    """InceptionTime/XceptionTime-style 1D residual block."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernels: Sequence[int] = (9, 19, 39),
+        bottleneck: int | None = None,
+        depthwise: bool = False,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        channels = int(channels)
+        kernels = tuple(int(k) for k in kernels)
+        if min(kernels) <= 0 or any(k % 2 == 0 for k in kernels):
+            raise ValueError("inception kernels must be positive odd integers")
+        bottleneck = int(bottleneck or max(8, channels // 4))
+        self.reduce = nn.Conv1d(channels, bottleneck, kernel_size=1, bias=False)
+        branch_ch = max(1, channels // (len(kernels) + 1))
+        branches = []
+        for k in kernels:
+            groups = bottleneck if depthwise and branch_ch == bottleneck else 1
+            if depthwise:
+                branches.append(nn.Sequential(
+                    nn.Conv1d(bottleneck, bottleneck, kernel_size=k, padding=k // 2, groups=bottleneck, bias=False),
+                    nn.Conv1d(bottleneck, branch_ch, kernel_size=1, bias=False),
+                ))
+            else:
+                branches.append(nn.Conv1d(bottleneck, branch_ch, kernel_size=k, padding=k // 2, bias=False))
+        branches.append(nn.Sequential(
+            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(channels, branch_ch, kernel_size=1, bias=False),
+        ))
+        self.branches = nn.ModuleList(branches)
+        self.project = nn.Sequential(
+            nn.BatchNorm1d(branch_ch * len(branches)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Conv1d(branch_ch * len(branches), channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.reduce(x)
+        outs = [branch(z) for branch in self.branches[:-1]] + [self.branches[-1](x)]
+        return F.gelu(x + self.project(torch.cat(outs, dim=1)))
+
+
+class _BlurPool1D(nn.Module):
+    """Small anti-aliased low-pass downsampler."""
+
+    def __init__(self, channels: int, *, stride: int = 2, filt_size: int = 5) -> None:
+        super().__init__()
+        if filt_size not in {3, 5, 7}:
+            raise ValueError("BlurPool filt_size must be 3, 5, or 7")
+        coeffs = {
+            3: [1.0, 2.0, 1.0],
+            5: [1.0, 4.0, 6.0, 4.0, 1.0],
+            7: [1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0],
+        }[filt_size]
+        filt = torch.tensor(coeffs, dtype=torch.float32)
+        filt = filt / filt.sum()
+        self.register_buffer("filt", filt.view(1, 1, -1).repeat(int(channels), 1, 1))
+        self.channels = int(channels)
+        self.stride = int(stride)
+        self.pad = filt_size // 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(x, self.filt.to(dtype=x.dtype), stride=self.stride, padding=self.pad, groups=self.channels)
+
+
+class _AntiAliasConv1D(nn.Module):
+    """BlurPool followed by stride-1 convolution to reduce aliasing of narrow PXRD peaks."""
+
+    def __init__(self, in_ch: int, out_ch: int, *, kernel_size: int, stride: int, padding: int, blur_size: int = 5) -> None:
+        super().__init__()
+        self.blur = _BlurPool1D(int(in_ch), stride=int(stride), filt_size=int(blur_size)) if int(stride) > 1 else nn.Identity()
+        self.conv = nn.Conv1d(int(in_ch), int(out_ch), kernel_size=int(kernel_size), stride=1, padding=int(padding), bias=False)
+        self.bn = nn.BatchNorm1d(int(out_ch))
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.conv(self.blur(x))))
+
+
+class _WaveletStem1D(nn.Module):
+    """Learnable wavelet/scattering-like filter bank stem initialized with Ricker filters."""
+
+    def __init__(self, in_ch: int, out_ch: int, *, kernels: Sequence[int] = (9, 17, 33), stride: int = 2) -> None:
+        super().__init__()
+        kernels = tuple(int(k) for k in kernels)
+        if min(kernels) <= 0 or any(k % 2 == 0 for k in kernels):
+            raise ValueError("wavelet kernels must be positive odd integers")
+        branch_ch = max(1, int(math.ceil(int(out_ch) / len(kernels))))
+        branches = []
+        for k in kernels:
+            conv = nn.Conv1d(int(in_ch), branch_ch, kernel_size=k, stride=int(stride), padding=k // 2, bias=False)
+            with torch.no_grad():
+                t = torch.linspace(-(k // 2), k // 2, k)
+                sigma = max(1.0, k / 6.0)
+                ricker = (1.0 - (t / sigma) ** 2) * torch.exp(-0.5 * (t / sigma) ** 2)
+                ricker = ricker - ricker.mean()
+                ricker = ricker / ricker.abs().sum().clamp_min(1.0e-6)
+                conv.weight.zero_()
+                for o in range(branch_ch):
+                    for i in range(int(in_ch)):
+                        conv.weight[o, i, :] = ricker
+            branches.append(nn.Sequential(conv, nn.BatchNorm1d(branch_ch), nn.GELU()))
+        self.branches = nn.ModuleList(branches)
+        self.project = nn.Sequential(
+            nn.Conv1d(branch_ch * len(branches), int(out_ch), kernel_size=1, bias=False),
+            nn.BatchNorm1d(int(out_ch)),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(torch.cat([branch(x) for branch in self.branches], dim=1))
+
+
+class _CustomDownsampleMambaBranch(nn.Module):
+    """Configurable PXRD-specific downsampling frontend before a Mamba mixer."""
+
+    def __init__(
+        self,
+        *,
+        branch_length: int,
+        d_model: int = 128,
+        stem_channels: int = 64,
+        mid_channels: int = 128,
+        final_channels: int = 256,
+        blocks_per_stage: Sequence[int] | int = (2, 2),
+        frontend_kind: str = "multiscale_downsample",
+        frontend_cfg: dict | None = None,
+        token_dropout: float = 0.0,
+        branch_dropout: float = 0.1,
+        mamba_layers: int = 0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "auto",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+        position_encoding: dict | None = None,
+        pooling: dict | None = None,
+        theta_start: float = 5.0,
+        theta_end: float = 90.0,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+    ) -> None:
+        super().__init__()
+        self.branch_length = int(branch_length)
+        frontend_kind = str(frontend_kind).lower()
+        cfg = dict(frontend_cfg or {})
+        blocks = _as_tuple(blocks_per_stage)
+        if len(blocks) == 1:
+            blocks = blocks * 2
+        if len(blocks) != 2:
+            raise ValueError("blocks_per_stage must be length 1 or 2")
+        stem_channels, mid_channels, final_channels = map(int, (stem_channels, mid_channels, final_channels))
+        if min(stem_channels, mid_channels, final_channels, int(d_model)) <= 0:
+            raise ValueError("custom downsample channels and d_model must be positive")
+
+        peak_mode = "peak_aware" if frontend_kind == "peak_aware_downsample" else "intensity"
+        self.input_transform = _SignalChannelTransform1D(
+            peak_mode, peak_window=int(cfg.get("peak_window", 9))
+        )
+        in_ch = self.input_transform.out_channels
+
+        if frontend_kind == "multiscale_downsample":
+            first = _MultiScaleConv1D(
+                in_ch, stem_channels,
+                kernels=cfg.get("kernels", (3, 7, 15)),
+                dilations=cfg.get("dilations", (1, 2)),
+                stride=2,
+                dropout=float(cfg.get("dropout", 0.0)),
+            )
+        elif frontend_kind == "inception_downsample":
+            first = nn.Sequential(
+                nn.Conv1d(in_ch, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm1d(stem_channels),
+                nn.GELU(),
+            )
+        elif frontend_kind == "wavelet_downsample":
+            first = _WaveletStem1D(in_ch, stem_channels, kernels=cfg.get("kernels", (9, 17, 33)), stride=2)
+        elif frontend_kind == "antialiased_downsample":
+            first = _AntiAliasConv1D(in_ch, stem_channels, kernel_size=7, stride=2, padding=3, blur_size=int(cfg.get("blur_size", 5)))
+        elif frontend_kind == "peak_aware_downsample":
+            first = nn.Sequential(
+                nn.Conv1d(in_ch, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm1d(stem_channels),
+                nn.GELU(),
+            )
+        else:
+            raise ValueError(f"unknown custom frontend kind: {frontend_kind}")
+
+        layers: list[nn.Module] = [first]
+        inception_kernels = cfg.get("inception_kernels", (9, 19, 39))
+        depthwise = bool(cfg.get("depthwise", frontend_kind == "inception_downsample"))
+        for _ in range(int(blocks[0])):
+            if frontend_kind == "inception_downsample":
+                layers.append(_InceptionBlock1D(stem_channels, kernels=inception_kernels, depthwise=depthwise, dropout=float(cfg.get("dropout", 0.0))))
+            else:
+                layers.append(_ResBlock1D(stem_channels, stem_channels, stride=1))
+        if frontend_kind == "antialiased_downsample":
+            layers.append(_AntiAliasConv1D(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1, blur_size=int(cfg.get("blur_size", 5))))
+        else:
+            layers.extend([nn.Conv1d(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1, bias=False), nn.BatchNorm1d(mid_channels), nn.GELU()])
+        for _ in range(int(blocks[1])):
+            if frontend_kind == "inception_downsample":
+                layers.append(_InceptionBlock1D(mid_channels, kernels=inception_kernels, depthwise=depthwise, dropout=float(cfg.get("dropout", 0.0))))
+            else:
+                layers.append(_ResBlock1D(mid_channels, mid_channels, stride=1))
+        if frontend_kind == "antialiased_downsample":
+            layers.append(_AntiAliasConv1D(mid_channels, final_channels, kernel_size=4, stride=2, padding=1, blur_size=int(cfg.get("blur_size", 5))))
+            layers.append(nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False))
+        else:
+            layers.extend([
+                nn.Conv1d(mid_channels, final_channels, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.BatchNorm1d(final_channels),
+                nn.GELU(),
+                nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False),
+            ])
+        self.frontend = nn.Sequential(*layers)
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.branch_length)
+            token_length = int(self.frontend(self.input_transform(dummy)).shape[-1])
+        if token_length <= 0:
+            raise ValueError("custom frontend produced non-positive token length")
+        self.token_length = token_length
+        self.token_stride = max(1, int(round(self.branch_length / self.token_length)))
+        position_cfg = dict(position_encoding or {})
+        self.position_encoding = (
+            _AnglePositionEncoding(
+                self.token_length, int(d_model), theta_start=float(theta_start),
+                theta_end=float(theta_end), theta_min=float(theta_min), theta_max=float(theta_max),
+                mode=str(position_cfg.get("mode", "angle_mlp")),
+                learned=bool(position_cfg.get("learned", True)),
+                dropout=float(position_cfg.get("dropout", 0.0)),
+            ) if bool(position_cfg.get("enabled", False)) else None
+        )
+        self.token_norm = nn.LayerNorm(int(d_model))
+        self.token_dropout = nn.Dropout(float(token_dropout))
+        self.mixer = _MambaSequenceMixer(
+            int(d_model), num_layers=mamba_layers, d_state=mamba_d_state,
+            d_conv=mamba_d_conv, expand=mamba_expand, dropout=mamba_dropout,
+            backend=mamba_backend, headdim=mamba_headdim, ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size, bidirectional=mamba_bidirectional,
+        )
+        self.actual_mamba_backend = self.mixer.actual_backend
+        pooling_cfg = dict(pooling or {})
+        self.pool = _TokenSequencePool(
+            int(d_model), name=str(pooling_cfg.get("name", "mean")),
+            hidden=pooling_cfg.get("hidden"), dropout=float(pooling_cfg.get("dropout", 0.0)),
+            residual_mean=bool(pooling_cfg.get("residual_mean", False)),
+            residual_init=float(pooling_cfg.get("residual_init", 0.5)),
+        )
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(int(d_model))
+        self.out_dim = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected branch input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.branch_length:
+            raise ValueError(f"branch length mismatch: got {x.shape[1]}, expected {self.branch_length}")
+        seq = self.frontend(self.input_transform(x))
+        if seq.shape[-1] != self.token_length:
+            raise RuntimeError(f"token length mismatch after custom downsampling: got {seq.shape[-1]}, expected {self.token_length}")
+        tokens = self.token_norm(seq.transpose(1, 2))
+        if self.position_encoding is not None:
+            tokens = self.position_encoding(tokens)
+        tokens = self.token_dropout(tokens)
+        tokens = self.mixer(tokens)
+        feat = self.pool(tokens)
+        return self.feature_norm(self.dropout(feat))
+
+
 class _LearnedDownsampleMambaBranch(nn.Module):
     """Learned Conv/ResBlock downsampling frontend before a Mamba mixer."""
 
@@ -1315,6 +1699,9 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         mid_channels: int = 128,
         final_channels: int = 256,
         blocks_per_stage: Sequence[int] | int = (2, 2),
+        downsample_kernels: Sequence[int] = (7, 4, 4),
+        downsample_strides: Sequence[int] = (2, 2, 2),
+        downsample_paddings: Sequence[int] = (3, 1, 1),
         token_dropout: float = 0.0,
         branch_dropout: float = 0.1,
         mamba_layers: int = 0,
@@ -1352,14 +1739,26 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         if len(blocks) != 2:
             raise ValueError("blocks_per_stage must be length 1 or 2")
 
+        kernels = tuple(int(v) for v in downsample_kernels)
+        strides = tuple(int(v) for v in downsample_strides)
+        paddings = tuple(int(v) for v in downsample_paddings)
+        if not (len(kernels) == len(strides) == len(paddings) == 3):
+            raise ValueError(
+                "downsample_kernels, downsample_strides, and downsample_paddings "
+                "must each contain exactly three integers"
+            )
+        if min(kernels) <= 0 or min(strides) <= 0 or min(paddings) < 0:
+            raise ValueError("downsample kernel/stride/padding values are invalid")
+
         self.branch_length = int(branch_length)
         length = self.branch_length
-        length = _conv1d_out_length(length, kernel_size=7, stride=2, padding=3)
-        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
-        length = _conv1d_out_length(length, kernel_size=4, stride=2, padding=1)
+        for kernel_size, stride, padding in zip(kernels, strides, paddings):
+            length = _conv1d_out_length(
+                length, kernel_size=kernel_size, stride=stride, padding=padding
+            )
         if length <= 0:
             raise ValueError("downsampled token length must be positive")
-        self.token_stride = 8
+        self.token_stride = int(strides[0] * strides[1] * strides[2])
         self.token_length = length
 
         token_kan_cfg = dict(token_kan_adapter or {})
@@ -1389,7 +1788,14 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             )
 
         layers: list[nn.Module] = [
-            nn.Conv1d(1, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv1d(
+                1,
+                stem_channels,
+                kernel_size=kernels[0],
+                stride=strides[0],
+                padding=paddings[0],
+                bias=False,
+            ),
             nn.BatchNorm1d(stem_channels),
             nn.GELU(),
         ]
@@ -1398,7 +1804,14 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         if local_kan_enabled and "after_stage1" in local_kan_positions:
             layers.append(make_local_kan(stem_channels))
         layers.extend([
-            nn.Conv1d(stem_channels, mid_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Conv1d(
+                stem_channels,
+                mid_channels,
+                kernel_size=kernels[1],
+                stride=strides[1],
+                padding=paddings[1],
+                bias=False,
+            ),
             nn.BatchNorm1d(mid_channels),
             nn.GELU(),
         ])
@@ -1407,7 +1820,14 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         if local_kan_enabled and "after_stage2" in local_kan_positions:
             layers.append(make_local_kan(mid_channels))
         layers.extend([
-            nn.Conv1d(mid_channels, final_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Conv1d(
+                mid_channels,
+                final_channels,
+                kernel_size=kernels[2],
+                stride=strides[2],
+                padding=paddings[2],
+                bias=False,
+            ),
             nn.BatchNorm1d(final_channels),
             nn.GELU(),
             nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False),
@@ -1464,6 +1884,8 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             name=str(pooling_cfg.get("name", "mean")),
             hidden=pooling_cfg.get("hidden"),
             dropout=float(pooling_cfg.get("dropout", 0.0)),
+            residual_mean=bool(pooling_cfg.get("residual_mean", False)),
+            residual_init=float(pooling_cfg.get("residual_init", 0.5)),
         )
         self.dropout = nn.Dropout(float(branch_dropout))
         self.feature_norm = nn.LayerNorm(int(d_model))
@@ -1787,6 +2209,8 @@ class _ConvNeXtDownsampleMambaBranch(nn.Module):
             name=str(pooling_cfg.get("name", "mean")),
             hidden=pooling_cfg.get("hidden"),
             dropout=float(pooling_cfg.get("dropout", 0.0)),
+            residual_mean=bool(pooling_cfg.get("residual_mean", False)),
+            residual_init=float(pooling_cfg.get("residual_init", 0.5)),
         )
         self.dropout = nn.Dropout(float(branch_dropout))
         self.feature_norm = nn.LayerNorm(int(d_model))
@@ -1919,6 +2343,8 @@ class _RawMambaBranch(nn.Module):
             name=str(pooling_cfg.get("name", "mean")),
             hidden=pooling_cfg.get("hidden"),
             dropout=float(pooling_cfg.get("dropout", 0.0)),
+            residual_mean=bool(pooling_cfg.get("residual_mean", False)),
+            residual_init=float(pooling_cfg.get("residual_init", 0.5)),
         )
         self.dropout = nn.Dropout(float(branch_dropout))
         self.feature_norm = nn.LayerNorm(int(d_model))
@@ -2264,6 +2690,9 @@ class DualPlaneMambaClassifier(nn.Module):
         sa_conv_channels: Sequence[int] = (32, 64, 128),
         wa_conv_channels: Sequence[int] = (32, 64, 128, 256),
         downsample_channels: Sequence[int] = (64, 128, 256),
+        downsample_kernels: Sequence[int] = (7, 4, 4),
+        downsample_strides: Sequence[int] = (2, 2, 2),
+        downsample_paddings: Sequence[int] = (3, 1, 1),
         sa_blocks_per_stage: Sequence[int] | int = 1,
         wa_blocks_per_stage: Sequence[int] | int = 1,
         downsample_blocks_per_stage: Sequence[int] | int = (2, 2),
@@ -2272,6 +2701,11 @@ class DualPlaneMambaClassifier(nn.Module):
         downsample_convnext: dict | None = None,
         downsample_position_encoding: dict | None = None,
         downsample_pooling: dict | None = None,
+        downsample_multiscale: dict | None = None,
+        downsample_inception: dict | None = None,
+        downsample_peak_aware: dict | None = None,
+        downsample_wavelet: dict | None = None,
+        downsample_antialias: dict | None = None,
         pool_every_stage: bool = True,
         pool_type: str = "max",
         token_mode: str = "multiply",
@@ -2377,23 +2811,31 @@ class DualPlaneMambaClassifier(nn.Module):
             "plane_token",
             "learned_downsample",
             "convnext_downsample",
+            "multiscale_downsample",
+            "inception_downsample",
+            "peak_aware_downsample",
+            "wavelet_downsample",
+            "antialiased_downsample",
             "xrdmamba_repo",
             "raw",
         }
         if self.frontend not in _valid_frontends:
             raise ValueError(
                 "frontend must be plane_token, learned_downsample, convnext_downsample, "
-                "xrdmamba_repo, or raw"
+                "multiscale_downsample, inception_downsample, peak_aware_downsample, "
+                "wavelet_downsample, antialiased_downsample, xrdmamba_repo, or raw"
             )
         if self.sa_frontend not in _valid_frontends:
             raise ValueError(
                 "sa_frontend must be plane_token, learned_downsample, convnext_downsample, "
-                "xrdmamba_repo, or raw"
+                "multiscale_downsample, inception_downsample, peak_aware_downsample, "
+                "wavelet_downsample, antialiased_downsample, xrdmamba_repo, or raw"
             )
         if self.wa_frontend not in _valid_frontends:
             raise ValueError(
                 "wa_frontend must be plane_token, learned_downsample, convnext_downsample, "
-                "xrdmamba_repo, or raw"
+                "multiscale_downsample, inception_downsample, peak_aware_downsample, "
+                "wavelet_downsample, antialiased_downsample, xrdmamba_repo, or raw"
             )
 
         def make_branch(
@@ -2427,6 +2869,9 @@ class DualPlaneMambaClassifier(nn.Module):
                     mid_channels=channels[1],
                     final_channels=channels[2],
                     blocks_per_stage=downsample_blocks_per_stage,
+                    downsample_kernels=downsample_kernels,
+                    downsample_strides=downsample_strides,
+                    downsample_paddings=downsample_paddings,
                     token_dropout=token_dropout,
                     branch_dropout=branch_dropout,
                     mamba_layers=mamba_layers,
@@ -2476,6 +2921,43 @@ class DualPlaneMambaClassifier(nn.Module):
                     theta_min=self.theta_min,
                     theta_max=self.theta_max,
                     convnext=downsample_convnext,
+                    **common_mamba,
+                )
+            if frontend in {
+                "multiscale_downsample",
+                "inception_downsample",
+                "peak_aware_downsample",
+                "wavelet_downsample",
+                "antialiased_downsample",
+            }:
+                channels = _as_tuple(downsample_channels)
+                if len(channels) != 3:
+                    raise ValueError("downsample_channels must be [stem, mid, final]")
+                custom_cfg_map = {
+                    "multiscale_downsample": downsample_multiscale,
+                    "inception_downsample": downsample_inception,
+                    "peak_aware_downsample": downsample_peak_aware,
+                    "wavelet_downsample": downsample_wavelet,
+                    "antialiased_downsample": downsample_antialias,
+                }
+                return _CustomDownsampleMambaBranch(
+                    branch_length=branch_length,
+                    d_model=branch_d_model,
+                    stem_channels=channels[0],
+                    mid_channels=channels[1],
+                    final_channels=channels[2],
+                    blocks_per_stage=downsample_blocks_per_stage,
+                    frontend_kind=frontend,
+                    frontend_cfg=custom_cfg_map[frontend],
+                    token_dropout=token_dropout,
+                    branch_dropout=branch_dropout,
+                    mamba_layers=mamba_layers,
+                    position_encoding=downsample_position_encoding,
+                    pooling=downsample_pooling,
+                    theta_start=float(theta_range[0]),
+                    theta_end=float(theta_range[1]),
+                    theta_min=self.theta_min,
+                    theta_max=self.theta_max,
                     **common_mamba,
                 )
             return _PlaneTokenResConvBranch(

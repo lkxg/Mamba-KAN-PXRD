@@ -80,6 +80,17 @@ MAIN_CONFIGS = [
     "configs/main/m41_single_plane_learned_downsample_mamba_gated_pool_label_smoothing.yaml",
     "configs/main/m42_dual_plane_sa_raw_wa_learned_downsample_mamba_label_smoothing.yaml",
     "configs/main/m43_single_plane_convnext_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m46_single_plane_learned_downsample_mamba_d128_l8_wide_frontend_label_smoothing.yaml",
+    "configs/main/m47_single_plane_learned_downsample_mamba_d128_l8_gated_pool_label_smoothing.yaml",
+    "configs/main/m48_single_plane_learned_downsample_mamba_d128_l8_stride4_label_smoothing.yaml",
+    "configs/main/m49_single_plane_learned_downsample_mamba_d128_l10_label_smoothing.yaml",
+    "configs/main/m50_single_plane_learned_downsample_mamba_d192_l8_label_smoothing.yaml",
+    "configs/main/m51_single_plane_learned_downsample_mamba_d128_l8_dstate32_label_smoothing.yaml",
+    "configs/main/m52_single_plane_multiscale_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m53_single_plane_inception_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m54_single_plane_peak_aware_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m55_single_plane_wavelet_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m56_single_plane_antialiased_downsample_mamba_d128_l8_label_smoothing.yaml",
     "configs/main/m45_resnet1d18_label_smoothing.yaml",
 ]
 
