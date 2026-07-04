@@ -1,0 +1,81 @@
+experiment:
+  name: speed_learned_stride8_l8_mamba_ssm
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 512
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: dual_plane_mamba
+  dual_plane_mamba:
+    frontend: learned_downsample
+    wa_range: [5.0, 90.0]
+    use_sa: false
+    d_model: 128
+    downsample_channels: [64, 128, 256]
+    downsample_blocks_per_stage: [2, 2]
+    downsample_strides: [2, 2, 2]
+    downsample_kernels: [7, 4, 4]
+    downsample_paddings: [3, 1, 1]
+    token_dropout: 0.05
+    mamba:
+      wa_layers: 8
+      dropout: 0.05
+
+optim:
+  name: adamw
+  lr: 6.0e-4
+  weight_decay: 5.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 1
+
+train:
+  epochs: 1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  log_every: 100
+  drop_last: true
+
+early_stopping:
+  enabled: false
+
+logging:
+  wandb:
+    enabled: false
+
+loss:
+  name: label_smoothing
+  label_smoothing: 0.05
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: false
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints/speed_tests
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5
