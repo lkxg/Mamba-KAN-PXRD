@@ -576,6 +576,239 @@ class _MambaSequenceMixer(nn.Module):
         return x
 
 
+class _RickerHighFreqBranch1D(nn.Module):
+    """Depthwise Ricker filters for lightweight peak/edge enhancement."""
+
+    def __init__(self, channels: int, kernels: Sequence[int] = (7, 15)) -> None:
+        super().__init__()
+        channels = int(channels)
+        kernels = tuple(int(k) for k in kernels)
+        if channels <= 0:
+            raise ValueError("channels must be positive")
+        if not kernels or min(kernels) <= 0 or any(k % 2 == 0 for k in kernels):
+            raise ValueError("Ricker kernels must be positive odd integers")
+        self.branches = nn.ModuleList()
+        for kernel_size in kernels:
+            conv = nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=channels,
+                bias=False,
+            )
+            with torch.no_grad():
+                t = torch.linspace(-(kernel_size // 2), kernel_size // 2, kernel_size)
+                sigma = max(1.0, kernel_size / 6.0)
+                ricker = (1.0 - (t / sigma) ** 2) * torch.exp(-0.5 * (t / sigma) ** 2)
+                ricker = ricker - ricker.mean()
+                ricker = ricker / ricker.abs().sum().clamp_min(1.0e-6)
+                conv.weight.zero_()
+                conv.weight[:, 0, :] = ricker
+            self.branches.append(conv)
+        self.scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.branches:
+            return x
+        high = sum(branch(x) for branch in self.branches) / len(self.branches)
+        return x + self.scale.to(dtype=x.dtype) * high
+
+
+class _MobileXRDTokenBlock(nn.Module):
+    """MobileMamba-style token block with global, local, and identity paths."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        global_channels: int,
+        local_channels: int,
+        identity_channels: int,
+        local_kernels: Sequence[int],
+        dropout: float,
+        use_wavelet: bool,
+        wavelet_kernels: Sequence[int],
+        mamba_d_state: int,
+        mamba_d_conv: int,
+        mamba_expand: int,
+        mamba_dropout: float,
+        mamba_backend: str,
+        mamba_headdim: int | None,
+        mamba_ngroups: int | None,
+        mamba_chunk_size: int | None,
+        mamba_bidirectional: bool,
+    ) -> None:
+        super().__init__()
+        d_model = int(d_model)
+        global_channels = int(global_channels)
+        local_channels = int(local_channels)
+        identity_channels = int(identity_channels)
+        if min(d_model, global_channels, local_channels, identity_channels) < 0:
+            raise ValueError("MobileXRD channel counts must be non-negative")
+        if global_channels + local_channels + identity_channels != d_model:
+            raise ValueError(
+                "global_channels + local_channels + identity_channels must equal d_model"
+            )
+        if global_channels <= 0:
+            raise ValueError("global_channels must be positive")
+        if local_channels <= 0:
+            raise ValueError("local_channels must be positive")
+
+        local_kernels = tuple(int(k) for k in local_kernels)
+        if not local_kernels or min(local_kernels) <= 0 or any(k % 2 == 0 for k in local_kernels):
+            raise ValueError("local_kernels must be positive odd integers")
+
+        self.global_channels = global_channels
+        self.local_channels = local_channels
+        self.identity_channels = identity_channels
+        self.norm = nn.LayerNorm(d_model)
+        self.global_mixer = _MambaSequenceMixer(
+            global_channels,
+            num_layers=1,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            dropout=mamba_dropout,
+            backend=mamba_backend,
+            headdim=mamba_headdim,
+            ngroups=mamba_ngroups,
+            chunk_size=mamba_chunk_size,
+            bidirectional=mamba_bidirectional,
+        )
+        base = local_channels // len(local_kernels)
+        remainder = local_channels % len(local_kernels)
+        self.local_splits = [
+            base + (1 if idx < remainder else 0)
+            for idx in range(len(local_kernels))
+        ]
+        local_branches: list[nn.Module] = []
+        for split_channels, kernel_size in zip(self.local_splits, local_kernels):
+            if split_channels <= 0:
+                continue
+            local_branches.append(nn.Sequential(
+                nn.Conv1d(
+                    split_channels,
+                    split_channels,
+                    kernel_size=kernel_size,
+                    padding=kernel_size // 2,
+                    groups=split_channels,
+                    bias=False,
+                ),
+                nn.BatchNorm1d(split_channels),
+                nn.GELU(),
+            ))
+        self.local_branches = nn.ModuleList(local_branches)
+        self.local_project = nn.Sequential(
+            nn.Conv1d(local_channels, local_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(local_channels),
+            nn.GELU(),
+        )
+        self.wavelet = (
+            _RickerHighFreqBranch1D(local_channels, kernels=wavelet_kernels)
+            if use_wavelet
+            else nn.Identity()
+        )
+        self.project = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Dropout(float(dropout)),
+        )
+
+    @property
+    def actual_backend(self) -> str:
+        return self.global_mixer.actual_backend
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        z = self.norm(x)
+        g_end = self.global_channels
+        l_end = g_end + self.local_channels
+        global_tokens = z[..., :g_end]
+        local_tokens = z[..., g_end:l_end]
+        identity_tokens = z[..., l_end:] if self.identity_channels > 0 else None
+
+        global_out = self.global_mixer(global_tokens)
+        local_seq = local_tokens.transpose(1, 2)
+        local_parts = torch.split(local_seq, self.local_splits, dim=1)
+        local_seq = torch.cat([
+            branch(part)
+            for branch, part in zip(self.local_branches, local_parts)
+        ], dim=1)
+        local_seq = self.local_project(local_seq)
+        local_seq = self.wavelet(local_seq)
+        local_out = local_seq.transpose(1, 2)
+
+        parts = [global_out, local_out]
+        if identity_tokens is not None:
+            parts.append(identity_tokens)
+        return residual + self.project(torch.cat(parts, dim=-1))
+
+
+class _MobileXRDTokenMixer(nn.Module):
+    """Stacked MobileXRD token blocks inspired by MobileMamba MRFFI."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        num_layers: int,
+        global_channels: int = 64,
+        local_channels: int = 32,
+        identity_channels: int = 32,
+        local_kernels: Sequence[int] = (3, 7, 15),
+        dropout: float = 0.0,
+        use_wavelet: bool = False,
+        wavelet_kernels: Sequence[int] = (7, 15),
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_dropout: float = 0.0,
+        mamba_backend: str = "mamba2_ssm",
+        mamba_headdim: int | None = None,
+        mamba_ngroups: int | None = None,
+        mamba_chunk_size: int | None = None,
+        mamba_bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_layers = int(num_layers)
+        if self.num_layers <= 0:
+            self.blocks = nn.ModuleList()
+            self.actual_backend = "none"
+            return
+        blocks = [
+            _MobileXRDTokenBlock(
+                int(d_model),
+                global_channels=global_channels,
+                local_channels=local_channels,
+                identity_channels=identity_channels,
+                local_kernels=local_kernels,
+                dropout=dropout,
+                use_wavelet=use_wavelet,
+                wavelet_kernels=wavelet_kernels,
+                mamba_d_state=mamba_d_state,
+                mamba_d_conv=mamba_d_conv,
+                mamba_expand=mamba_expand,
+                mamba_dropout=mamba_dropout,
+                mamba_backend=mamba_backend,
+                mamba_headdim=mamba_headdim,
+                mamba_ngroups=mamba_ngroups,
+                mamba_chunk_size=mamba_chunk_size,
+                mamba_bidirectional=mamba_bidirectional,
+            )
+            for _ in range(self.num_layers)
+        ]
+        self.blocks = nn.ModuleList(blocks)
+        self.actual_backend = f"mobilexrd_{self.blocks[0].actual_backend}"
+        self.norm = nn.LayerNorm(int(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        if self.num_layers > 0:
+            x = self.norm(x)
+        return x
+
+
 class _RBFLayer(nn.Module):
     """Compact RBF expansion used by the local KAN head."""
 
@@ -1716,6 +1949,7 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         mamba_bidirectional: bool = False,
         token_kan_adapter: dict | None = None,
         local_kan_adapter: dict | None = None,
+        token_mixer: dict | None = None,
         position_encoding: dict | None = None,
         pooling: dict | None = None,
         theta_start: float = 5.0,
@@ -1864,19 +2098,48 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             else None
         )
         self.token_dropout = nn.Dropout(float(token_dropout))
-        self.mixer = _MambaSequenceMixer(
-            int(d_model),
-            num_layers=mamba_layers,
-            d_state=mamba_d_state,
-            d_conv=mamba_d_conv,
-            expand=mamba_expand,
-            dropout=mamba_dropout,
-            backend=mamba_backend,
-            headdim=mamba_headdim,
-            ngroups=mamba_ngroups,
-            chunk_size=mamba_chunk_size,
-            bidirectional=mamba_bidirectional,
-        )
+        token_mixer_cfg = dict(token_mixer or {})
+        token_mixer_name = str(token_mixer_cfg.get("name", "mamba")).lower()
+        if token_mixer_name in {"mamba", "full_mamba"}:
+            self.mixer = _MambaSequenceMixer(
+                int(d_model),
+                num_layers=mamba_layers,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                expand=mamba_expand,
+                dropout=mamba_dropout,
+                backend=mamba_backend,
+                headdim=mamba_headdim,
+                ngroups=mamba_ngroups,
+                chunk_size=mamba_chunk_size,
+                bidirectional=mamba_bidirectional,
+            )
+        elif token_mixer_name in {"mobilexrd", "mobilexrd_lite", "partial_mamba"}:
+            self.mixer = _MobileXRDTokenMixer(
+                int(d_model),
+                num_layers=mamba_layers,
+                global_channels=int(token_mixer_cfg.get("global_channels", 64)),
+                local_channels=int(token_mixer_cfg.get("local_channels", 32)),
+                identity_channels=int(token_mixer_cfg.get("identity_channels", 32)),
+                local_kernels=token_mixer_cfg.get("local_kernels", (3, 7, 15)),
+                dropout=float(token_mixer_cfg.get("dropout", mamba_dropout)),
+                use_wavelet=bool(token_mixer_cfg.get("use_wavelet", False)),
+                wavelet_kernels=token_mixer_cfg.get("wavelet_kernels", (7, 15)),
+                mamba_d_state=mamba_d_state,
+                mamba_d_conv=mamba_d_conv,
+                mamba_expand=mamba_expand,
+                mamba_dropout=mamba_dropout,
+                mamba_backend=mamba_backend,
+                mamba_headdim=mamba_headdim,
+                mamba_ngroups=mamba_ngroups,
+                mamba_chunk_size=mamba_chunk_size,
+                mamba_bidirectional=mamba_bidirectional,
+            )
+        else:
+            raise ValueError(
+                "downsample_token_mixer.name must be mamba, mobilexrd, "
+                "mobilexrd_lite, or partial_mamba"
+            )
         self.actual_mamba_backend = self.mixer.actual_backend
         pooling_cfg = dict(pooling or {})
         self.pool = _TokenSequencePool(
@@ -2698,6 +2961,7 @@ class DualPlaneMambaClassifier(nn.Module):
         downsample_blocks_per_stage: Sequence[int] | int = (2, 2),
         downsample_token_kan_adapter: dict | None = None,
         downsample_local_kan_adapter: dict | None = None,
+        downsample_token_mixer: dict | None = None,
         downsample_convnext: dict | None = None,
         downsample_position_encoding: dict | None = None,
         downsample_pooling: dict | None = None,
@@ -2877,6 +3141,7 @@ class DualPlaneMambaClassifier(nn.Module):
                     mamba_layers=mamba_layers,
                     token_kan_adapter=downsample_token_kan_adapter,
                     local_kan_adapter=downsample_local_kan_adapter,
+                    token_mixer=downsample_token_mixer,
                     position_encoding=downsample_position_encoding,
                     pooling=downsample_pooling,
                     theta_start=float(theta_range[0]),

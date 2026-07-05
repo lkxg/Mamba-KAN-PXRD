@@ -91,6 +91,8 @@ MAIN_CONFIGS = [
     "configs/main/m54_single_plane_peak_aware_downsample_mamba_d128_l8_label_smoothing.yaml",
     "configs/main/m55_single_plane_wavelet_downsample_mamba_d128_l8_label_smoothing.yaml",
     "configs/main/m56_single_plane_antialiased_downsample_mamba_d128_l8_label_smoothing.yaml",
+    "configs/main/m57_mobilexrd_mamba_lite_d128_l8_label_smoothing.yaml",
+    "configs/main/m58_mobilexrd_mamba_wavelet_d128_l8_label_smoothing.yaml",
     "configs/main/m45_resnet1d18_label_smoothing.yaml",
 ]
 
