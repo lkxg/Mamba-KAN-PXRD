@@ -615,6 +615,78 @@ class _RickerHighFreqBranch1D(nn.Module):
         return x + self.scale.to(dtype=x.dtype) * high
 
 
+class _HaarWTEBranch1D(nn.Module):
+    """Token-level Haar WT/IWT branch paired with the global Mamba path."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernel_size: int = 3,
+        init_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        channels = int(channels)
+        kernel_size = int(kernel_size)
+        if channels <= 0:
+            raise ValueError("channels must be positive")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+        self.channels = channels
+        self.mix = nn.Sequential(
+            nn.Conv1d(
+                channels * 2,
+                channels * 2,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=channels * 2,
+                bias=False,
+            ),
+            nn.BatchNorm1d(channels * 2),
+            nn.GELU(),
+            nn.Conv1d(channels * 2, channels * 2, kernel_size=1, bias=False),
+            nn.BatchNorm1d(channels * 2),
+            nn.GELU(),
+        )
+        self.scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+    @staticmethod
+    def _dwt(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+        original_length = x.shape[-1]
+        if original_length % 2:
+            x = F.pad(x, (0, 1), mode="replicate")
+        even = x[..., 0::2]
+        odd = x[..., 1::2]
+        inv_sqrt2 = 1.0 / math.sqrt(2.0)
+        low = (even + odd) * inv_sqrt2
+        high = (even - odd) * inv_sqrt2
+        return torch.cat([low, high], dim=1), original_length
+
+    @staticmethod
+    def _iwt(coeffs: torch.Tensor, original_length: int) -> torch.Tensor:
+        low, high = coeffs.chunk(2, dim=1)
+        inv_sqrt2 = 1.0 / math.sqrt(2.0)
+        even = (low + high) * inv_sqrt2
+        odd = (low - high) * inv_sqrt2
+        x = torch.empty(
+            low.shape[0],
+            low.shape[1],
+            low.shape[-1] * 2,
+            dtype=coeffs.dtype,
+            device=coeffs.device,
+        )
+        x[..., 0::2] = even
+        x[..., 1::2] = odd
+        return x[..., :original_length]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = x.transpose(1, 2)
+        coeffs, original_length = self._dwt(seq)
+        mixed = self.mix(coeffs)
+        restored = self._iwt(mixed, original_length).transpose(1, 2)
+        return self.scale.to(dtype=x.dtype) * restored
+
+
 class _MobileXRDTokenBlock(nn.Module):
     """MobileMamba-style token block with global, local, and identity paths."""
 
@@ -629,6 +701,7 @@ class _MobileXRDTokenBlock(nn.Module):
         dropout: float,
         use_wavelet: bool,
         wavelet_kernels: Sequence[int],
+        global_wavelet: dict | None,
         mamba_d_state: int,
         mamba_d_conv: int,
         mamba_expand: int,
@@ -675,6 +748,16 @@ class _MobileXRDTokenBlock(nn.Module):
             ngroups=mamba_ngroups,
             chunk_size=mamba_chunk_size,
             bidirectional=mamba_bidirectional,
+        )
+        global_wavelet_cfg = dict(global_wavelet or {})
+        self.global_wavelet = (
+            _HaarWTEBranch1D(
+                global_channels,
+                kernel_size=int(global_wavelet_cfg.get("kernel_size", 3)),
+                init_scale=float(global_wavelet_cfg.get("init_scale", 0.1)),
+            )
+            if bool(global_wavelet_cfg.get("enabled", False))
+            else None
         )
         base = local_channels // len(local_kernels)
         remainder = local_channels % len(local_kernels)
@@ -728,6 +811,8 @@ class _MobileXRDTokenBlock(nn.Module):
         identity_tokens = z[..., l_end:] if self.identity_channels > 0 else None
 
         global_out = self.global_mixer(global_tokens)
+        if self.global_wavelet is not None:
+            global_out = global_out + self.global_wavelet(global_tokens)
         local_seq = local_tokens.transpose(1, 2)
         local_parts = torch.split(local_seq, self.local_splits, dim=1)
         local_seq = torch.cat([
@@ -759,6 +844,7 @@ class _MobileXRDTokenMixer(nn.Module):
         dropout: float = 0.0,
         use_wavelet: bool = False,
         wavelet_kernels: Sequence[int] = (7, 15),
+        global_wavelet: dict | None = None,
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
@@ -785,6 +871,7 @@ class _MobileXRDTokenMixer(nn.Module):
                 dropout=dropout,
                 use_wavelet=use_wavelet,
                 wavelet_kernels=wavelet_kernels,
+                global_wavelet=global_wavelet,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
@@ -2125,6 +2212,7 @@ class _LearnedDownsampleMambaBranch(nn.Module):
                 dropout=float(token_mixer_cfg.get("dropout", mamba_dropout)),
                 use_wavelet=bool(token_mixer_cfg.get("use_wavelet", False)),
                 wavelet_kernels=token_mixer_cfg.get("wavelet_kernels", (7, 15)),
+                global_wavelet=token_mixer_cfg.get("global_wavelet"),
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,

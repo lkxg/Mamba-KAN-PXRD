@@ -5,7 +5,7 @@ data:
   root: dataset
   splits_csv: splits/splits.csv
   task: space_group
-  batch_size: 512
+  batch_size: 64
   num_workers: 12
   prefetch_factor: 4
   pin_memory: true
@@ -27,6 +27,10 @@ model:
     - 2
     token_dropout: 0.05
     mamba:
+      backend: mamba2_ssm
+      d_state: 16
+      headdim: 64
+      chunk_size: 256
       wa_layers: 8
       dropout: 0.05
     downsample_antialias:
@@ -69,12 +73,14 @@ logging:
     - peak-preserving
     - single-plane
     - mamba
+    - mamba2
+    - batch64
     - d128
     - label-smoothing
     - main
     notes: 'M18-controlled frontend innovation: replace stride convolutions with BlurPool-style
       anti-aliased downsampling to reduce aliasing and preserve narrow PXRD peaks
-      before Mamba.'
+      before Mamba2, using batch size 64.'
     dir: wandb
     save_code: true
     watch_model: false

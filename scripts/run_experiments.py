@@ -93,6 +93,9 @@ MAIN_CONFIGS = [
     "configs/main/m56_single_plane_antialiased_downsample_mamba_d128_l8_label_smoothing.yaml",
     "configs/main/m57_mobilexrd_mamba_lite_d128_l8_label_smoothing.yaml",
     "configs/main/m58_mobilexrd_mamba_wavelet_d128_l8_label_smoothing.yaml",
+    "configs/main/m59_mobilexrd_mamba_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m60_mobilexrd_mamba_wte_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m61_single_plane_learned_downsample_mamba2_d128_l8_stride4_batch64_label_smoothing.yaml",
     "configs/main/m45_resnet1d18_label_smoothing.yaml",
 ]
 
