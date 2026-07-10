@@ -96,6 +96,12 @@ MAIN_CONFIGS = [
     "configs/main/m59_mobilexrd_mamba_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
     "configs/main/m60_mobilexrd_mamba_wte_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
     "configs/main/m61_single_plane_learned_downsample_mamba2_d128_l8_stride4_batch64_label_smoothing.yaml",
+    "configs/main/m62_mobilexrd_mamba_wide_frontend_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m63_mobilexrd_mamba_d192_global128_local64_no_identity_l8_label_smoothing.yaml",
+    "configs/main/m64_mobilexrd_mamba_dstate64_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m65_mobilexrd_mamba_peak_kernel_blocks_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m67_mobilexrd_mamba_antialias_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
+    "configs/main/m68_mobilexrd_mamba_multikernel_stem_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
     "configs/main/m45_resnet1d18_label_smoothing.yaml",
 ]
 

@@ -1812,6 +1812,40 @@ class _AntiAliasConv1D(nn.Module):
         return self.act(self.bn(self.conv(self.blur(x))))
 
 
+class _ConvAntiAliasDownsample1D(nn.Module):
+    """Stride-1 convolution followed by BlurPool downsampling for learned frontends."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        *,
+        kernel_size: int,
+        stride: int,
+        padding: int,
+        blur_size: int = 5,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(
+            int(in_ch),
+            int(out_ch),
+            kernel_size=int(kernel_size),
+            stride=1,
+            padding=int(padding),
+            bias=False,
+        )
+        self.bn = nn.BatchNorm1d(int(out_ch))
+        self.act = nn.GELU()
+        self.blur = (
+            _BlurPool1D(int(out_ch), stride=int(stride), filt_size=int(blur_size))
+            if int(stride) > 1
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blur(self.act(self.bn(self.conv(x))))
+
+
 class _WaveletStem1D(nn.Module):
     """Learnable wavelet/scattering-like filter bank stem initialized with Ricker filters."""
 
@@ -2022,6 +2056,8 @@ class _LearnedDownsampleMambaBranch(nn.Module):
         downsample_kernels: Sequence[int] = (7, 4, 4),
         downsample_strides: Sequence[int] = (2, 2, 2),
         downsample_paddings: Sequence[int] = (3, 1, 1),
+        downsample_multiscale: dict | None = None,
+        downsample_antialias: dict | None = None,
         token_dropout: float = 0.0,
         branch_dropout: float = 0.1,
         mamba_layers: int = 0,
@@ -2070,6 +2106,11 @@ class _LearnedDownsampleMambaBranch(nn.Module):
             )
         if min(kernels) <= 0 or min(strides) <= 0 or min(paddings) < 0:
             raise ValueError("downsample kernel/stride/padding values are invalid")
+        multiscale_cfg = dict(downsample_multiscale or {})
+        use_multiscale_stem = bool(multiscale_cfg.get("enabled", False))
+        antialias_cfg = dict(downsample_antialias or {})
+        use_antialias = bool(antialias_cfg.get("enabled", False))
+        antialias_blur_size = int(antialias_cfg.get("blur_size", 5))
 
         self.branch_length = int(branch_length)
         length = self.branch_length
@@ -2108,54 +2149,64 @@ class _LearnedDownsampleMambaBranch(nn.Module):
                 init_scale=float(local_kan_cfg.get("init_scale", 0.05)),
             )
 
-        layers: list[nn.Module] = [
-            nn.Conv1d(
-                1,
-                stem_channels,
-                kernel_size=kernels[0],
-                stride=strides[0],
-                padding=paddings[0],
-                bias=False,
-            ),
-            nn.BatchNorm1d(stem_channels),
-            nn.GELU(),
-        ]
+        def make_downsample(in_channels: int, out_channels: int, stage_idx: int) -> nn.Module:
+            if use_antialias:
+                return _ConvAntiAliasDownsample1D(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernels[stage_idx],
+                    stride=strides[stage_idx],
+                    padding=paddings[stage_idx],
+                    blur_size=antialias_blur_size,
+                )
+            return nn.Sequential(
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernels[stage_idx],
+                    stride=strides[stage_idx],
+                    padding=paddings[stage_idx],
+                    bias=False,
+                ),
+                nn.BatchNorm1d(out_channels),
+                nn.GELU(),
+            )
+
+        if use_multiscale_stem:
+            layers: list[nn.Module] = [
+                _MultiScaleConv1D(
+                    1,
+                    stem_channels,
+                    kernels=multiscale_cfg.get("kernels", (3, 7, 15)),
+                    dilations=multiscale_cfg.get("dilations", (1, 2)),
+                    stride=strides[0],
+                    dropout=float(multiscale_cfg.get("dropout", 0.0)),
+                )
+            ]
+        else:
+            layers = [make_downsample(1, stem_channels, 0)]
         for _ in range(int(blocks[0])):
             layers.append(_ResBlock1D(stem_channels, stem_channels, stride=1))
         if local_kan_enabled and "after_stage1" in local_kan_positions:
             layers.append(make_local_kan(stem_channels))
-        layers.extend([
-            nn.Conv1d(
-                stem_channels,
-                mid_channels,
-                kernel_size=kernels[1],
-                stride=strides[1],
-                padding=paddings[1],
-                bias=False,
-            ),
-            nn.BatchNorm1d(mid_channels),
-            nn.GELU(),
-        ])
+        layers.append(make_downsample(stem_channels, mid_channels, 1))
         for _ in range(int(blocks[1])):
             layers.append(_ResBlock1D(mid_channels, mid_channels, stride=1))
         if local_kan_enabled and "after_stage2" in local_kan_positions:
             layers.append(make_local_kan(mid_channels))
         layers.extend([
-            nn.Conv1d(
-                mid_channels,
-                final_channels,
-                kernel_size=kernels[2],
-                stride=strides[2],
-                padding=paddings[2],
-                bias=False,
-            ),
-            nn.BatchNorm1d(final_channels),
-            nn.GELU(),
+            make_downsample(mid_channels, final_channels, 2),
             nn.Conv1d(final_channels, int(d_model), kernel_size=1, bias=False),
         ])
         if local_kan_enabled and "after_projection" in local_kan_positions:
             layers.append(make_local_kan(int(d_model)))
         self.frontend = nn.Sequential(*layers)
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.branch_length)
+            actual_length = int(self.frontend(dummy.unsqueeze(1)).shape[-1])
+        if actual_length <= 0:
+            raise ValueError("learned downsample frontend produced non-positive token length")
+        self.token_length = actual_length
         position_cfg = dict(position_encoding or {})
         self.position_encoding = (
             _AnglePositionEncoding(
@@ -3224,6 +3275,8 @@ class DualPlaneMambaClassifier(nn.Module):
                     downsample_kernels=downsample_kernels,
                     downsample_strides=downsample_strides,
                     downsample_paddings=downsample_paddings,
+                    downsample_multiscale=downsample_multiscale,
+                    downsample_antialias=downsample_antialias,
                     token_dropout=token_dropout,
                     branch_dropout=branch_dropout,
                     mamba_layers=mamba_layers,
