@@ -3,32 +3,28 @@
 # 可通过复制并修改此文件来创建实验特定的配置
 
 experiment:
-  name: h100_resnet1d_longtail   # 实验名称，用于日志和检查点目录命名
+  name: default_resnet           # 实验名称，用于日志和检查点目录命名
   seed: 42                       # 随机种子，确保结果可复现
 
 data:
   root: dataset                  # 数据目录路径，包含 pxrd.npy 和 labels.csv
   splits_csv: splits/splits.csv  # 数据划分文件路径（由 make_splits.py 生成）
-  task: space_group              # 分类任务类型：space_group（230类）或 crystal_system（7类）
+  task: space_group              # 当前任务固定为空间群分类（230 类）
   batch_size: 1024                # H100 起点；若显存/吞吐仍有余量可试 1024
   num_workers: 12                # 当前机器 20 核，给 DataLoader 留足并发
   prefetch_factor: 4             # 每个 worker 预取 batch 数
   pin_memory: true               # 是否固定内存页，加快 GPU 数据传输
 
 model:
-  name: resnet1d                 # 模型架构：mlp（多层感知机）或 resnet1d（一维残差网络）
-  # 以下是各模型的具体参数（根据 name 选择使用的配置块）
+  name: resnet1d                 # 模型架构：resnet1d（一维残差网络）
   resnet1d:
     base_channels: 64           # H100 上提升通道数，提高容量与 GPU 利用率
     blocks_per_stage: [3, 4, 6, 3]  # 每个阶段的残差块数量
-  mlp:
-    hidden: [1024, 512]          # MLP 隐藏层维度
-    dropout: 0.2                 # Dropout 概率
 
 optim:
   lr: 2.0e-3                    # batch 512 下的 AdamW 初始学习率
   weight_decay: 1.0e-3          # 权重衰减系数（L2 正则化）
-  betas: [0.9, 0.999]           # Adam 优化器的动量参数
+  betas: [0.9, 0.999]           # AdamW 优化器的动量参数
 
 scheduler:
   name: cosine                   # 学习率调度器：cosine（余弦退火）或 none（固定学习率）
@@ -36,10 +32,7 @@ scheduler:
 
 train:
   epochs: 30                     # 训练总轮数
-  amp: true                      # 是否启用混合精度训练（AMP），减少显存占用并加速
-  amp_dtype: bf16                # H100 原生支持 BF16，不需要 GradScaler
   grad_clip: 1.0                 # 梯度裁剪阈值，防止梯度爆炸
-  log_every: 50                 # 日志打印频率（每多少批次打印一次）
 
 logging:
   wandb:
@@ -47,27 +40,18 @@ logging:
     project: mamba-kan-pxrd      # W&B project 名称
     entity: null                 # 个人账号可留空；团队空间可填 team/user 名称
     mode: online                 # online / offline / disabled
-    tags: [h100, resnet1d, longtail]
+    tags: [h100, default_resnet, resnet1d, longtail]
     notes: null
     dir: wandb                   # W&B 本地缓存目录
     save_code: true              # 保存当前训练代码快照
-    watch_model: false           # 需要梯度/参数直方图时改为 true
-    watch_log: gradients
-    watch_log_freq: 100
-    log_best_checkpoint: false   # 若想把 best.pt 作为 artifact 上传，改为 true
 
 loss:
   name: class_balanced_ce        # 长尾默认：class_balanced_ce；也可试 weighted_ce / focal
   label_smoothing: 0.05          # 标签平滑参数，用于防止过拟合
-  focal_gamma: 2.0              # Focal Loss 的聚焦参数
-  class_weight_power: 0.5        # weighted_ce 使用：1 / count^power
   class_weight_beta: 0.999       # class_balanced_ce 使用：有效样本数 beta
 
 sampler:
   name: none                     # 默认不重采样；若 macro_acc1 偏低可改为 class_balanced
-  power: 0.5                     # class_balanced sampler 使用：1 / count^power
-  replacement: true
-  num_samples_multiplier: 1.0
 
 performance:
   tf32: true                     # 允许 TF32 加速 FP32 matmul/conv

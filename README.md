@@ -19,7 +19,7 @@ Recently, deep learning has shown great potential in materials science. However,
 
 1. Propose the first deep learning framework combining Mamba and KAN for PXRD classification
 2. Provide a stratified splitting strategy handling severe class imbalance
-3. Build performance comparisons between MLP, ResNet1D baselines and the Mamba-KAN hybrid
+3. Build performance comparisons between retained CNN/RNN/Transformer baselines and the Mamba-KAN hybrid
 4. Open-source complete code for data preprocessing, model training, and evaluation
 
 ---
@@ -55,13 +55,9 @@ Our Mamba-KAN hybrid architecture combines the strengths of two cutting-edge mod
 
 ### Baseline Models
 
-For fair comparison, we implement the following baselines:
+For fair comparison, we retain ResNet1D, ConvNeXt1D, BiGRU-patch, and PatchTST-style baselines.
 
-**1. MLP Classifier**
-- Structure: Input(10824) → Linear(1024) → GELU → Dropout → Linear(512) → GELU → Dropout → Linear(230)
-- Characteristics: Simple and efficient, suitable as baseline
-
-**2. ResNet1D**
+**ResNet1D**
 - Structure: Stem(Conv1D + BN + GELU + MaxPool) → 4 stages × 2 ResBlocks → AdaptiveAvgPool → Linear
 - Characteristics: Residual connections mitigate gradient vanishing, suitable for long sequences
 
@@ -71,7 +67,7 @@ For fair comparison, we implement the following baselines:
 - **Optimizer**: AdamW (lr=1e-3, weight_decay=1e-4)
 - **LR Schedule**: Cosine annealing + warmup
 - **Regularization**: Label Smoothing, Dropout, Gradient Clipping
-- **Mixed Precision**: FP16/BF16 training
+- **Mixed Precision**: BF16 on CUDA
 
 ---
 
@@ -119,7 +115,7 @@ Each crystal contains a simulated 1D PXRD pattern computed with:
 | GPU | RTX 3090/4090 (16GB VRAM) |
 | Batch Size | 128 |
 | Epochs | 20 |
-| Mixed Precision | FP16 |
+| Mixed Precision | BF16 |
 
 ### Reproducibility
 
@@ -133,14 +129,14 @@ python analysis/preprocess.py
 # 3. Generate splits
 python make_splits.py
 
-# 4. Train baseline models (ResNet1D / MLP)
-python train.py --config configs/default.yaml
+# 4. Train the default ResNet1D baseline
+python3 scripts/train.py --config configs/default.yaml
 
 # 5. Train Mamba-KAN model
-python train.py --config configs/mamba_kan.yaml
+python3 scripts/train.py --config configs/main/m01_mamba.yaml
 
 # 6. Evaluate
-python evaluate.py --checkpoint checkpoints/<run>/best.pt
+python3 scripts/evaluate.py --checkpoint checkpoints/<run>/best.pt
 ```
 
 ---

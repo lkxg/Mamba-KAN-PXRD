@@ -2,25 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-SPACE_GROUP_CRYSTAL_SYSTEM = torch.tensor(
-    [0] * 2
-    + [1] * 13
-    + [2] * 59
-    + [3] * 68
-    + [4] * 25
-    + [5] * 27
-    + [6] * 36,
-    dtype=torch.long,
-)
-CRYSTAL_SYSTEM_START = torch.tensor([0, 2, 15, 74, 142, 167, 194], dtype=torch.long)
 
 
 def configure_backend(cfg: dict, device: torch.device) -> None:
@@ -39,120 +26,36 @@ def configure_backend(cfg: dict, device: torch.device) -> None:
         torch.set_float32_matmul_precision(matmul_precision)
 
 
-def amp_dtype_from_config(
-    name: str | None,
-    device: torch.device,
-) -> torch.dtype | None:
-    """Parse AMP dtype from config; return None off CUDA or for fp32."""
-    if device.type != "cuda" or name is None:
-        return None
-
-    normalized = name.lower()
-    if normalized in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if normalized in {"fp16", "float16", "half"}:
-        return torch.float16
-    if normalized in {"fp32", "float32", "none"}:
-        return None
-    raise ValueError(f"unknown amp dtype: {name!r}")
-
-
 # =====================================================================
 # 损失函数
 # =====================================================================
 
 class FocalLoss(nn.Module):
-    """多类别 Focal Loss（Lin et al., 2017）。
+    """Multi-class focal loss: -(1 - p_t)^gamma * log(p_t)."""
 
-    Focal Loss 通过降低易分类样本的权重，使模型更关注难分类的样本。
-    适用于类别不平衡的分类问题。
-
-    公式: FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-    其中 p_t 是真实类别的预测概率，γ 是聚焦参数，α_t 是类别权重。
-
-    参数:
-        gamma: 聚焦参数，默认 2.0。γ 越大，模型越关注难分类样本
-        alpha: 类别权重张量，可选
-        ignore_index: 忽略的类别索引，默认 -100
-    """
-
-    def __init__(
-        self,
-        gamma: float = 2.0,
-        alpha: torch.Tensor | None = None,
-        ignore_index: int = -100,
-    ) -> None:
+    def __init__(self, gamma: float = 2.0) -> None:
         super().__init__()
-        self.gamma = gamma
-        self.register_buffer("alpha", alpha if alpha is not None else torch.tensor(1.0))
-        self.ignore_index = ignore_index
+        if gamma < 0:
+            raise ValueError("focal_gamma must be non-negative")
+        self.gamma = float(gamma)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """计算 Focal Loss。
-
-        参数:
-            logits: 模型输出的未归一化 logits，形状 (batch_size, num_classes)
-            target: 真实类别索引，形状 (batch_size,)
-
-        返回:
-            标量损失值
-        """
-        if self.ignore_index is not None:
-            valid_mask = target != self.ignore_index
-            logits = logits[valid_mask]
-            target = target[valid_mask]
-            if target.numel() == 0:
-                return logits.sum() * 0.0
-
-        # 计算 log softmax 和 softmax
         log_p = F.log_softmax(logits, dim=-1)
         target_log_p = log_p.gather(1, target.unsqueeze(1)).squeeze(1)
-        target_p = log_p.exp().gather(1, target.unsqueeze(1)).squeeze(1)
-
-        # 计算聚焦权重：(1 - p_t)^γ
+        target_p = target_log_p.exp()
         focal_weight = (1.0 - target_p).clamp(min=1e-7).pow(self.gamma)
-
-        # 应用类别权重
-        alpha_y = self.alpha[target] if self.alpha.ndim > 0 else self.alpha
-
-        # 计算最终损失
-        loss = -alpha_y * focal_weight * target_log_p
-        return loss.mean()
+        return (-focal_weight * target_log_p).mean()
 
 
 class AsymmetricLoss(nn.Module):
-    """Asymmetric Loss for single-label multi-class long-tail classification.
-
-    Adapts ASL (Ben-Baruch et al., 2021) from multi-label to softmax-based
-    single-label classification, combined with class-frequency positive sample
-    weighting for long-tailed distributions.
-
-    Loss decomposition:
-        L_pos = -α_y · (1 - p_y)^{γ+} · log(p_y)
-        L_neg = Σ_{j≠y} max(p_j - m, 0)^{γ-} · (-log(1 - max(p_j - m, 0)))
-        L = L_pos + L_neg
-
-    Key design for long-tail:
-        - γ+ small (0~1): preserve gradients from hard rare-class positives
-        - γ- large (2~4): suppress easy head-class negative contributions
-        - Probability shift m: further dampen low-confidence negative noise
-        - α_y (class weights): frequency-based positive sample reweighting
-
-    Parameters:
-        gamma_pos: Focusing parameter for the positive (true) class
-        gamma_neg: Focusing parameter for negative (non-true) classes
-        prob_shift: Probability shifting margin for negatives
-        alpha: Per-class weight tensor for positive sample weighting
-        ignore_index: Target value to ignore
-    """
+    """Softmax ASL with class-weighted positives and shifted negatives."""
 
     def __init__(
         self,
+        alpha: torch.Tensor,
         gamma_pos: float = 0.0,
         gamma_neg: float = 4.0,
         prob_shift: float = 0.05,
-        alpha: torch.Tensor | None = None,
-        ignore_index: int = -100,
     ) -> None:
         super().__init__()
         if gamma_pos < 0:
@@ -164,65 +67,27 @@ class AsymmetricLoss(nn.Module):
         self.gamma_pos = gamma_pos
         self.gamma_neg = gamma_neg
         self.prob_shift = prob_shift
-        self.register_buffer(
-            "alpha", alpha if alpha is not None else torch.tensor(1.0)
-        )
-        self.ignore_index = ignore_index
+        self.register_buffer("alpha", alpha)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """计算非对称损失。
-
-        参数:
-            logits: 模型输出的未归一化 logits，形状 (batch_size, num_classes)
-            target: 真实类别索引，形状 (batch_size,)
-
-        返回:
-            标量损失值
-        """
-        if self.ignore_index is not None:
-            valid_mask = target != self.ignore_index
-            logits = logits[valid_mask]
-            target = target[valid_mask]
-            if target.numel() == 0:
-                return logits.sum() * 0.0
-
         num_classes = logits.shape[1]
-
-        # Softmax 概率和 log 概率
         probs = torch.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
-
-        # One-hot 编码
         one_hot = F.one_hot(target, num_classes=num_classes).to(dtype=probs.dtype)
-
-        # --- 正样本损失：真实类 ---
-        pos_probs = (probs * one_hot).sum(dim=-1)           # (B,)
-        pos_log_probs = (log_probs * one_hot).sum(dim=-1)   # (B,)
+        pos_probs = (probs * one_hot).sum(dim=-1)
+        pos_log_probs = (log_probs * one_hot).sum(dim=-1)
         pos_focal = (1.0 - pos_probs).clamp(min=1e-7).pow(self.gamma_pos)
-
-        # 类频率正样本加权
-        alpha_y = self.alpha[target] if self.alpha.ndim > 0 else self.alpha
-        pos_loss = -alpha_y * pos_focal * pos_log_probs     # (B,)
-
-        # --- 负样本损失：非真实类 ---
-        neg_probs = probs * (1.0 - one_hot)                 # (B, C)
-
-        # 概率偏移：将低置信度负样本概率裁剪到零
+        pos_loss = -self.alpha[target] * pos_focal * pos_log_probs
+        neg_probs = probs * (1.0 - one_hot)
         neg_probs_shifted = (neg_probs - self.prob_shift).clamp(min=0.0)
-
-        # 负样本聚焦加权
         neg_focal = neg_probs_shifted.pow(self.gamma_neg)
-
-        # 负样本贡献：-p^{γ-} · log(1 - p_shifted)
         neg_log = torch.log(1.0 - neg_probs_shifted + 1e-7)
-        neg_loss = -(neg_focal * neg_log).mean(dim=-1)       # (B,)
-
-        loss = pos_loss + neg_loss
-        return loss.mean()
+        neg_loss = -(neg_focal * neg_log).mean(dim=-1)
+        return (pos_loss + neg_loss).mean()
 
 
 def _positive_class_counts(class_counts: np.ndarray | None, *, name: str) -> np.ndarray:
-    """Return finite positive class counts for prior/logit adjustment losses."""
+    """Return finite positive class counts for frequency-aware losses."""
     if class_counts is None:
         raise ValueError(f"`class_counts` required for {name}")
     counts = np.asarray(class_counts, dtype=np.float64)
@@ -233,63 +98,6 @@ def _positive_class_counts(class_counts: np.ndarray | None, *, name: str) -> np.
     if not np.any(counts > 0):
         raise ValueError("class_counts must contain at least one positive count")
     return np.maximum(counts, 1.0)
-
-
-class BalancedSoftmaxLoss(nn.Module):
-    """Balanced Softmax loss using training-set class frequencies."""
-
-    def __init__(
-        self,
-        class_counts: np.ndarray,
-        *,
-        label_smoothing: float = 0.0,
-    ) -> None:
-        super().__init__()
-        counts = _positive_class_counts(class_counts, name="balanced_softmax")
-        self.register_buffer(
-            "log_counts",
-            torch.tensor(np.log(counts), dtype=torch.float32),
-        )
-        self.label_smoothing = float(label_smoothing)
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        adjusted = logits + self.log_counts.to(dtype=logits.dtype)
-        return F.cross_entropy(
-            adjusted,
-            target,
-            label_smoothing=self.label_smoothing,
-        )
-
-
-class LogitAdjustedLoss(nn.Module):
-    """Logit-adjusted cross entropy with configurable prior strength."""
-
-    def __init__(
-        self,
-        class_counts: np.ndarray,
-        *,
-        tau: float = 1.0,
-        label_smoothing: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if tau < 0:
-            raise ValueError("logit_adjustment_tau must be non-negative")
-        counts = _positive_class_counts(class_counts, name="logit_adjustment")
-        priors = counts / counts.sum()
-        self.register_buffer(
-            "log_priors",
-            torch.tensor(np.log(priors), dtype=torch.float32),
-        )
-        self.tau = float(tau)
-        self.label_smoothing = float(label_smoothing)
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        adjusted = logits + self.tau * self.log_priors.to(dtype=logits.dtype)
-        return F.cross_entropy(
-            adjusted,
-            target,
-            label_smoothing=self.label_smoothing,
-        )
 
 
 def _effective_number_weights(
@@ -371,57 +179,15 @@ class LDAMLoss(nn.Module):
         )
 
 
-def build_loss(
-    name: Literal[
-        "ce",
-        "label_smoothing",
-        "weighted_ce",
-        "class_balanced_ce",
-        "balanced_softmax",
-        "logit_adjustment",
-        "ldam",
-        "focal",
-        "asl",
-    ] = "ce",
+def build_loss_from_config(
+    loss_cfg: dict,
     *,
     class_counts: np.ndarray | None = None,
-    gamma: float = 2.0,
-    label_smoothing: float = 0.0,
-    class_weight_power: float = 0.5,
-    class_weight_beta: float = 0.99,
-    logit_adjustment_tau: float = 1.0,
-    ldam_max_m: float = 0.5,
-    ldam_scale: float = 30.0,
-    ldam_class_weight_beta: float = 0.9999,
-    ldam_use_class_weights: bool = False,
-    asl_gamma_pos: float = 0.0,
-    asl_gamma_neg: float = 4.0,
-    asl_prob_shift: float = 0.05,
 ) -> nn.Module:
-    """根据名称构建损失函数。
-
-    参数:
-        name: 损失函数名称
-              - "ce": 标准交叉熵损失
-              - "label_smoothing": 带标签平滑的交叉熵损失
-              - "weighted_ce": 加权交叉熵，权重为 1/sqrt(类别样本数)
-              - "class_balanced_ce": 有效样本数加权交叉熵
-              - "balanced_softmax": 按训练类别频数调整 softmax 分母
-              - "logit_adjustment": 按训练类别先验调整 logits
-              - "ldam": 带类别频数 margin 的 LDAM loss，可配合 DRW
-              - "focal": Focal Loss
-        class_counts: 各类别的样本数量，用于计算加权交叉熵的权重
-        gamma: Focal Loss 的聚焦参数
-        label_smoothing: 标签平滑参数，用于防止过拟合
-        class_weight_power: weighted_ce 的类别频数指数
-        class_weight_beta: class_balanced_ce 的有效样本数 beta
-        logit_adjustment_tau: logit_adjustment 的类别先验强度
-
-    返回:
-        PyTorch 损失函数模块
-    """
-    name = name.lower()
-    if name in {"ce", "label_smoothing"}:
+    """Build one of the retained losses from its YAML mapping."""
+    name = str(loss_cfg["name"]).lower()
+    label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
+    if name == "label_smoothing":
         return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     if name == "weighted_ce":
         if class_counts is None:
@@ -431,6 +197,7 @@ def build_loss(
         present = counts > 0
         if not present.any():
             raise ValueError("class_counts must contain at least one positive count")
+        class_weight_power = float(loss_cfg.get("class_weight_power", 0.5))
         if class_weight_power < 0:
             raise ValueError("class_weight_power must be non-negative")
         weights[present] = 1.0 / np.power(counts[present], class_weight_power)
@@ -442,82 +209,38 @@ def build_loss(
             raise ValueError("`class_counts` required for class_balanced_ce")
         w_tensor = _effective_number_weights(
             class_counts,
-            beta=class_weight_beta,
+            beta=float(loss_cfg.get("class_weight_beta", 0.99)),
             name="class_balanced_ce",
         )
         return nn.CrossEntropyLoss(weight=w_tensor, label_smoothing=label_smoothing)
-    if name == "balanced_softmax":
-        return BalancedSoftmaxLoss(
-            class_counts,
-            label_smoothing=label_smoothing,
-        )
-    if name == "logit_adjustment":
-        return LogitAdjustedLoss(
-            class_counts,
-            tau=logit_adjustment_tau,
-            label_smoothing=label_smoothing,
-        )
     if name == "ldam":
         if class_counts is None:
             raise ValueError("`class_counts` required for ldam")
         return LDAMLoss(
             class_counts,
-            max_m=ldam_max_m,
-            scale=ldam_scale,
+            max_m=float(loss_cfg.get("ldam_max_m", 0.5)),
+            scale=float(loss_cfg.get("ldam_scale", 30.0)),
             label_smoothing=label_smoothing,
-            class_weight_beta=ldam_class_weight_beta,
-            use_class_weights=ldam_use_class_weights,
+            class_weight_beta=float(loss_cfg.get("ldam_class_weight_beta", 0.9999)),
+            use_class_weights=bool(loss_cfg.get("ldam_use_class_weights", False)),
         )
     if name == "focal":
-        return FocalLoss(gamma=gamma)
+        return FocalLoss(gamma=float(loss_cfg.get("focal_gamma", 2.0)))
     if name == "asl":
         if class_counts is None:
             raise ValueError("`class_counts` required for asl")
         alpha = _effective_number_weights(
             class_counts,
-            beta=class_weight_beta,
+            beta=float(loss_cfg.get("class_weight_beta", 0.99)),
             name="asl",
         )
         return AsymmetricLoss(
-            gamma_pos=asl_gamma_pos,
-            gamma_neg=asl_gamma_neg,
-            prob_shift=asl_prob_shift,
             alpha=alpha,
+            gamma_pos=float(loss_cfg.get("asl_gamma_pos", 0.0)),
+            gamma_neg=float(loss_cfg.get("asl_gamma_neg", 4.0)),
+            prob_shift=float(loss_cfg.get("asl_prob_shift", 0.05)),
         )
     raise ValueError(f"unknown loss: {name!r}")
-
-
-def build_loss_from_config(
-    loss_cfg: dict,
-    *,
-    class_counts: np.ndarray | None = None,
-) -> nn.Module:
-    """Build a loss module from a YAML loss config mapping."""
-    name = str(loss_cfg["name"]).lower()
-    needs_counts = {
-        "weighted_ce",
-        "class_balanced_ce",
-        "balanced_softmax",
-        "logit_adjustment",
-        "ldam",
-        "asl",
-    }
-    return build_loss(
-        name,
-        class_counts=class_counts if name in needs_counts else None,
-        gamma=loss_cfg.get("focal_gamma", 2.0),
-        label_smoothing=loss_cfg.get("label_smoothing", 0.0),
-        class_weight_power=loss_cfg.get("class_weight_power", 0.5),
-        class_weight_beta=loss_cfg.get("class_weight_beta", 0.99),
-        logit_adjustment_tau=loss_cfg.get("logit_adjustment_tau", 1.0),
-        ldam_max_m=loss_cfg.get("ldam_max_m", 0.5),
-        ldam_scale=loss_cfg.get("ldam_scale", 30.0),
-        ldam_class_weight_beta=loss_cfg.get("ldam_class_weight_beta", 0.9999),
-        ldam_use_class_weights=loss_cfg.get("ldam_use_class_weights", False),
-        asl_gamma_pos=float(loss_cfg.get("asl_gamma_pos", 0.0)),
-        asl_gamma_neg=float(loss_cfg.get("asl_gamma_neg", 4.0)),
-        asl_prob_shift=float(loss_cfg.get("asl_prob_shift", 0.05)),
-    )
 
 
 # =====================================================================
@@ -531,12 +254,9 @@ class StepStats:
     n: int               # 处理的样本总数
     correct_top1: int    # Top-1 正确预测数
     correct_top5: int    # Top-5 正确预测数
-    correct_top10: int = 0  # Top-10 正确预测数
     class_correct_top1: np.ndarray | None = None
     class_total: np.ndarray | None = None
-    aux_loss: float = 0.0
     contrastive_loss: float = 0.0
-    gate_mean: float | None = None
     rare_correct_top1: int | None = None
     rare_total: int | None = None
 
@@ -549,11 +269,6 @@ class StepStats:
     def acc5(self) -> float:
         """Top-5 准确率。"""
         return self.correct_top5 / max(self.n, 1)
-
-    @property
-    def acc10(self) -> float:
-        """Top-10 准确率。"""
-        return self.correct_top10 / max(self.n, 1)
 
     @property
     def macro_acc1(self) -> float:
@@ -574,23 +289,14 @@ class StepStats:
         return self.rare_correct_top1 / max(self.rare_total, 1)
 
 
-def _accuracy_topk(logits: torch.Tensor, target: torch.Tensor, k: int = 5) -> int:
-    """计算 Top-k 准确率。
-
-    参数:
-        logits: 模型输出的未归一化 logits，形状 (batch_size, num_classes)
-        target: 真实类别索引，形状 (batch_size,)
-        k: Top-k 中的 k 值
-
-    返回:
-        Top-k 正确的样本数
-    """
-    k = min(k, logits.shape[1])
-    # 取 logits 最大的 k 个类别的索引
-    values, top = logits.topk(k, dim=1)
-    # 检查真实类别是否在这 k 个中
-    hits = (top == target.unsqueeze(1)) & torch.isfinite(values)
-    return int(hits.any(dim=1).sum().item())
+def _topk_hits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Top-1/5 hit masks from one topk call."""
+    values, indices = logits.topk(min(5, logits.shape[1]), dim=1)
+    hits = (indices == target.unsqueeze(1)) & torch.isfinite(values)
+    return hits[:, 0], hits.any(dim=1)
 
 
 def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
@@ -598,93 +304,6 @@ def primary_logits(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tens
     if isinstance(output, dict):
         return output["logits"]
     return output
-
-
-def space_group_to_crystal_system(target: torch.Tensor) -> torch.Tensor:
-    """Map 0-based space-group labels to 0-based crystal-system labels."""
-    mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=target.device)
-    return mapping[target.long()]
-
-
-def crystal_system_mask(
-    crystal_ids: torch.Tensor,
-    *,
-    num_space_groups: int = 230,
-) -> torch.Tensor:
-    """Return a boolean [B, 230] mask for allowed space groups per crystal system."""
-    mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=crystal_ids.device)
-    if int(num_space_groups) != int(mapping.numel()):
-        raise ValueError("hierarchical masking expects 230 space-group logits")
-    return mapping.unsqueeze(0).eq(crystal_ids.long().unsqueeze(1))
-
-
-def apply_hierarchical_mask(
-    logits: torch.Tensor,
-    crystal_logits: torch.Tensor,
-    *,
-    mode: str = "predicted",
-) -> torch.Tensor:
-    """Mask space-group logits to the predicted crystal system at inference."""
-    mode = mode.lower()
-    if mode in {"none", "off", "false"}:
-        return logits
-    if mode != "predicted":
-        raise ValueError(f"unknown hierarchical inference mask mode: {mode!r}")
-    crystal_ids = crystal_logits.float().argmax(dim=1)
-    mask = crystal_system_mask(crystal_ids, num_space_groups=logits.shape[1])
-    return logits.masked_fill(~mask, float("-inf"))
-
-
-def hierarchical_loss(
-    output: dict[str, torch.Tensor],
-    target: torch.Tensor,
-    *,
-    crystal_aux_weight: float = 0.0,
-    consistency_weight: float = 0.0,
-    expert_weight: float = 0.0,
-) -> torch.Tensor:
-    """Crystal-system auxiliary and soft consistency loss for SG classifiers."""
-    if "crystal_logits" not in output:
-        return primary_logits(output).sum() * 0.0
-    crystal_target = space_group_to_crystal_system(target)
-    crystal_logits = output["crystal_logits"]
-    loss = crystal_logits.sum() * 0.0
-    if crystal_aux_weight > 0:
-        loss = loss + float(crystal_aux_weight) * F.cross_entropy(
-            crystal_logits,
-            crystal_target,
-        )
-    if expert_weight > 0 and "expert_logits" in output:
-        starts = CRYSTAL_SYSTEM_START.to(device=target.device)
-        expert_loss = crystal_logits.sum() * 0.0
-        expert_count = 0
-        for system_id, local_logits in enumerate(output["expert_logits"]):
-            mask = crystal_target == int(system_id)
-            if bool(mask.any()):
-                local_target = target[mask] - starts[system_id]
-                expert_loss = expert_loss + F.cross_entropy(
-                    local_logits[mask],
-                    local_target.long(),
-                )
-                expert_count += 1
-        if expert_count:
-            loss = loss + float(expert_weight) * (expert_loss / expert_count)
-    if consistency_weight > 0:
-        logits = primary_logits(output)
-        sg_probs = torch.softmax(logits.float(), dim=1)
-        mapping = SPACE_GROUP_CRYSTAL_SYSTEM.to(device=logits.device)
-        system_probs = sg_probs.new_zeros((sg_probs.shape[0], 7))
-        system_probs.scatter_add_(
-            1,
-            mapping.unsqueeze(0).expand(sg_probs.shape[0], -1),
-            sg_probs,
-        )
-        consistency = F.nll_loss(
-            torch.log(system_probs.clamp_min(1.0e-12)),
-            crystal_target,
-        )
-        loss = loss + float(consistency_weight) * consistency
-    return loss
 
 
 def supervised_contrastive_loss(
@@ -711,8 +330,6 @@ def supervised_contrastive_loss(
     contrast_mask = ~self_mask
     positive_count = positive_mask.sum(dim=1)
     valid_anchor = positive_count > 0
-    if not bool(valid_anchor.any()):
-        return embedding.sum() * 0.0
 
     logits = logits.masked_fill(~contrast_mask, float("-inf"))
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
@@ -720,54 +337,36 @@ def supervised_contrastive_loss(
         log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1)
         / positive_count.clamp_min(1)
     )
-    return -positive_log_prob[valid_anchor].mean()
+    return -(positive_log_prob * valid_anchor).sum() / valid_anchor.sum().clamp_min(1)
 
 
-def loss_with_auxiliary(
+def loss_with_contrastive(
     output: torch.Tensor | dict[str, torch.Tensor],
     target: torch.Tensor,
     loss_fn: nn.Module,
     *,
-    aux_weights: dict[str, float] | None = None,
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
-    hierarchical_aux_weight: float = 0.0,
-    hierarchical_consistency_weight: float = 0.0,
-    hierarchical_expert_weight: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute main loss plus optional branch auxiliary and contrastive losses."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute classification loss plus optional supervised contrastive loss."""
     logits = primary_logits(output)
     main_loss = loss_fn(logits, target)
-    aux_loss = logits.sum() * 0.0
     contrastive_loss = logits.sum() * 0.0
-    if isinstance(output, dict):
-        weights = aux_weights or {}
-        for key in ("sa_logits", "wa_logits"):
-            weight = float(weights.get(key, 0.0))
-            if weight > 0 and key in output:
-                aux_loss = aux_loss + weight * loss_fn(output[key], target)
-        aux_loss = aux_loss + hierarchical_loss(
-            output,
-            target,
-            crystal_aux_weight=hierarchical_aux_weight,
-            consistency_weight=hierarchical_consistency_weight,
-            expert_weight=hierarchical_expert_weight,
-        )
-        if contrastive_weight > 0:
-            if contrastive_embedding_key not in output:
-                raise KeyError(
-                    f"contrastive embedding {contrastive_embedding_key!r} missing from model output"
-                )
-            contrastive_loss = supervised_contrastive_loss(
-                output[contrastive_embedding_key],
-                target,
-                temperature=contrastive_temperature,
+    if contrastive_weight > 0:
+        if not isinstance(output, dict):
+            raise TypeError("contrastive loss requires a model output dict with embeddings")
+        if contrastive_embedding_key not in output:
+            raise KeyError(
+                f"contrastive embedding {contrastive_embedding_key!r} missing from model output"
             )
-    elif contrastive_weight > 0:
-        raise TypeError("contrastive loss requires a model output dict with embeddings")
-    total_loss = main_loss + aux_loss + float(contrastive_weight) * contrastive_loss
-    return total_loss, logits, aux_loss.detach(), contrastive_loss.detach()
+        contrastive_loss = supervised_contrastive_loss(
+            output[contrastive_embedding_key],
+            target,
+            temperature=contrastive_temperature,
+        )
+    total_loss = main_loss + float(contrastive_weight) * contrastive_loss
+    return total_loss, logits, contrastive_loss.detach()
 
 
 def supervised_contrastive_config(
@@ -792,27 +391,6 @@ def supervised_contrastive_config(
     return weight, temperature, embedding_key
 
 
-def hierarchical_config(loss_cfg: dict) -> tuple[float, float, float]:
-    """Return crystal auxiliary, consistency, and expert-local loss weights."""
-    cfg = loss_cfg.get("hierarchical", {}) or {}
-    if not bool(cfg.get("enabled", False)):
-        return 0.0, 0.0, 0.0
-    return (
-        float(cfg.get("crystal_aux_weight", 0.2)),
-        float(cfg.get("consistency_weight", 0.05)),
-        float(cfg.get("expert_weight", 0.0)),
-    )
-
-
-def output_gate_mean(output: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor | None:
-    """Return batch gate means when a gated dual-range model exposes them."""
-    if isinstance(output, dict) and "gate_mean" in output:
-        return output["gate_mean"].detach()
-    if isinstance(output, dict) and "peak_gate_mean" in output:
-        return output["peak_gate_mean"].detach()
-    return None
-
-
 def rare_classes_from_counts(
     class_counts: np.ndarray | None,
     *,
@@ -831,15 +409,6 @@ def rare_classes_from_counts(
     }
 
 
-def aux_loss_weights_from_model(model: nn.Module) -> dict[str, float]:
-    """Read optional auxiliary loss weights from a raw or compiled model."""
-    candidate = getattr(model, "_orig_mod", model)
-    weights = getattr(candidate, "aux_loss_weights", None)
-    if not weights:
-        return {}
-    return {str(k): float(v) for k, v in dict(weights).items() if float(v) > 0}
-
-
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -847,21 +416,11 @@ def train_one_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     *,
-    scaler: torch.amp.GradScaler | None = None,
     grad_clip: float | None = 1.0,
-    log_every: int = 100,
-    progress_callback=None,
-    use_amp: bool | None = None,
-    amp_dtype: torch.dtype | None = None,
-    aux_loss_weights: dict[str, float] | None = None,
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
-    hierarchical_aux_weight: float = 0.0,
-    hierarchical_consistency_weight: float = 0.0,
-    hierarchical_expert_weight: float = 0.0,
     rare_classes: set[int] | None = None,
-    freeze_batch_norm: bool = False,
 ) -> StepStats:
     """训练一个 epoch。
 
@@ -871,110 +430,72 @@ def train_one_epoch(
         optimizer: 优化器
         loss_fn: 损失函数
         device: 计算设备（CPU 或 CUDA）
-        scaler: 混合精度训练的 GradScaler，None 表示不使用 AMP
         grad_clip: 梯度裁剪阈值，None 表示不裁剪
-        log_every: 日志打印频率（每多少批次打印一次）
-        progress_callback: 进度回调函数，签名为 (step, loss, acc1)
 
     返回:
         StepStats：包含当前 epoch 的训练统计信息
     """
     model.train()
-    if freeze_batch_norm:
-        for module in model.modules():
-            if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                module.eval()
-    total_loss = 0.0
-    total_aux_loss = 0.0
-    total_contrastive_loss = 0.0
-    n = correct1 = correct5 = correct10 = 0
-    rare_correct1 = rare_total = 0
-    gate_sum = 0.0
-    gate_count = 0
-    if use_amp is None:
-        use_amp = scaler is not None
-    use_scaler = scaler is not None and scaler.is_enabled()
+    total_loss = torch.zeros((), device=device)
+    total_contrastive_loss = torch.zeros((), device=device)
+    correct1 = torch.zeros((), dtype=torch.int64, device=device)
+    correct5 = torch.zeros((), dtype=torch.int64, device=device)
+    rare_correct1 = torch.zeros((), dtype=torch.int64, device=device)
+    rare_total = torch.zeros((), dtype=torch.int64, device=device)
+    n = 0
+    rare_lookup: torch.Tensor | None = None
 
-    for step, (x, y) in enumerate(loader):
-        # 将数据移动到设备上
+    for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-
-        # 清零梯度
         optimizer.zero_grad(set_to_none=True)
-
-        # 前向传播（可选混合精度）
         with torch.amp.autocast(
             device_type=device.type,
-            enabled=use_amp,
-            dtype=amp_dtype,
+            enabled=device.type == "cuda",
+            dtype=torch.bfloat16,
         ):
             output = model(x)
-            loss, logits, aux_loss, contrastive_loss = loss_with_auxiliary(
+            loss, logits, contrastive_loss = loss_with_contrastive(
                 output,
                 y,
                 loss_fn,
-                aux_weights=aux_loss_weights,
                 contrastive_weight=contrastive_weight,
                 contrastive_temperature=contrastive_temperature,
                 contrastive_embedding_key=contrastive_embedding_key,
-                hierarchical_aux_weight=hierarchical_aux_weight,
-                hierarchical_consistency_weight=hierarchical_consistency_weight,
-                hierarchical_expert_weight=hierarchical_expert_weight,
             )
 
-        # 反向传播
-        if use_scaler:
-            scaler.scale(loss).backward()
-            if grad_clip:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+        loss.backward()
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
-        # 统计信息
         bsz = y.size(0)
-        total_loss += float(loss.item()) * bsz
-        total_aux_loss += float(aux_loss.item()) * bsz
-        total_contrastive_loss += float(contrastive_loss.item()) * bsz
+        total_loss += loss.detach().float() * bsz
+        total_contrastive_loss += contrastive_loss.float() * bsz
         n += bsz
-        correct1 += _accuracy_topk(logits.detach(), y, k=1)
-        correct5 += _accuracy_topk(logits.detach(), y, k=5)
-        correct10 += _accuracy_topk(logits.detach(), y, k=10)
+        top1_hits, top5_hits = _topk_hits(logits.detach(), y)
+        correct1 += top1_hits.sum()
+        correct5 += top5_hits.sum()
         if rare_classes:
-            pred = logits.detach().argmax(dim=1)
-            rare_mask = torch.zeros_like(y, dtype=torch.bool)
-            for cls in rare_classes:
-                rare_mask |= y == int(cls)
-            if rare_mask.any():
-                rare_total += int(rare_mask.sum().item())
-                rare_correct1 += int((pred[rare_mask] == y[rare_mask]).sum().item())
-
-        gate_mean = output_gate_mean(output)
-        if gate_mean is not None:
-            gate_sum += float(gate_mean.float().sum().item())
-            gate_count += int(gate_mean.numel())
-
-        # 进度回调
-        if progress_callback is not None and (step % log_every == 0):
-            progress_callback(step, total_loss / max(n, 1), correct1 / max(n, 1))
+            if rare_lookup is None:
+                rare_lookup = torch.zeros(
+                    logits.shape[1],
+                    dtype=torch.bool,
+                    device=y.device,
+                )
+                rare_lookup[list(rare_classes)] = True
+            rare_mask = rare_lookup[y]
+            rare_total += rare_mask.sum()
+            rare_correct1 += top1_hits[rare_mask].sum()
 
     return StepStats(
-        loss=total_loss / max(n, 1),
+        loss=float(total_loss.item()) / max(n, 1),
         n=n,
-        correct_top1=correct1,
-        correct_top5=correct5,
-        correct_top10=correct10,
-        aux_loss=total_aux_loss / max(n, 1),
-        contrastive_loss=total_contrastive_loss / max(n, 1),
-        gate_mean=(gate_sum / gate_count) if gate_count else None,
-        rare_correct_top1=rare_correct1 if rare_classes else None,
-        rare_total=rare_total if rare_classes else None,
+        correct_top1=int(correct1.item()),
+        correct_top5=int(correct5.item()),
+        contrastive_loss=float(total_contrastive_loss.item()) / max(n, 1),
+        rare_correct_top1=int(rare_correct1.item()) if rare_classes else None,
+        rare_total=int(rare_total.item()) if rare_classes else None,
     )
 
 
@@ -985,13 +506,6 @@ def evaluate(
     loss_fn: nn.Module,
     device: torch.device,
     *,
-    use_amp: bool = True,
-    amp_dtype: torch.dtype | None = None,
-    aux_loss_weights: dict[str, float] | None = None,
-    hierarchical_aux_weight: float = 0.0,
-    hierarchical_consistency_weight: float = 0.0,
-    hierarchical_expert_weight: float = 0.0,
-    hierarchical_mask_mode: str = "none",
     rare_classes: set[int] | None = None,
 ) -> StepStats:
     """在验证集或测试集上评估模型。
@@ -1001,20 +515,19 @@ def evaluate(
         loader: 评估数据加载器
         loss_fn: 损失函数
         device: 计算设备
-        use_amp: 是否使用混合精度
-
     返回:
         StepStats：包含评估统计信息
     """
     model.eval()
-    total_loss = 0.0
-    total_aux_loss = 0.0
-    n = correct1 = correct5 = correct10 = 0
-    rare_correct1 = rare_total = 0
-    gate_sum = 0.0
-    gate_count = 0
-    class_correct1: np.ndarray | None = None
-    class_total: np.ndarray | None = None
+    total_loss = torch.zeros((), device=device)
+    correct1 = torch.zeros((), dtype=torch.int64, device=device)
+    correct5 = torch.zeros((), dtype=torch.int64, device=device)
+    rare_correct1 = torch.zeros((), dtype=torch.int64, device=device)
+    rare_total = torch.zeros((), dtype=torch.int64, device=device)
+    n = 0
+    rare_lookup: torch.Tensor | None = None
+    class_correct1: torch.Tensor | None = None
+    class_total: torch.Tensor | None = None
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -1022,80 +535,46 @@ def evaluate(
 
         with torch.amp.autocast(
             device_type=device.type,
-            enabled=use_amp,
-            dtype=amp_dtype,
+            enabled=device.type == "cuda",
+            dtype=torch.bfloat16,
         ):
             output = model(x)
-            loss, logits, aux_loss, _contrastive_loss = loss_with_auxiliary(
-                output,
-                y,
-                loss_fn,
-                aux_weights=aux_loss_weights,
-                hierarchical_aux_weight=hierarchical_aux_weight,
-                hierarchical_consistency_weight=hierarchical_consistency_weight,
-                hierarchical_expert_weight=hierarchical_expert_weight,
-            )
-            if isinstance(output, dict) and "crystal_logits" in output:
-                logits = apply_hierarchical_mask(
-                    logits,
-                    output["crystal_logits"],
-                    mode=hierarchical_mask_mode,
-                )
+            logits = primary_logits(output)
+            loss = loss_fn(logits, y)
 
         bsz = y.size(0)
-        total_loss += float(loss.item()) * bsz
-        total_aux_loss += float(aux_loss.item()) * bsz
+        total_loss += loss.float() * bsz
         n += bsz
-        correct1 += _accuracy_topk(logits, y, k=1)
-        correct5 += _accuracy_topk(logits, y, k=5)
-        correct10 += _accuracy_topk(logits, y, k=10)
-
-        pred = logits.argmax(dim=1)
+        top1_hits, top5_hits = _topk_hits(logits, y)
+        correct1 += top1_hits.sum()
+        correct5 += top5_hits.sum()
         num_classes = logits.shape[1]
         if class_total is None:
-            class_total = np.zeros(num_classes, dtype=np.int64)
-            class_correct1 = np.zeros(num_classes, dtype=np.int64)
-        y_cpu = y.detach().cpu()
-        pred_cpu = pred.detach().cpu()
-        class_total += np.bincount(y_cpu.numpy(), minlength=num_classes)
-        correct_mask = pred_cpu == y_cpu
-        class_correct1 += np.bincount(
-            y_cpu[correct_mask].numpy(),
-            minlength=num_classes,
-        )
+            class_total = torch.zeros(num_classes, dtype=torch.int64, device=device)
+            class_correct1 = torch.zeros(num_classes, dtype=torch.int64, device=device)
+        class_total += torch.bincount(y, minlength=num_classes)
+        class_correct1 += torch.bincount(y[top1_hits], minlength=num_classes)
         if rare_classes:
-            rare_mask = np.isin(y_cpu.numpy(), list(rare_classes))
-            rare_total += int(rare_mask.sum())
-            if rare_mask.any():
-                rare_correct1 += int((pred_cpu.numpy()[rare_mask] == y_cpu.numpy()[rare_mask]).sum())
-
-        gate_mean = output_gate_mean(output)
-        if gate_mean is not None:
-            gate_sum += float(gate_mean.float().sum().item())
-            gate_count += int(gate_mean.numel())
+            if rare_lookup is None:
+                rare_lookup = torch.zeros(
+                    num_classes,
+                    dtype=torch.bool,
+                    device=y.device,
+                )
+                rare_lookup[list(rare_classes)] = True
+            rare_mask = rare_lookup[y]
+            rare_total += rare_mask.sum()
+            rare_correct1 += top1_hits[rare_mask].sum()
 
     return StepStats(
-        loss=total_loss / max(n, 1),
+        loss=float(total_loss.item()) / max(n, 1),
         n=n,
-        correct_top1=correct1,
-        correct_top5=correct5,
-        correct_top10=correct10,
-        class_correct_top1=class_correct1,
-        class_total=class_total,
-        aux_loss=total_aux_loss / max(n, 1),
-        gate_mean=(gate_sum / gate_count) if gate_count else None,
-        rare_correct_top1=rare_correct1 if rare_classes else None,
-        rare_total=rare_total if rare_classes else None,
+        correct_top1=int(correct1.item()),
+        correct_top5=int(correct5.item()),
+        class_correct_top1=(
+            class_correct1.cpu().numpy() if class_correct1 is not None else None
+        ),
+        class_total=class_total.cpu().numpy() if class_total is not None else None,
+        rare_correct_top1=int(rare_correct1.item()) if rare_classes else None,
+        rare_total=int(rare_total.item()) if rare_classes else None,
     )
-
-
-__all__ = [
-    "configure_backend", "amp_dtype_from_config",
-    "FocalLoss", "AsymmetricLoss", "LDAMLoss", "build_loss", "build_loss_from_config",
-    "StepStats", "primary_logits", "loss_with_auxiliary",
-    "supervised_contrastive_config", "supervised_contrastive_loss",
-    "hierarchical_config", "space_group_to_crystal_system",
-    "apply_hierarchical_mask", "rare_classes_from_counts",
-    "aux_loss_weights_from_model",
-    "train_one_epoch", "evaluate",
-]

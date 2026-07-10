@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import re
 import sys
 import time
 from pathlib import Path
@@ -24,18 +23,13 @@ from src.models import (
     BiGRUPatchClassifier,
     ConvNeXt1D,
     DualPlaneMambaClassifier,
-    DualRangePXRDClassifier,
-    MLPClassifier,
     PatchTSTClassifier,
     ResNet1D,
 )
 from src.training import (
-    amp_dtype_from_config,
-    aux_loss_weights_from_model,
     build_loss_from_config,
     configure_backend,
     evaluate,
-    hierarchical_config,
     rare_classes_from_counts,
     supervised_contrastive_config,
     train_one_epoch,
@@ -58,19 +52,10 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
         ValueError: 当模型名称未知时抛出
     """
     name = cfg["model"]["name"].lower()
-    if name == "mlp":
-        return MLPClassifier(in_dim=in_dim, num_classes=num_classes,
-                             **cfg["model"].get("mlp", {}))
     if name == "resnet1d":
         return ResNet1D(num_classes=num_classes, **cfg["model"].get("resnet1d", {}))
     if name == "convnext1d":
         return ConvNeXt1D(num_classes=num_classes, **cfg["model"].get("convnext1d", {}))
-    if name == "dual_range":
-        return DualRangePXRDClassifier(
-            in_dim=in_dim,
-            num_classes=num_classes,
-            **cfg["model"].get("dual_range", {}),
-        )
     if name == "dual_plane_mamba":
         return DualPlaneMambaClassifier(
             in_dim=in_dim,
@@ -92,7 +77,13 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
     raise ValueError(f"unknown model: {name!r}")
 
 
-def cosine_lr(step: int, warmup: int, total: int, base_lr: float) -> float:
+def cosine_lr(
+    step: int,
+    warmup: int,
+    total: int,
+    base_lr: float,
+    min_lr: float = 0.0,
+) -> float:
     """余弦退火学习率调度器。
 
     参数:
@@ -100,6 +91,7 @@ def cosine_lr(step: int, warmup: int, total: int, base_lr: float) -> float:
         warmup: 预热阶段的 epoch 数
         total: 总训练 epoch 数
         base_lr: 基础学习率
+        min_lr: 余弦退火阶段的最低学习率
 
     返回:
         当前步的学习率值
@@ -107,12 +99,16 @@ def cosine_lr(step: int, warmup: int, total: int, base_lr: float) -> float:
     说明:
         - 在预热阶段，学习率从很小的值线性增加到 base_lr
         - 预热结束后，使用余弦退火公式逐渐降低学习率
-        - 余弦公式: lr = base_lr * 0.5 * (1 + cos(pi * progress))
+        - 余弦公式在 base_lr 和 min_lr 之间插值
     """
+    if min_lr < 0 or min_lr > base_lr:
+        raise ValueError("scheduler.min_lr must be between 0 and optim.lr")
     if step < warmup:
         return base_lr * (step + 1) / max(warmup, 1)
     progress = (step - warmup) / max(total - warmup, 1)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
 
 
 def build_balanced_sampler(
@@ -187,11 +183,9 @@ def metric_value(
         "train_loss": train_stats.loss,
         "train_acc1": train_stats.acc1,
         "train_acc5": train_stats.acc5,
-        "train_acc10": train_stats.acc10,
         "val_loss": val_stats.loss,
         "val_acc1": val_stats.acc1,
         "val_acc5": val_stats.acc5,
-        "val_acc10": val_stats.acc10,
         "val_macro_acc1": val_stats.macro_acc1,
         "val_rare_acc1": val_stats.rare_acc1,
         "val_balanced_acc1_macro": balanced_acc1_macro,
@@ -202,11 +196,6 @@ def metric_value(
             f"choose one of {sorted(metrics)}"
         )
     return metrics[monitor]
-
-
-def _wandb_artifact_name(name: str) -> str:
-    """Make a conservative W&B artifact name from an experiment/run name."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-") or "checkpoint"
 
 
 def init_wandb(cfg: dict, run_dir: Path):
@@ -249,99 +238,19 @@ def init_wandb(cfg: dict, run_dir: Path):
 def build_optimizer(
     cfg: dict,
     params,
-    *,
-    optim_override: dict | None = None,
 ) -> torch.optim.Optimizer:
-    """Build the optimizer selected by config."""
-    optim_cfg = dict(cfg.get("optim", {}))
-    if optim_override:
-        optim_cfg.update(optim_override)
+    """Build the AdamW optimizer used by all retained configs."""
+    optim_cfg = cfg.get("optim", {})
     name = optim_cfg.get("name", "adamw").lower()
-    lr = float(optim_cfg["lr"])
-    weight_decay = float(optim_cfg.get("weight_decay", 0.0))
-
-    if name == "adamw":
-        return torch.optim.AdamW(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
-            eps=float(optim_cfg.get("eps", 1e-8)),
-        )
-    if name == "adam":
-        return torch.optim.Adam(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
-            eps=float(optim_cfg.get("eps", 1e-8)),
-        )
-    if name == "sgd":
-        return torch.optim.SGD(
-            params,
-            lr=lr,
-            momentum=float(optim_cfg.get("momentum", 0.9)),
-            weight_decay=weight_decay,
-            nesterov=bool(optim_cfg.get("nesterov", False)),
-        )
-    raise ValueError(f"unknown optimizer: {name!r}")
-
-
-def _as_name_list(value, *, default: list[str]) -> list[str]:
-    """Normalize a config value into a list of module names."""
-    if value is None:
-        return list(default)
-    if isinstance(value, str):
-        return [value]
-    return [str(v) for v in value]
-
-
-def reset_named_modules(model: torch.nn.Module, module_names: list[str]) -> list[str]:
-    """Reset modules that expose reset_parameters, returning names found."""
-    reset_names: list[str] = []
-    for name in module_names:
-        module = getattr(model, name, None)
-        if module is None:
-            continue
-        for child in module.modules():
-            reset = getattr(child, "reset_parameters", None)
-            if callable(reset):
-                reset()
-        reset_names.append(name)
-    return reset_names
-
-
-def set_trainable_named_modules(
-    model: torch.nn.Module,
-    module_names: list[str],
-) -> tuple[list[str], list[torch.nn.Parameter]]:
-    """Freeze all parameters except those belonging to named modules."""
-    for param in model.parameters():
-        param.requires_grad_(False)
-
-    trainable_names: list[str] = []
-    trainable_params: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-    for name in module_names:
-        module = getattr(model, name, None)
-        if module is None:
-            continue
-        module_params = list(module.parameters())
-        if not module_params:
-            continue
-        for param in module_params:
-            param.requires_grad_(True)
-            if id(param) not in seen:
-                seen.add(id(param))
-                trainable_params.append(param)
-        trainable_names.append(name)
-
-    if not trainable_params:
-        raise ValueError(
-            "cRT requested but none of the requested head modules have "
-            f"parameters: {module_names}"
-        )
-    return trainable_names, trainable_params
+    if name != "adamw":
+        raise ValueError(f"unsupported optimizer: {name!r}; expected 'adamw'")
+    return torch.optim.AdamW(
+        params,
+        lr=float(optim_cfg["lr"]),
+        weight_decay=float(optim_cfg.get("weight_decay", 0.0)),
+        betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
+        eps=float(optim_cfg.get("eps", 1e-8)),
+    )
 
 
 def main():
@@ -446,9 +355,6 @@ def main():
         print(f"  WA mixer backend: {model.wa_branch.actual_mamba_backend}")
 
     raw_model = model
-    aux_loss_weights = aux_loss_weights_from_model(raw_model)
-    if aux_loss_weights:
-        print(f"Aux losses: {aux_loss_weights}")
     if cfg.get("performance", {}).get("compile", False) and device.type == "cuda":
         compile_mode = cfg.get("performance", {}).get("compile_mode", "default")
         model = torch.compile(raw_model, mode=compile_mode)
@@ -467,32 +373,14 @@ def main():
     # ========== 优化器和学习率调度器 ==========
     optimizer = build_optimizer(cfg, raw_model.parameters())
     print(f"Optimizer: {cfg.get('optim', {}).get('name', 'adamw')}")
-    # 混合精度训练（AMP）：减少显存占用并加速训练
-    use_amp = cfg["train"].get("amp", True) and device.type == "cuda"
-    amp_dtype = amp_dtype_from_config(cfg["train"].get("amp_dtype", "float16"), device)
-    use_scaler = use_amp and amp_dtype == torch.float16
-    scaler = torch.amp.GradScaler(enabled=use_scaler) if use_scaler else None
-    print(f"AMP: enabled={use_amp} dtype={amp_dtype} scaler={use_scaler}")
+    print(f"AMP: enabled={device.type == 'cuda'} dtype=torch.bfloat16")
 
     epochs = cfg["train"]["epochs"]                              # 训练轮数
     warmup_epochs = cfg.get("scheduler", {}).get("warmup_epochs", 0)  # 预热轮数
-    phase_name = "main"
-    phase_start_epoch = 0
-    phase_total_epochs = epochs
-    phase_warmup_epochs = warmup_epochs
-    phase_base_lr = float(cfg["optim"]["lr"])
-    freeze_batch_norm = False
-    crt_trainable_modules: list[str] = []
+    base_lr = float(cfg["optim"]["lr"])
+    min_lr = float(cfg.get("scheduler", {}).get("min_lr", 0.0))
 
     loss_cfg = cfg.get("loss", {})
-    (
-        hierarchical_aux_weight,
-        hierarchical_consistency_weight,
-        hierarchical_expert_weight,
-    ) = hierarchical_config(loss_cfg)
-    hierarchical_mask_mode = str(
-        (loss_cfg.get("hierarchical", {}) or {}).get("inference_mask", "none")
-    )
     ldam_drw_start_epoch = loss_cfg.get("ldam_drw_start_epoch")
     if ldam_drw_start_epoch is not None:
         ldam_drw_start_epoch = int(ldam_drw_start_epoch)
@@ -506,36 +394,17 @@ def main():
     elif ldam_drw_start_epoch is not None:
         raise ValueError("loss.ldam_drw_start_epoch is only valid for LDAM loss")
 
-    crt_cfg = cfg.get("train", {}).get("crt", {}) or {}
-    crt_enabled = bool(crt_cfg.get("enabled", False))
-    crt_active = False
-    crt_start_epoch = int(crt_cfg.get("start_epoch", epochs + 1))
-    if crt_enabled:
-        if crt_start_epoch <= 0:
-            raise ValueError("train.crt.start_epoch must be positive")
-        print(f"cRT: scheduled at epoch {crt_start_epoch}")
-
     # ========== W&B 日志记录设置 ==========
     run_name = cfg["experiment"]["name"]
     run_id = f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path("runs") / run_id
-    logging_cfg = cfg.get("logging", {})
     ckpt_dir = Path(cfg["checkpoint"]["out_dir"]) / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints: {ckpt_dir}")
 
     wandb_run = init_wandb(cfg, run_dir)
-    wandb_cfg = logging_cfg.get("wandb", {})
     if wandb_run is not None:
         print(f"W&B: {wandb_run.url}")
-        if wandb_cfg.get("watch_model", False):
-            import wandb
-
-            wandb.watch(
-                raw_model,
-                log=wandb_cfg.get("watch_log", "gradients"),
-                log_freq=int(wandb_cfg.get("watch_log_freq", 100)),
-            )
 
     # ========== 训练循环 ==========
     best_score = -float("inf") if monitor_mode == "max" else float("inf")
@@ -566,74 +435,19 @@ def main():
             ldam_drw_active = True
             print(f"LDAM-DRW: enabled class weights at epoch {epoch_num}", flush=True)
 
-        if crt_enabled and not crt_active and epoch_num >= crt_start_epoch:
-            crt_active = True
-            phase_name = "crt"
-            phase_start_epoch = epoch
-            phase_total_epochs = max(epochs - epoch, 1)
-            phase_warmup_epochs = int(crt_cfg.get("warmup_epochs", 0))
-            freeze_batch_norm = bool(crt_cfg.get("freeze_batch_norm", True))
-            head_modules = _as_name_list(
-                crt_cfg.get("head_modules"),
-                default=["head", "sa_head", "wa_head"],
-            )
-            if bool(crt_cfg.get("reset_head", False)):
-                reset_names = reset_named_modules(raw_model, head_modules)
-                print(f"cRT: reset modules {reset_names}", flush=True)
-            crt_trainable_modules, crt_params = set_trainable_named_modules(
-                raw_model,
-                head_modules,
-            )
-            crt_optim_cfg = dict(crt_cfg.get("optim", {}))
-            phase_base_lr = float(crt_optim_cfg.get("lr", cfg["optim"]["lr"]))
-            optimizer = build_optimizer(
-                cfg,
-                crt_params,
-                optim_override=crt_optim_cfg,
-            )
-            crt_sampler_cfg = crt_cfg.get("sampler")
-            if crt_sampler_cfg:
-                crt_sampler_source = dict(cfg)
-                crt_sampler_source["sampler"] = crt_sampler_cfg
-                train_sampler = build_balanced_sampler(
-                    crt_sampler_source,
-                    labels_csv=labels_csv,
-                    train_rows=train_ds.rows,
-                    task=task,
-                    class_counts=class_counts,
-                )
-                train_loader = make_train_loader(train_sampler)
-                print(
-                    "cRT: sampler="
-                    f"{crt_sampler_cfg.get('name', 'none')} "
-                    f"power={crt_sampler_cfg.get('power', '')}",
-                    flush=True,
-                )
-            trainable_count = sum(p.numel() for p in crt_params)
-            if bool(crt_cfg.get("reset_best", True)):
-                best_score = -float("inf") if monitor_mode == "max" else float("inf")
-            epochs_without_improvement = 0
-            print(
-                "cRT: enabled head-only training "
-                f"modules={crt_trainable_modules} "
-                f"params={trainable_count:,} "
-                f"lr={phase_base_lr:.2e} "
-                f"reset_best={bool(crt_cfg.get('reset_best', True))}",
-                flush=True,
-            )
-
         # 更新学习率（使用余弦退火调度器）
         if cfg["scheduler"]["name"] == "cosine":
             lr = cosine_lr(
-                epoch - phase_start_epoch,
-                phase_warmup_epochs,
-                phase_total_epochs,
-                phase_base_lr,
+                epoch,
+                warmup_epochs,
+                epochs,
+                base_lr,
+                min_lr,
             )
             for g in optimizer.param_groups:
                 g["lr"] = lr
         else:
-            lr = phase_base_lr
+            lr = base_lr
 
         contrastive_weight, contrastive_temperature, contrastive_embedding_key = (
             supervised_contrastive_config(loss_cfg, epoch=epoch_num)
@@ -643,20 +457,11 @@ def main():
         # 训练一个 epoch
         train_stats = train_one_epoch(
             model, train_loader, optimizer, loss_fn, device,
-            scaler=scaler,
             grad_clip=cfg["train"].get("grad_clip", 1.0),  # 梯度裁剪阈值
-            log_every=cfg["train"].get("log_every", 100),  # 日志打印频率
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            aux_loss_weights=aux_loss_weights,
             contrastive_weight=contrastive_weight,
             contrastive_temperature=contrastive_temperature,
             contrastive_embedding_key=contrastive_embedding_key,
-            hierarchical_aux_weight=hierarchical_aux_weight,
-            hierarchical_consistency_weight=hierarchical_consistency_weight,
-            hierarchical_expert_weight=hierarchical_expert_weight,
             rare_classes=rare_classes,
-            freeze_batch_norm=freeze_batch_norm,
         )
         # 在验证集上评估
         val_stats = evaluate(
@@ -664,13 +469,6 @@ def main():
             val_loader,
             loss_fn,
             device,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            aux_loss_weights=aux_loss_weights,
-            hierarchical_aux_weight=hierarchical_aux_weight,
-            hierarchical_consistency_weight=hierarchical_consistency_weight,
-            hierarchical_expert_weight=hierarchical_expert_weight,
-            hierarchical_mask_mode=hierarchical_mask_mode,
             rare_classes=rare_classes,
         )
         dt = time.time() - t0
@@ -684,24 +482,19 @@ def main():
         )
         score = metric_value(train_stats, val_stats, monitor, cfg["checkpoint"])
         extra_parts = [
-            f"phase={phase_name}",
             f"drw={'on' if ldam_drw_active else 'off'}",
             f"rare={val_stats.rare_acc1:.4f}",
         ]
-        if val_stats.aux_loss:
-            extra_parts.append(f"aux={val_stats.aux_loss:.4f}")
         if train_stats.contrastive_loss:
             extra_parts.append(
                 f"supcon={train_stats.contrastive_loss:.4f}"
                 f"x{contrastive_weight:.3f}"
             )
-        if val_stats.gate_mean is not None:
-            extra_parts.append(f"gate={val_stats.gate_mean:.4f}")
         print(f"epoch {epoch+1:3d}/{epochs}  "
               f"lr={lr:.2e}  "
               f"train loss={train_stats.loss:.4f} acc1={train_stats.acc1:.4f}  "
               f"val loss={val_stats.loss:.4f} acc1={val_stats.acc1:.4f} "
-              f"acc5={val_stats.acc5:.4f} acc10={val_stats.acc10:.4f} "
+              f"acc5={val_stats.acc5:.4f} "
               f"macro={val_stats.macro_acc1:.4f} "
               f"{' '.join(extra_parts)} "
               f"balanced={balanced_score:.4f}  "
@@ -712,29 +505,21 @@ def main():
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1,
-                "phase": phase_name,
                 "ldam_drw": int(ldam_drw_active),
                 "lr": lr,
                 "train_loss": train_stats.loss,
                 "train_acc1": train_stats.acc1,
                 "train_acc5": train_stats.acc5,
-                "train_acc10": train_stats.acc10,
                 "train_contrastive_loss": train_stats.contrastive_loss,
                 "train_contrastive_weight": contrastive_weight,
                 "val_loss": val_stats.loss,
                 "val_acc1": val_stats.acc1,
                 "val_acc5": val_stats.acc5,
-                "val_acc10": val_stats.acc10,
                 "val_macro_acc1": val_stats.macro_acc1,
                 "val_rare_acc1": val_stats.rare_acc1,
-                "val_aux_loss": val_stats.aux_loss,
                 "val_balanced_acc1_macro": balanced_score,
                 "epoch_time_sec": dt,
-            } | (
-                {"val_gate_mean": val_stats.gate_mean}
-                if val_stats.gate_mean is not None
-                else {}
-            ), step=epoch + 1)
+            }, step=epoch + 1)
 
         min_delta = early_min_delta if early_enabled else 0.0
         if monitor_mode == "max":
@@ -753,12 +538,9 @@ def main():
                 wandb_run.summary[f"best_{monitor}"] = best_score
                 wandb_run.summary["best_val_acc1"] = val_stats.acc1
                 wandb_run.summary["best_val_acc5"] = val_stats.acc5
-                wandb_run.summary["best_val_acc10"] = val_stats.acc10
                 wandb_run.summary["best_val_macro_acc1"] = val_stats.macro_acc1
                 wandb_run.summary["best_val_rare_acc1"] = val_stats.rare_acc1
                 wandb_run.summary["best_val_balanced_acc1_macro"] = balanced_score
-                if val_stats.gate_mean is not None:
-                    wandb_run.summary["best_val_gate_mean"] = val_stats.gate_mean
 
             if cfg["checkpoint"].get("save_best", True):
                 best_path = ckpt_dir / "best.pt"
@@ -768,36 +550,16 @@ def main():
                     "config": cfg,
                     "val_acc1": val_stats.acc1,
                     "val_acc5": val_stats.acc5,
-                    "val_acc10": val_stats.acc10,
                     "val_macro_acc1": val_stats.macro_acc1,
                     "val_rare_acc1": val_stats.rare_acc1,
-                    "val_aux_loss": val_stats.aux_loss,
-                    "val_gate_mean": val_stats.gate_mean,
                     "val_balanced_acc1_macro": balanced_score,
                     "rare_classes": sorted(rare_classes),
                     "rare_max_train_count": rare_max_count,
                     "rare_min_train_count": rare_min_count,
                     "monitor": monitor,
                     "monitor_score": score,
-                    "phase": phase_name,
                     "ldam_drw_active": ldam_drw_active,
-                    "crt_trainable_modules": crt_trainable_modules,
                 }, best_path)
-
-                if wandb_run is not None and wandb_cfg.get("log_best_checkpoint", False):
-                    import wandb
-
-                    artifact = wandb.Artifact(
-                        name=_wandb_artifact_name(f"{run_dir.name}-best"),
-                        type="model",
-                        metadata={
-                            "epoch": epoch + 1,
-                            "monitor": monitor,
-                            "monitor_score": score,
-                        },
-                    )
-                    artifact.add_file(str(best_path))
-                    wandb_run.log_artifact(artifact)
         elif early_enabled and epoch + 1 >= early_start_epoch:
             epochs_without_improvement += 1
             if epochs_without_improvement >= early_patience:

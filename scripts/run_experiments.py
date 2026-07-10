@@ -1,8 +1,8 @@
 """Run a sequence of training/evaluation experiments and summarize results.
 
 Usage:
-    python3 scripts/run_experiments.py
-    python3 scripts/run_experiments.py --configs configs/experiments/e02_resnet_deep_label_smoothing.yaml
+    python3 scripts/run_experiments.py --configs configs/baselines/b02_resnet_deep.yaml
+    python3 scripts/run_experiments.py --configs configs/main/m01_mamba.yaml configs/mobile/mx01_lite.yaml
 """
 from __future__ import annotations
 
@@ -26,123 +26,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.utils import load_config
 
 
-DEFAULT_RESULTS = "experiments/dual_range_matrix/results.md"
-DEFAULT_LOGS_DIR = "experiments/dual_range_matrix/logs"
-MAIN_RESULTS = "experiments/main_results/results.md"
-MAIN_LOGS_DIR = "experiments/main_results/logs"
-CS_RESULTS = "experiments/cs_results/results.md"
-CS_LOGS_DIR = "experiments/cs_results/logs"
-PEAK_TOKEN_RESULTS = "experiments/peak_token/results.md"
-PEAK_TOKEN_LOGS_DIR = "experiments/peak_token/logs"
-
-DEFAULT_CONFIGS = [
-    "configs/experiments/e02_resnet_deep_label_smoothing.yaml",
-    "configs/experiments/e07_wa_only_resnet_label_smoothing.yaml",
-    "configs/experiments/e08_dual_concat_resnet.yaml",
-    "configs/experiments/e09_dual_gated_resnet.yaml",
-    "configs/experiments/e11_dual_gated_kan.yaml",
-    "configs/experiments/e14_sa_only_resnet_ablation.yaml",
-]
-
-MAIN_CONFIGS = [
-    "configs/main/m01_resnet1d_label_smoothing.yaml",
-    "configs/main/m02_dual_gated_resnet_label_smoothing.yaml",
-    "configs/main/m03_dual_gated_kan_label_smoothing.yaml",
-    "configs/main/m04_dual_gated_mamba_label_smoothing.yaml",
-    "configs/main/m05_dual_gated_mamba_kan_label_smoothing.yaml",
-    "configs/main/m08_dual_gated_mamba_kan_angle_label_smoothing.yaml",
-    "configs/main/m09_dual_gated_mamba_kan_relaxed_resnet_label_smoothing.yaml",
-    "configs/main/m06_dual_gated_resnet_ldam_drw.yaml",
-    "configs/main/m07_dual_gated_resnet_crt.yaml",
-    "configs/main/m11_dual_plane_resconv_label_smoothing.yaml",
-    "configs/main/m12_dual_plane_mamba_resconv_label_smoothing.yaml",
-    "configs/main/m13_dual_plane_mamba_kan_gate_label_smoothing.yaml",
-    "configs/main/m14_dual_plane_mamba_kan_gate_aux_label_smoothing.yaml",
-    "configs/main/m15_dual_plane_mamba_kan_gate_aux_supcon.yaml",
-    "configs/main/m16_dual_plane_mamba_kan_gate_aux_supcon_d64.yaml",
-    "configs/main/m17_wa_only_plane_mamba_kan_aux_supcon.yaml",
-    "configs/main/m18_single_plane_learned_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m19_single_plane_learned_downsample_mamba_d128_l8_kan_head_label_smoothing.yaml",
-    "configs/main/m20_single_plane_learned_downsample_bidirectional_mamba_d128_l8_kan_head_label_smoothing.yaml",
-    "configs/main/m21_single_plane_learned_downsample_mamba_d128_l8_efficient_kan_head_label_smoothing.yaml",
-    "configs/main/m22_single_plane_learned_downsample_mamba_d128_l8_ldam_drw.yaml",
-    "configs/main/m23_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon.yaml",
-    "configs/main/m25_single_plane_learned_downsample_mamba_d128_l8_hierarchical_crystal_aux.yaml",
-    "configs/main/m26_single_plane_learned_downsample_mamba_d128_l8_crystal_expert_heads.yaml",
-    "configs/main/m27_single_plane_learned_downsample_mamba2_d128_l8_label_smoothing.yaml",
-    "configs/main/m28_single_plane_learned_downsample_mamba_d128_l8_kan_proj_supcon_lr3e4.yaml",
-    "configs/main/m29_single_plane_learned_downsample_mamba_d128_l8_focal_gamma15.yaml",
-    "configs/main/m32_single_plane_learned_downsample_mamba_d128_l8_kan_residual_adapter_label_smoothing.yaml",
-    "configs/main/m33_single_plane_learned_downsample_mamba_d128_l8_mlp_kan_logit_residual_label_smoothing.yaml",
-    "configs/main/m38_single_plane_learned_downsample_mamba_token_kan_adapter_label_smoothing.yaml",
-    "configs/main/m39_single_plane_learned_downsample_mamba_local_kan_adapter_label_smoothing.yaml",
-    "configs/main/m40_single_plane_learned_downsample_mamba_angle_pos_label_smoothing.yaml",
-    "configs/main/m41_single_plane_learned_downsample_mamba_gated_pool_label_smoothing.yaml",
-    "configs/main/m42_dual_plane_sa_raw_wa_learned_downsample_mamba_label_smoothing.yaml",
-    "configs/main/m43_single_plane_convnext_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m46_single_plane_learned_downsample_mamba_d128_l8_wide_frontend_label_smoothing.yaml",
-    "configs/main/m47_single_plane_learned_downsample_mamba_d128_l8_gated_pool_label_smoothing.yaml",
-    "configs/main/m48_single_plane_learned_downsample_mamba_d128_l8_stride4_label_smoothing.yaml",
-    "configs/main/m49_single_plane_learned_downsample_mamba_d128_l10_label_smoothing.yaml",
-    "configs/main/m50_single_plane_learned_downsample_mamba_d192_l8_label_smoothing.yaml",
-    "configs/main/m51_single_plane_learned_downsample_mamba_d128_l8_dstate32_label_smoothing.yaml",
-    "configs/main/m52_single_plane_multiscale_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m53_single_plane_inception_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m54_single_plane_peak_aware_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m55_single_plane_wavelet_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m56_single_plane_antialiased_downsample_mamba_d128_l8_label_smoothing.yaml",
-    "configs/main/m57_mobilexrd_mamba_lite_d128_l8_label_smoothing.yaml",
-    "configs/main/m58_mobilexrd_mamba_wavelet_d128_l8_label_smoothing.yaml",
-    "configs/main/m59_mobilexrd_mamba_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m60_mobilexrd_mamba_wte_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m61_single_plane_learned_downsample_mamba2_d128_l8_stride4_batch64_label_smoothing.yaml",
-    "configs/main/m62_mobilexrd_mamba_wide_frontend_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m63_mobilexrd_mamba_d192_global128_local64_no_identity_l8_label_smoothing.yaml",
-    "configs/main/m64_mobilexrd_mamba_dstate64_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m65_mobilexrd_mamba_peak_kernel_blocks_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m67_mobilexrd_mamba_antialias_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m68_mobilexrd_mamba_multikernel_stem_global96_local32_no_identity_d128_l8_label_smoothing.yaml",
-    "configs/main/m45_resnet1d18_label_smoothing.yaml",
-]
-
-NON_MAMBA_CONFIGS = [
-    "configs/experiments/e02_resnet_deep_label_smoothing.yaml",
-    "configs/experiments/e07_wa_only_resnet_label_smoothing.yaml",
-    "configs/experiments/e14_sa_only_resnet_ablation.yaml",
-    "configs/experiments/e08_dual_concat_resnet.yaml",
-    "configs/experiments/e09_dual_gated_resnet.yaml",
-    "configs/experiments/e11_dual_gated_kan.yaml",
-]
-
-CS_CONFIGS = [
-    "configs/cs/c01_resnet1d_crystal_label_smoothing.yaml",
-]
-
-PEAK_TOKEN_CONFIGS = [
-    "configs/main/m34_single_plane_learned_downsample_mamba_peak_mamba_label_smoothing.yaml",
-    "configs/main/m35_single_plane_learned_downsample_mamba_peak_pool_label_smoothing.yaml",
-]
-
-CONFIG_PRESETS = {
-    "cs": CS_CONFIGS,
-    "full": DEFAULT_CONFIGS,
-    "main": MAIN_CONFIGS,
-    "non_mamba": NON_MAMBA_CONFIGS,
-    "peak_token": PEAK_TOKEN_CONFIGS,
-}
+DEFAULT_RESULTS = "experiments/results.md"
+DEFAULT_LOGS_DIR = "runs/experiment_logs"
 
 TEST_RE = re.compile(
     r"Test loss=(?P<loss>[0-9.]+)\s+"
     r"acc1=(?P<acc1>[0-9.]+)\s+"
     r"acc5=(?P<acc5>[0-9.]+)\s+"
-    r"(?:acc10=(?P<acc10>[0-9.]+)\s+)?"
-    r"(?:macro=(?P<macro>[0-9.]+)\s+)?"
-    r"(?:macro_f1=(?P<macro_f1>[0-9.]+)\s+)?"
-    r"(?:rare=(?P<rare>[0-9.]+|nan)\s+)?"
+    r"macro_f1=(?P<macro_f1>[0-9.]+)\s+"
     r"(?:rare_acc1=(?P<rare_acc1>[0-9.]+|nan)\s+)?"
-    r"(?:aux=(?P<aux>[0-9.]+|nan)\s+)?"
-    r"(?:gate=(?P<gate>[0-9.]+|nan)\s+)?"
-    r"(?:crystal_acc1=(?P<crystal_acc1>[0-9.]+|nan)\s+)?"
     r"\(N=(?P<n>[0-9]+)\)"
 )
 
@@ -151,6 +43,7 @@ RESULT_COLUMNS = [
     "test_acc1",
     "test_acc5",
     "test_macro_f1",
+    "test_rare_acc1",
 ]
 
 def run_and_log(cmd: list[str], log_path: Path, env: dict[str, str]) -> str:
@@ -250,8 +143,6 @@ def normalize_result_row(row: dict[str, str]) -> dict[str, str]:
     for key, value in row.items():
         if key in RESULT_COLUMNS:
             normalized[key] = "" if value is None else str(value)
-    if "experiment" in normalized and normalized["experiment"]:
-        normalized["experiment"] = normalized["experiment"].split("_")[0]
     return {column: normalized.get(column, "") for column in RESULT_COLUMNS}
 
 
@@ -410,16 +301,11 @@ def summarize_config(cfg: dict) -> dict[str, str]:
 def mamba_layers_requested(cfg: dict) -> int:
     """Return total branch Mamba layers requested by a config."""
     model_name = cfg.get("model", {}).get("name", "").lower()
-    if model_name not in {"dual_range", "dual_plane_mamba"}:
+    if model_name != "dual_plane_mamba":
         return 0
     model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
     mamba_cfg = model_cfg.get("mamba", {}) or {}
-    layers = int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
-    peak_cfg = model_cfg.get("peak_branch", {}) or {}
-    if peak_cfg.get("enabled", False) and str(peak_cfg.get("encoder", "mamba")).lower() == "mamba":
-        peak_mamba_cfg = peak_cfg.get("mamba", {}) or {}
-        layers += int(peak_mamba_cfg.get("layers", peak_cfg.get("mamba_layers", 2)))
-    return layers
+    return int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
 
 
 def mamba_ssm_import_error(backend: str = "mamba_ssm") -> str | None:
@@ -472,33 +358,21 @@ def metrics_row(
             "test_acc1": format_metric(metrics.get("acc1")),
             "test_acc5": format_metric(metrics.get("acc5")),
             "test_macro_f1": format_metric(metrics.get("macro_f1")),
+            "test_rare_acc1": format_metric(metrics.get("rare_acc1")),
         }
     return {
         "test_acc1": fallback.get("acc1") or "",
         "test_acc5": fallback.get("acc5") or "",
         "test_macro_f1": fallback.get("macro_f1") or "",
+        "test_rare_acc1": fallback.get("rare_acc1") or "",
     }
 
 
-def resolve_config_paths(
-    preset: str | None,
-    configs: list[str] | None,
-) -> list[str]:
-    """Resolve config paths from a preset and/or explicit paths.
-
-    With no CLI selection, run the full matrix. With --configs alone, run only
-    those explicit paths. With --preset plus --configs, append the explicit paths
-    after the selected preset.
-    """
-    if preset is None:
-        selected = list(configs) if configs is not None else list(CONFIG_PRESETS["full"])
-    else:
-        selected = list(CONFIG_PRESETS[preset])
-        if configs:
-            selected.extend(configs)
+def resolve_config_paths(configs: list[str]) -> list[str]:
+    """Deduplicate explicit config paths while preserving their order."""
     deduped: list[str] = []
     seen: set[str] = set()
-    for path in selected:
+    for path in configs:
         if path in seen:
             continue
         seen.add(path)
@@ -507,44 +381,25 @@ def resolve_config_paths(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run PXRD experiment matrix")
-    ap.add_argument(
-        "--preset",
-        choices=sorted(CONFIG_PRESETS),
-        default=None,
-        help=(
-            "Named config group. Omit both --preset and --configs to run full. "
-            "Use main for the unified main-result configs, or cs for "
-            "crystal-system classifiers. Use peak_token for the compressed "
-            "peak-branch validation pair."
-        ),
-    )
+    ap = argparse.ArgumentParser(description="Run selected PXRD experiments")
     ap.add_argument(
         "--configs",
-        nargs="*",
-        default=None,
-        help=(
-            "Explicit config paths. Used alone, this runs only the listed paths; "
-            "with --preset, they are appended after that preset."
-        ),
+        nargs="+",
+        required=True,
+        help="One or more config paths to run in the given order.",
     )
     ap.add_argument(
         "--results",
-        default=None,
+        default=DEFAULT_RESULTS,
         help=(
-            "Result Markdown path. Defaults to main_results for --preset main, "
-            "cs_results for --preset cs, peak_token for --preset peak_token, "
-            "else dual_range_matrix. Legacy .csv paths are mapped to .md."
+            f"Result Markdown path (default: {DEFAULT_RESULTS}). "
+            "Legacy .csv paths are mapped to .md."
         ),
     )
     ap.add_argument(
         "--logs-dir",
-        default=None,
-        help=(
-            "Log directory. Defaults to main_results for --preset main, "
-            "cs_results for --preset cs, peak_token for --preset peak_token, "
-            "else dual_range_matrix."
-        ),
+        default=DEFAULT_LOGS_DIR,
+        help=f"Log directory (default: {DEFAULT_LOGS_DIR}).",
     )
     ap.add_argument(
         "--skip-train",
@@ -579,34 +434,14 @@ def main() -> None:
         action="store_true",
         help="Forward to evaluate.py --no-pin-memory.",
     )
-    ap.add_argument(
-        "--eval-skip-occlusion",
-        action="store_true",
-        help="Forward to evaluate.py --skip-occlusion.",
-    )
     args = ap.parse_args()
 
     env = os.environ.copy()
     env.setdefault("WANDB_DIR", str(PROJECT_ROOT / "wandb"))
 
-    if args.preset == "main":
-        default_results = MAIN_RESULTS
-        default_logs_dir = MAIN_LOGS_DIR
-    elif args.preset == "cs":
-        default_results = CS_RESULTS
-        default_logs_dir = CS_LOGS_DIR
-    elif args.preset == "peak_token":
-        default_results = PEAK_TOKEN_RESULTS
-        default_logs_dir = PEAK_TOKEN_LOGS_DIR
-    else:
-        default_results = DEFAULT_RESULTS
-        default_logs_dir = DEFAULT_LOGS_DIR
-    results_arg = args.results or default_results
-    logs_dir_arg = args.logs_dir or default_logs_dir
-
-    results_path = normalize_results_path(Path(results_arg))
+    results_path = normalize_results_path(Path(args.results))
     rows: list[dict[str, str]] = load_existing_results(results_path)
-    for config_path_str in resolve_config_paths(args.preset, args.configs):
+    for config_path_str in resolve_config_paths(args.configs):
         config_path = Path(config_path_str)
         cfg = load_config(config_path)
         validate_mamba_backend(cfg)
@@ -615,7 +450,7 @@ def main() -> None:
         started_at = time.time()
 
         if not args.skip_train:
-            train_log = Path(logs_dir_arg) / f"{run_name}.train.log"
+            train_log = Path(args.logs_dir) / f"{run_name}.train.log"
             run_and_log(
                 [sys.executable, "scripts/train.py", "--config", str(config_path)],
                 train_log,
@@ -625,7 +460,7 @@ def main() -> None:
         else:
             best_path = newest_checkpoint(run_name, 0.0)
 
-        eval_log = Path(logs_dir_arg) / f"{run_name}.eval.log"
+        eval_log = Path(args.logs_dir) / f"{run_name}.eval.log"
         eval_cmd = [sys.executable, "scripts/evaluate.py", "--checkpoint", str(best_path)]
         eval_plot_dir = None
         if args.eval_plot_dir_root is not None:
@@ -642,8 +477,6 @@ def main() -> None:
             eval_cmd.extend(["--num-workers", str(args.eval_num_workers)])
         if args.eval_no_pin_memory:
             eval_cmd.append("--no-pin-memory")
-        if args.eval_skip_occlusion:
-            eval_cmd.append("--skip-occlusion")
         eval_output = run_and_log(
             eval_cmd,
             eval_log,

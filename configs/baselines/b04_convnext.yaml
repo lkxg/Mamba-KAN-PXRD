@@ -1,0 +1,88 @@
+experiment:
+  name: b04_convnext
+  seed: 42
+
+data:
+  root: dataset
+  splits_csv: splits/splits.csv
+  task: space_group
+  batch_size: 512
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+
+model:
+  name: convnext1d
+  convnext1d:
+    base_channels: 64
+    depths: [3, 3, 9, 3]
+    kernel_size: 7
+    expansion: 4
+    layer_scale_init: 1.0e-6
+    block_dropout: 0.0
+    head_dropout: 0.0
+
+optim:
+  name: adamw
+  lr: 1.0e-3
+  weight_decay: 5.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_epochs: 20
+
+train:
+  epochs: 120
+  grad_clip: 1.0
+  drop_last: true
+
+early_stopping:
+  enabled: true
+  patience: 10
+  min_delta: 0.0
+  start_epoch: 60
+
+logging:
+  wandb:
+    enabled: true
+    project: mamba-kan-pxrd
+    entity: null
+    mode: online
+    group: main_results
+    job_type: train
+    tags: [h100, b04_convnext, convnext1d, label-smoothing, main]
+    notes: >
+      b01_resnet-controlled ConvNeXt1D baseline. Replaces the ResNet1D backbone with
+      a standard 1D ConvNeXt stem/downsampling layout and ConvNeXt blocks while
+      keeping label smoothing CE, optimizer, schedule, and early stopping
+      matched to b01_resnet.
+    dir: wandb
+    save_code: true
+
+loss:
+  name: label_smoothing
+  label_smoothing: 0.05
+
+sampler:
+  name: none
+
+metrics:
+  rare_min_train_count: 1
+  rare_max_train_count: 100
+
+performance:
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  compile: false
+  compile_mode: default
+
+checkpoint:
+  out_dir: checkpoints
+  save_best: true
+  monitor: val_balanced_acc1_macro
+  mode: max
+  balanced_metric:
+    acc1_weight: 0.5
+    macro_acc1_weight: 0.5

@@ -20,7 +20,7 @@
 
 1. 提出了首个将 Mamba 与 KAN 结合用于 PXRD 分类的深度学习框架
 2. 提供了处理严重类别不平衡问题的分层划分策略
-3. 构建了 MLP、ResNet1D 基准模型与 Mamba-KAN 混合模型的性能对比
+3. 构建了保留的 CNN、RNN、Transformer 基准与 Mamba-KAN 混合模型的性能对比
 4. 开源了数据预处理、模型训练和评估的完整代码
 
 ---
@@ -56,13 +56,9 @@
 
 ### 基准模型
 
-为公平对比，我们实现了以下基准模型：
+为公平对比，我们保留了 ResNet1D、ConvNeXt1D、BiGRU-patch 和 PatchTST-style 基准。
 
-**1. MLP 分类器**
-- 结构：Input(10824) → Linear(1024) → GELU → Dropout → Linear(512) → GELU → Dropout → Linear(230)
-- 特点：简单高效，适合作为基线
-
-**2. ResNet1D**
+**ResNet1D**
 - 结构：Stem(Conv1D + BN + GELU + MaxPool) → 4 stages × 2 ResBlocks → AdaptiveAvgPool → Linear
 - 特点：残差连接缓解梯度消失，适合长序列
 
@@ -72,7 +68,7 @@
 - **优化器**：AdamW (lr=1e-3, weight_decay=1e-4)
 - **学习率调度**：余弦退火 + 预热
 - **正则化**：Label Smoothing, Dropout, 梯度裁剪
-- **混合精度**：FP16/BF16 训练
+- **混合精度**：CUDA 上使用 BF16
 
 ---
 
@@ -120,7 +116,7 @@
 | GPU | RTX 3090/4090 (16GB VRAM) |
 | Batch Size | 128 |
 | Epochs | 20 |
-| 混合精度 | FP16 |
+| 混合精度 | BF16 |
 
 ### 可复现性
 
@@ -134,14 +130,14 @@ python analysis/preprocess.py
 # 3. 生成分划分
 python make_splits.py
 
-# 4. 基准模型训练（ResNet1D / MLP）
-python train.py --config configs/default.yaml
+# 4. 训练默认 ResNet1D 基准
+python3 scripts/train.py --config configs/default.yaml
 
 # 5. Mamba-KAN 模型训练
-python train.py --config configs/mamba_kan.yaml
+python3 scripts/train.py --config configs/main/m01_mamba.yaml
 
 # 6. 模型评估
-python evaluate.py --checkpoint checkpoints/<run>/best.pt
+python3 scripts/evaluate.py --checkpoint checkpoints/<run>/best.pt
 ```
 
 ---
