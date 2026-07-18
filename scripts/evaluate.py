@@ -39,6 +39,7 @@ from src.models import (
     DualPlaneMambaClassifier,
     PatchTSTClassifier,
     ResNet1D,
+    XRDCTMClassifier,
 )
 from src.training import (
     StepStats,
@@ -62,6 +63,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
             in_dim=in_dim,
             num_classes=num_classes,
             **cfg["model"].get("dual_plane_mamba", {}),
+        )
+    if name == "xrd_ctm":
+        return XRDCTMClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("xrd_ctm", {}),
         )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(
@@ -97,7 +104,7 @@ def evaluate_with_predictions(
     device: torch.device,
     *,
     rare_classes: set[int] | None = None,
-) -> tuple[StepStats, np.ndarray, np.ndarray]:
+) -> tuple[StepStats, np.ndarray, np.ndarray, dict[str, list[float]]]:
     """Evaluate once while retaining labels needed for F1 and confusion matrix."""
     model.eval()
     total_loss = 0.0
@@ -111,6 +118,9 @@ def evaluate_with_predictions(
     class_total: np.ndarray | None = None
     y_true_parts: list[np.ndarray] = []
     y_pred_parts: list[np.ndarray] = []
+    gate_sum: torch.Tensor | None = None
+    quality_sum: torch.Tensor | None = None
+    diagnostic_n = 0
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -121,8 +131,24 @@ def evaluate_with_predictions(
             enabled=device.type == "cuda",
             dtype=torch.bfloat16,
         ):
-            logits = primary_logits(model(x))
+            output = model(x)
+            logits = primary_logits(output)
             loss = loss_fn(logits, y)
+            if isinstance(output, dict) and isinstance(
+                output.get("gate_weights"), torch.Tensor
+            ):
+                gate = output["gate_weights"].detach().float()
+                quality = output.get("quality")
+                gate_batch = gate.sum(dim=0).cpu()
+                gate_sum = gate_batch if gate_sum is None else gate_sum + gate_batch
+                if isinstance(quality, torch.Tensor):
+                    quality_batch = quality.detach().float().sum(dim=0).cpu()
+                    quality_sum = (
+                        quality_batch
+                        if quality_sum is None
+                        else quality_sum + quality_batch
+                    )
+                diagnostic_n += int(gate.shape[0])
 
         bsz = y.size(0)
         num_classes = logits.shape[1]
@@ -184,7 +210,12 @@ def evaluate_with_predictions(
         rare_correct_top1=rare_correct1 if rare_classes else None,
         rare_total=rare_total if rare_classes else None,
     )
-    return stats, y_true, y_pred
+    diagnostics: dict[str, list[float]] = {}
+    if gate_sum is not None and diagnostic_n > 0:
+        diagnostics["gate_mean"] = (gate_sum / diagnostic_n).tolist()
+    if quality_sum is not None and diagnostic_n > 0:
+        diagnostics["quality_mean"] = (quality_sum / diagnostic_n).tolist()
+    return stats, y_true, y_pred, diagnostics
 
 
 def save_normalized_confusion_matrix(
@@ -417,6 +448,10 @@ def main() -> None:
     if hasattr(model, "wa_branch") and model.wa_branch is not None:
         wa_mamba_backend = str(model.wa_branch.actual_mamba_backend)
         print(f"  WA mixer backend: {wa_mamba_backend}")
+    xrd_ctm_mamba_backend = ""
+    if hasattr(model, "actual_mamba_backend"):
+        xrd_ctm_mamba_backend = str(model.actual_mamba_backend)
+        print(f"  XRD-CTM Mamba backend: {xrd_ctm_mamba_backend}")
 
     print(
         f"Rare classes: {len(rare_classes)} "
@@ -435,7 +470,7 @@ def main() -> None:
         loss_fn.set_class_weights(enabled)
         print(f"LDAM-DRW eval weights: {enabled}")
 
-    stats, y_true, y_pred = evaluate_with_predictions(
+    stats, y_true, y_pred, model_diagnostics = evaluate_with_predictions(
         model,
         eval_loader,
         loss_fn,
@@ -487,6 +522,9 @@ def main() -> None:
         metrics["only_rare"] = True
     if wa_mamba_backend:
         metrics["wa_mamba_backend"] = wa_mamba_backend
+    if xrd_ctm_mamba_backend:
+        metrics["xrd_ctm_mamba_backend"] = xrd_ctm_mamba_backend
+    metrics.update(model_diagnostics)
     if stats.rare_total:
         metrics["rare_acc1"] = float(stats.rare_acc1)
         metrics["rare_total"] = int(stats.rare_total)

@@ -60,6 +60,9 @@ Evaluate an old checkpoint by passing its path directly to `scripts/evaluate.py`
 | `mobile/mx08_peak_blocks.yaml` | `m65` | Peak kernels and deeper frontend |
 | `mobile/mx09_antialias.yaml` | `m67` | Anti-aliased MobileXRD frontend |
 | `mobile/mx10_multikernel.yaml` | `m68` | Multi-kernel MobileXRD stem |
+| `mobile/mx11_physaug.yaml` | — | Symmetry-preserving PXRD augmentation on mx03 |
+| `mobile/mx12_la_physaug.yaml` | — | PeakSet gated fusion + logit-adjusted CE (augmentation disabled in the initial control) |
+| `mobile/mx13_xrd_ctm.yaml` | — | Full clean XRD-CTM with CNN, unidirectional Mamba, and peak/gap Transformer |
 
 Run selected configs explicitly:
 

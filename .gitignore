@@ -2,6 +2,7 @@
 dataset/*.npy
 dataset/*.npz
 Structures/
+splits/
 papers/
 mypapers/
 

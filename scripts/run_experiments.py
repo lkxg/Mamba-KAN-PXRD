@@ -301,11 +301,17 @@ def summarize_config(cfg: dict) -> dict[str, str]:
 def mamba_layers_requested(cfg: dict) -> int:
     """Return total branch Mamba layers requested by a config."""
     model_name = cfg.get("model", {}).get("name", "").lower()
-    if model_name != "dual_plane_mamba":
-        return 0
     model_cfg = cfg.get("model", {}).get(model_name, {}) or {}
     mamba_cfg = model_cfg.get("mamba", {}) or {}
-    return int(mamba_cfg.get("sa_layers", 0)) + int(mamba_cfg.get("wa_layers", 0))
+    if model_name == "dual_plane_mamba":
+        return int(mamba_cfg.get("sa_layers", 0)) + int(
+            mamba_cfg.get("wa_layers", 0)
+        )
+    if model_name == "xrd_ctm":
+        return int(mamba_cfg.get("stage1_layers", 0)) + int(
+            mamba_cfg.get("stage2_layers", 0)
+        )
+    return 0
 
 
 def mamba_ssm_import_error(backend: str = "mamba_ssm") -> str | None:

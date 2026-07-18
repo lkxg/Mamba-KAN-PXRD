@@ -15,8 +15,171 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
+
+
+# =====================================================================
+# 训练增强（对称性保持）
+# =====================================================================
+
+
+class PXRDAugment:
+    """对称性保持的 PXRD 训练时增强。
+
+    三种变换均不改变空间群标签：
+
+    1. 晶格等比缩放：所有 d 间距乘同一因子（sinθ' = s·sinθ），等价于晶格
+       常数各向同性变化。峰位间的比例关系和系统消光规律严格不变，
+       通过在 2θ 网格上按 sinθ 映射做线性插值重采样实现。
+    2. 强度扰动：随机 gamma 幂次 + 低频平滑包络，模拟择优取向/织构
+       对相对峰强的影响（峰位不动）。
+    3. 峰宽展宽：随机 σ 的高斯核卷积，模拟晶粒尺寸减小带来的峰形加宽。
+
+    变换后重新归一化到 max=1，与预处理约定一致。
+    """
+
+    def __init__(
+        self,
+        *,
+        signal_length: int = 10824,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+        lattice_scale_prob: float = 0.7,
+        lattice_scale_delta: float = 0.03,
+        intensity_prob: float = 0.5,
+        gamma_range: tuple[float, float] = (0.7, 1.4),
+        envelope_amp: float = 0.25,
+        envelope_nodes: int = 8,
+        broaden_prob: float = 0.3,
+        broaden_max_sigma: float = 5.0,
+    ) -> None:
+        if signal_length <= 1:
+            raise ValueError("signal_length must be greater than 1")
+        for prob in (lattice_scale_prob, intensity_prob, broaden_prob):
+            if not 0.0 <= prob <= 1.0:
+                raise ValueError("augmentation probabilities must be in [0, 1]")
+        if lattice_scale_delta < 0 or lattice_scale_delta >= 0.5:
+            raise ValueError("lattice_scale_delta must satisfy 0 <= delta < 0.5")
+        if len(gamma_range) != 2 or gamma_range[0] <= 0 or gamma_range[0] > gamma_range[1]:
+            raise ValueError("gamma_range must be (low, high) with 0 < low <= high")
+        if envelope_amp < 0 or envelope_amp >= 1.0:
+            raise ValueError("envelope_amp must satisfy 0 <= amp < 1")
+        if envelope_nodes < 2:
+            raise ValueError("envelope_nodes must be at least 2")
+        if broaden_max_sigma < 0:
+            raise ValueError("broaden_max_sigma must be non-negative")
+
+        self.signal_length = int(signal_length)
+        self.theta_min = float(theta_min)
+        self.theta_max = float(theta_max)
+        self.lattice_scale_prob = float(lattice_scale_prob)
+        self.lattice_scale_delta = float(lattice_scale_delta)
+        self.intensity_prob = float(intensity_prob)
+        self.gamma_range = (float(gamma_range[0]), float(gamma_range[1]))
+        self.envelope_amp = float(envelope_amp)
+        self.envelope_nodes = int(envelope_nodes)
+        self.broaden_prob = float(broaden_prob)
+        self.broaden_max_sigma = float(broaden_max_sigma)
+
+        theta2 = torch.linspace(theta_min, theta_max, self.signal_length)
+        self._sin_grid = torch.sin(torch.deg2rad(theta2 / 2.0))
+
+    def _lattice_scale(self, x: torch.Tensor) -> torch.Tensor:
+        delta = self.lattice_scale_delta
+        s = float(torch.empty(1).uniform_(1.0 - delta, 1.0 + delta))
+        # 峰从 θ 移到 θ'（sinθ' = s·sinθ），因此网格点 θ_i 的新强度取自
+        # 源角度 sinθ_src = sinθ_i / s 处的旧强度。
+        src_sin = (self._sin_grid / s).clamp(-1.0, 1.0)
+        src_theta2 = torch.rad2deg(torch.asin(src_sin)) * 2.0
+        frac = (
+            (src_theta2 - self.theta_min)
+            / (self.theta_max - self.theta_min)
+            * (self.signal_length - 1)
+        )
+        lo = frac.floor().long().clamp(0, self.signal_length - 1)
+        hi = (lo + 1).clamp(0, self.signal_length - 1)
+        w = (frac - lo.to(frac.dtype)).clamp(0.0, 1.0)
+        out = x[lo] * (1.0 - w) + x[hi] * w
+        inside = (frac >= 0.0) & (frac <= self.signal_length - 1)
+        return out * inside.to(out.dtype)
+
+    def _intensity_perturb(self, x: torch.Tensor) -> torch.Tensor:
+        low, high = self.gamma_range
+        gamma = float(torch.empty(1).uniform_(low, high))
+        out = x.clamp_min(0.0).pow(gamma)
+        if self.envelope_amp > 0:
+            nodes = 1.0 + torch.empty(self.envelope_nodes).uniform_(
+                -self.envelope_amp, self.envelope_amp
+            )
+            envelope = F.interpolate(
+                nodes.view(1, 1, -1),
+                size=self.signal_length,
+                mode="linear",
+                align_corners=True,
+            ).view(-1)
+            out = out * envelope
+        return out
+
+    def _broaden(self, x: torch.Tensor) -> torch.Tensor:
+        sigma = float(torch.empty(1).uniform_(0.0, self.broaden_max_sigma))
+        if sigma < 0.3:
+            return x
+        radius = max(1, int(3.0 * sigma))
+        offsets = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        kernel = torch.exp(-0.5 * (offsets / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        return F.conv1d(
+            x.view(1, 1, -1), kernel.view(1, 1, -1), padding=radius
+        ).view(-1)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.signal_length:
+            raise ValueError(
+                f"signal length mismatch: got {x.shape[-1]}, "
+                f"expected {self.signal_length}"
+            )
+        if self.lattice_scale_prob > 0 and float(torch.rand(1)) < self.lattice_scale_prob:
+            x = self._lattice_scale(x)
+        if self.intensity_prob > 0 and float(torch.rand(1)) < self.intensity_prob:
+            x = self._intensity_perturb(x)
+        if self.broaden_prob > 0 and float(torch.rand(1)) < self.broaden_prob:
+            x = self._broaden(x)
+        peak = float(x.max())
+        if peak > 0:
+            x = x / peak
+        return x
+
+
+def build_augment_from_config(
+    augment_cfg: dict | None,
+    *,
+    signal_length: int,
+    theta_min: float = 5.0,
+    theta_max: float = 90.0,
+) -> PXRDAugment | None:
+    """从 YAML 的 data.augment 配置块构建训练增强，未启用时返回 None。"""
+    cfg = dict(augment_cfg or {})
+    if not bool(cfg.get("enabled", False)):
+        return None
+    lattice_cfg = dict(cfg.get("lattice_scale", {}))
+    intensity_cfg = dict(cfg.get("intensity", {}))
+    broaden_cfg = dict(cfg.get("broaden", {}))
+    gamma_range = intensity_cfg.get("gamma_range", (0.7, 1.4))
+    return PXRDAugment(
+        signal_length=signal_length,
+        theta_min=theta_min,
+        theta_max=theta_max,
+        lattice_scale_prob=float(lattice_cfg.get("prob", 0.7)),
+        lattice_scale_delta=float(lattice_cfg.get("max_delta", 0.03)),
+        intensity_prob=float(intensity_cfg.get("prob", 0.5)),
+        gamma_range=(float(gamma_range[0]), float(gamma_range[1])),
+        envelope_amp=float(intensity_cfg.get("envelope_amp", 0.25)),
+        envelope_nodes=int(intensity_cfg.get("envelope_nodes", 8)),
+        broaden_prob=float(broaden_cfg.get("prob", 0.3)),
+        broaden_max_sigma=float(broaden_cfg.get("max_sigma", 5.0)),
+    )
 
 
 # =====================================================================

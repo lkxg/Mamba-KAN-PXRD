@@ -179,6 +179,40 @@ class LDAMLoss(nn.Module):
         )
 
 
+class LogitAdjustedLoss(nn.Module):
+    """Logit-adjusted cross entropy (Menon et al., ICLR 2021).
+
+    Adds tau * log(class prior) to the logits before the softmax so the
+    optimum targets balanced error directly. Unlike per-sample reweighting
+    it shifts class margins instead of gradient magnitudes, leaving
+    representation learning on the natural data distribution intact.
+    """
+
+    def __init__(
+        self,
+        class_counts: np.ndarray,
+        *,
+        tau: float = 1.0,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if tau < 0:
+            raise ValueError("tau must be non-negative")
+        counts = _positive_class_counts(class_counts, name="logit_adjusted_ce")
+        priors = counts / counts.sum()
+        adjustment = float(tau) * np.log(priors)
+        self.register_buffer(
+            "adjustment", torch.tensor(adjustment, dtype=torch.float32)
+        )
+        self.label_smoothing = float(label_smoothing)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        adjusted = logits + self.adjustment.to(dtype=logits.dtype, device=logits.device)
+        return F.cross_entropy(
+            adjusted, target, label_smoothing=self.label_smoothing
+        )
+
+
 def build_loss_from_config(
     loss_cfg: dict,
     *,
@@ -189,6 +223,14 @@ def build_loss_from_config(
     label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
     if name == "label_smoothing":
         return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    if name == "logit_adjusted_ce":
+        if class_counts is None:
+            raise ValueError("`class_counts` required for logit_adjusted_ce")
+        return LogitAdjustedLoss(
+            class_counts,
+            tau=float(loss_cfg.get("tau", 1.0)),
+            label_smoothing=label_smoothing,
+        )
     if name == "weighted_ce":
         if class_counts is None:
             raise ValueError("`class_counts` required for weighted_ce")
@@ -345,6 +387,7 @@ def loss_with_contrastive(
     target: torch.Tensor,
     loss_fn: nn.Module,
     *,
+    auxiliary_weight: float = 0.0,
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
@@ -352,6 +395,16 @@ def loss_with_contrastive(
     """Compute classification loss plus optional supervised contrastive loss."""
     logits = primary_logits(output)
     main_loss = loss_fn(logits, target)
+    auxiliary_loss = logits.sum() * 0.0
+    if auxiliary_weight > 0:
+        if not isinstance(output, dict):
+            raise TypeError("auxiliary loss requires a model output dict")
+        auxiliary_logits = output.get("aux_logits")
+        if not isinstance(auxiliary_logits, dict) or not auxiliary_logits:
+            raise KeyError("auxiliary loss requires a non-empty aux_logits mapping")
+        auxiliary_loss = torch.stack(
+            [loss_fn(branch_logits, target) for branch_logits in auxiliary_logits.values()]
+        ).sum()
     contrastive_loss = logits.sum() * 0.0
     if contrastive_weight > 0:
         if not isinstance(output, dict):
@@ -365,7 +418,11 @@ def loss_with_contrastive(
             target,
             temperature=contrastive_temperature,
         )
-    total_loss = main_loss + float(contrastive_weight) * contrastive_loss
+    total_loss = (
+        main_loss
+        + float(auxiliary_weight) * auxiliary_loss
+        + float(contrastive_weight) * contrastive_loss
+    )
     return total_loss, logits, contrastive_loss.detach()
 
 
@@ -417,6 +474,7 @@ def train_one_epoch(
     device: torch.device,
     *,
     grad_clip: float | None = 1.0,
+    auxiliary_weight: float = 0.0,
     contrastive_weight: float = 0.0,
     contrastive_temperature: float = 0.1,
     contrastive_embedding_key: str = "embedding",
@@ -459,6 +517,7 @@ def train_one_epoch(
                 output,
                 y,
                 loss_fn,
+                auxiliary_weight=auxiliary_weight,
                 contrastive_weight=contrastive_weight,
                 contrastive_temperature=contrastive_temperature,
                 contrastive_embedding_key=contrastive_embedding_key,

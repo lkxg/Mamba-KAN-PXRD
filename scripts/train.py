@@ -18,13 +18,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import PXRDDataset, class_counts_for_rows, labels_for_rows, load_splits
+from src.data import (
+    PXRDDataset,
+    build_augment_from_config,
+    class_counts_for_rows,
+    labels_for_rows,
+    load_splits,
+)
 from src.models import (
     BiGRUPatchClassifier,
     ConvNeXt1D,
     DualPlaneMambaClassifier,
     PatchTSTClassifier,
     ResNet1D,
+    XRDCTMClassifier,
 )
 from src.training import (
     build_loss_from_config,
@@ -61,6 +68,12 @@ def build_model(cfg: dict, *, in_dim: int, num_classes: int) -> torch.nn.Module:
             in_dim=in_dim,
             num_classes=num_classes,
             **cfg["model"].get("dual_plane_mamba", {}),
+        )
+    if name == "xrd_ctm":
+        return XRDCTMClassifier(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            **cfg["model"].get("xrd_ctm", {}),
         )
     if name == "bigru_patch":
         return BiGRUPatchClassifier(
@@ -281,6 +294,13 @@ def main():
     # 创建 PyTorch Dataset 对象
     train_ds = PXRDDataset(cfg["data"]["root"], rows=splits["train"], task=task)
     val_ds   = PXRDDataset(cfg["data"]["root"], rows=splits["val"],   task=task)
+    train_augment = build_augment_from_config(
+        cfg["data"].get("augment"),
+        signal_length=train_ds.signal_length,
+    )
+    train_ds.transform = train_augment
+    if train_augment is not None:
+        print("Augment: lattice_scale/intensity/broaden enabled (train only)")
     if len(train_ds) == 0:
         raise ValueError("train split is empty")
     if monitor.startswith("val_") and len(val_ds) == 0:
@@ -353,6 +373,8 @@ def main():
         print(f"  SA mixer backend: {model.sa_branch.actual_mamba_backend}")
     if hasattr(model, "wa_branch") and getattr(model, "wa_branch") is not None:
         print(f"  WA mixer backend: {model.wa_branch.actual_mamba_backend}")
+    if hasattr(model, "actual_mamba_backend"):
+        print(f"  XRD-CTM Mamba backend: {model.actual_mamba_backend}")
 
     raw_model = model
     if cfg.get("performance", {}).get("compile", False) and device.type == "cuda":
@@ -381,6 +403,11 @@ def main():
     min_lr = float(cfg.get("scheduler", {}).get("min_lr", 0.0))
 
     loss_cfg = cfg.get("loss", {})
+    auxiliary_weight = float(loss_cfg.get("auxiliary_weight", 0.0))
+    if auxiliary_weight < 0:
+        raise ValueError("loss.auxiliary_weight must be non-negative")
+    if auxiliary_weight:
+        print(f"Auxiliary branch loss weight: {auxiliary_weight}")
     ldam_drw_start_epoch = loss_cfg.get("ldam_drw_start_epoch")
     if ldam_drw_start_epoch is not None:
         ldam_drw_start_epoch = int(ldam_drw_start_epoch)
@@ -458,6 +485,7 @@ def main():
         train_stats = train_one_epoch(
             model, train_loader, optimizer, loss_fn, device,
             grad_clip=cfg["train"].get("grad_clip", 1.0),  # 梯度裁剪阈值
+            auxiliary_weight=auxiliary_weight,
             contrastive_weight=contrastive_weight,
             contrastive_temperature=contrastive_temperature,
             contrastive_embedding_key=contrastive_embedding_key,

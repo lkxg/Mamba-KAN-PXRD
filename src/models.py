@@ -6,6 +6,7 @@
 3. BiGRUPatchClassifier：patch 化 PXRD 序列 + 双向 GRU
 4. PatchTSTClassifier：patch 化 PXRD 序列 + Transformer Encoder
 5. DualPlaneMambaClassifier：可配置下采样前端与 Mamba token mixer
+6. XRDCTMClassifier：共享 Stem + CNN/Mamba/峰关系 Transformer 三路模型
 
 这些模型为项目提供了基线性能，后续可以添加更先进的架构（如 Mamba-KAN 混合模型）。
 """
@@ -891,6 +892,154 @@ class _TokenSequencePool(nn.Module):
             alpha = torch.sigmoid(self.residual_logit).to(dtype=tokens.dtype)
             pooled = mean + alpha * (pooled - mean)
         return pooled
+
+
+class _PeakSetBranch(nn.Module):
+    """Sparse Bragg-peak set encoder complementing the dense branches.
+
+    Detects the top-K local maxima of the raw pattern, builds physics-aware
+    per-peak tokens (Q-space position, intensity, neighbour spacing, peak
+    curvature) and encodes the ordered set with a small bidirectional
+    Transformer. Peak indices are selected without gradient, but intensity
+    and curvature values are gathered differentiably.
+    """
+
+    _FOURIER_FREQS = (1.0, 2.0, 4.0, 8.0)
+
+    def __init__(
+        self,
+        *,
+        signal_length: int,
+        theta_min: float = 5.0,
+        theta_max: float = 90.0,
+        wavelength: float = 1.5406,
+        num_peaks: int = 64,
+        window: int = 11,
+        min_intensity: float = 0.01,
+        d_model: int = 96,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ffn_mult: float = 2.0,
+        dropout: float = 0.1,
+        out_dim: int = 128,
+        branch_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if signal_length <= 1:
+            raise ValueError("signal_length must be greater than 1")
+        if num_peaks <= 0:
+            raise ValueError("num_peaks must be positive")
+        if window < 3 or window % 2 == 0:
+            raise ValueError("window must be an odd integer >= 3")
+        if d_model <= 0 or out_dim <= 0 or num_layers <= 0:
+            raise ValueError("d_model, out_dim, and num_layers must be positive")
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.signal_length = int(signal_length)
+        self.num_peaks = int(num_peaks)
+        self.window = int(window)
+        self.min_intensity = float(min_intensity)
+        self.out_dim = int(out_dim)
+
+        # Q = 4π·sin(θ)/λ with θ = 2θ/2; positions are normalised by Q(θ_max)
+        # so lattice-scaling shifts stay affine across the token features.
+        positions = torch.arange(self.signal_length, dtype=torch.float32)
+        theta2 = theta_min + (theta_max - theta_min) * positions / (self.signal_length - 1)
+        q = 4.0 * math.pi * torch.sin(torch.deg2rad(theta2 / 2.0)) / float(wavelength)
+        q_max = 4.0 * math.pi * math.sin(math.radians(theta_max / 2.0)) / float(wavelength)
+        self.register_buffer("q_norm_grid", q / q_max)
+
+        feature_dim = 8 + 2 * len(self._FOURIER_FREQS)
+        self.embed = nn.Sequential(
+            nn.Linear(feature_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=int(d_model * ffn_mult),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+        )
+        self.encoder_norm = nn.LayerNorm(d_model)
+        self.project = nn.Linear(d_model, self.out_dim)
+        self.dropout = nn.Dropout(float(branch_dropout))
+        self.feature_norm = nn.LayerNorm(self.out_dim)
+
+    def _extract_peaks(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (indices, valid mask), both (B, K), indices sorted by angle."""
+        length = x.shape[1]
+        pooled = F.max_pool1d(
+            x.unsqueeze(1), kernel_size=self.window, stride=1, padding=self.window // 2
+        ).squeeze(1)
+        is_peak = (x >= pooled) & (x >= self.min_intensity)
+        scores = torch.where(is_peak, x, torch.zeros_like(x))
+        k = min(self.num_peaks, length)
+        vals, idx = scores.topk(k, dim=1)
+        valid = vals > 0
+        idx = torch.where(valid, idx, torch.full_like(idx, length - 1))
+        idx, order = idx.sort(dim=1)
+        valid = valid.gather(1, order)
+        # Keep one token alive for degenerate all-flat inputs so that the
+        # attention mask never blanks out an entire row.
+        valid[:, 0] = True
+        return idx, valid
+
+    def _gather_signal(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return x.gather(1, idx.clamp(0, x.shape[1] - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"expected input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.signal_length:
+            raise ValueError(
+                f"signal length mismatch: got {x.shape[1]}, expected {self.signal_length}"
+            )
+
+        with torch.no_grad():
+            idx, valid = self._extract_peaks(x)
+
+        intensity = self._gather_signal(x, idx)
+        q_pos = self.q_norm_grid[idx].to(dtype=x.dtype)
+        pos_norm = idx.to(dtype=x.dtype) / (self.signal_length - 1)
+        curv_near = intensity - 0.5 * (
+            self._gather_signal(x, idx - 2) + self._gather_signal(x, idx + 2)
+        )
+        curv_far = intensity - 0.5 * (
+            self._gather_signal(x, idx - 8) + self._gather_signal(x, idx + 8)
+        )
+        dq = q_pos.diff(dim=1, prepend=q_pos[:, :1])
+        dq_next = q_pos.diff(dim=1, append=q_pos[:, -1:])
+
+        feats = [
+            q_pos,
+            pos_norm,
+            intensity,
+            intensity.clamp_min(0.0).sqrt(),
+            dq * 20.0,
+            dq_next * 20.0,
+            curv_near,
+            curv_far,
+        ]
+        for freq in self._FOURIER_FREQS:
+            feats.append(torch.sin(2.0 * math.pi * freq * q_pos))
+            feats.append(torch.cos(2.0 * math.pi * freq * q_pos))
+        tokens = torch.stack(feats, dim=-1) * valid.unsqueeze(-1).to(dtype=x.dtype)
+
+        tokens = self.embed(tokens)
+        tokens = self.encoder(tokens, src_key_padding_mask=~valid)
+        tokens = self.encoder_norm(tokens)
+        weights = valid.to(dtype=tokens.dtype).unsqueeze(-1)
+        pooled = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return self.feature_norm(self.dropout(self.project(pooled)))
 
 
 def _make_head(
@@ -1930,6 +2079,7 @@ class DualPlaneMambaClassifier(nn.Module):
         projection_dropout: float = 0.1,
         projection_normalize: bool = True,
         mamba: dict | None = None,
+        peak_branch: dict | None = None,
     ) -> None:
         super().__init__()
         if not use_sa and not use_wa:
@@ -2170,6 +2320,43 @@ class DualPlaneMambaClassifier(nn.Module):
             self.branch_feature_dim = aligned_dim
             fused_dim = aligned_dim
 
+        peak_cfg = dict(peak_branch or {})
+        if bool(peak_cfg.get("enabled", False)):
+            self.peak_fusion = str(peak_cfg.get("fusion", "concat")).lower()
+            if self.peak_fusion not in {"concat", "gated_add"}:
+                raise ValueError("peak_branch.fusion must be concat or gated_add")
+            self.peak_branch = _PeakSetBranch(
+                signal_length=self.in_dim,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                wavelength=float(peak_cfg.get("wavelength", 1.5406)),
+                num_peaks=int(peak_cfg.get("num_peaks", 64)),
+                window=int(peak_cfg.get("window", 11)),
+                min_intensity=float(peak_cfg.get("min_intensity", 0.01)),
+                d_model=int(peak_cfg.get("d_model", 96)),
+                num_layers=int(peak_cfg.get("layers", 2)),
+                num_heads=int(peak_cfg.get("heads", 4)),
+                ffn_mult=float(peak_cfg.get("ffn_mult", 2.0)),
+                dropout=float(peak_cfg.get("dropout", 0.1)),
+                out_dim=int(peak_cfg.get("out_dim", 128)),
+                branch_dropout=float(peak_cfg.get("branch_dropout", branch_dropout)),
+            )
+            if self.peak_fusion == "concat":
+                self.peak_align = None
+                self.peak_gate = None
+                fused_dim = fused_dim + self.peak_branch.out_dim
+            else:
+                self.peak_align = nn.Linear(self.peak_branch.out_dim, fused_dim)
+                self.peak_gate = nn.Sequential(
+                    nn.LayerNorm(fused_dim + self.peak_branch.out_dim),
+                    nn.Linear(fused_dim + self.peak_branch.out_dim, fused_dim),
+                )
+        else:
+            self.peak_branch = None
+            self.peak_fusion = "none"
+            self.peak_align = None
+            self.peak_gate = None
+
         self.head = _make_head(
             name=head,
             in_dim=fused_dim,
@@ -2227,6 +2414,14 @@ class DualPlaneMambaClassifier(nn.Module):
         else:
             fused = parts[0]
 
+        if self.peak_branch is not None:
+            f_peak = self.peak_branch(x)
+            if self.peak_fusion == "concat":
+                fused = torch.cat([fused, f_peak], dim=-1)
+            else:
+                gate = torch.sigmoid(self.peak_gate(torch.cat([fused, f_peak], dim=-1)))
+                fused = fused + gate * self.peak_align(f_peak)
+
         outputs["logits"] = self.head(fused)
         if self.projection_head is not None:
             embedding = self.projection_head(fused)
@@ -2234,6 +2429,988 @@ class DualPlaneMambaClassifier(nn.Module):
                 embedding = F.normalize(embedding.float(), dim=-1).to(dtype=fused.dtype)
             outputs["embedding"] = embedding
         return outputs if len(outputs) > 1 else outputs["logits"]
+
+
+class _XRDNorm1D(nn.Module):
+    """LayerNorm over channels for a channels-first 1D feature map."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(int(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
+class _XRDInputStem(nn.Module):
+    """Build three signal channels and perform sample-preserving rearrangement."""
+
+    def __init__(
+        self,
+        *,
+        signal_length: int,
+        out_channels: int = 64,
+        factor: int = 4,
+    ) -> None:
+        super().__init__()
+        if signal_length <= 1:
+            raise ValueError("signal_length must be greater than 1")
+        if factor <= 0:
+            raise ValueError("stem factor must be positive")
+        self.signal_length = int(signal_length)
+        self.factor = int(factor)
+        self.proj = nn.Conv1d(3 * self.factor, int(out_channels), 1, bias=False)
+        self.norm = _XRDNorm1D(int(out_channels))
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            if x.shape[1] != 1:
+                raise ValueError("XRDCTMClassifier expects a raw single-channel spectrum")
+            x = x[:, 0]
+        if x.ndim != 2:
+            raise ValueError(f"expected input shape (B, L), got {tuple(x.shape)}")
+        if x.shape[1] != self.signal_length:
+            raise ValueError(
+                f"signal length mismatch: got {x.shape[1]}, expected {self.signal_length}"
+            )
+
+        intensity = x.clamp_min(0.0)
+        log_intensity = torch.log1p(9.0 * intensity) / math.log1p(9.0)
+        gradient = F.pad(intensity[:, 1:] - intensity[:, :-1], (1, 0))
+        grad_scale = gradient.abs().mean(dim=-1, keepdim=True).clamp_min(1.0e-4)
+        gradient = torch.tanh(gradient / grad_scale)
+        channels = torch.stack([intensity, log_intensity, gradient], dim=1)
+
+        pad = (-channels.shape[-1]) % self.factor
+        if pad:
+            channels = F.pad(channels, (0, pad))
+        bsz, n_channels, length = channels.shape
+        channels = channels.view(
+            bsz,
+            n_channels,
+            length // self.factor,
+            self.factor,
+        )
+        channels = channels.permute(0, 1, 3, 2).reshape(
+            bsz,
+            n_channels * self.factor,
+            length // self.factor,
+        )
+        return self.activation(self.norm(self.proj(channels)))
+
+
+class _XRDDownsample(nn.Module):
+    """Peak-preserving stride-two convolution plus a max-pool path."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(
+            int(in_channels),
+            int(out_channels),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        self.pool = nn.Sequential(
+            nn.MaxPool1d(2, stride=2, ceil_mode=True),
+            nn.Conv1d(int(in_channels), int(out_channels), 1, bias=False),
+        )
+        self.norm = _XRDNorm1D(int(out_channels))
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.norm(self.conv(x) + self.pool(x)))
+
+
+class _XRDMultiScaleBlock(nn.Module):
+    """Residual multi-kernel depthwise convolution block."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernels: Sequence[int],
+        dilations: Sequence[int] | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        kernels = tuple(int(k) for k in kernels)
+        dilations = tuple(
+            int(d)
+            for d in (dilations if dilations is not None else (1,) * len(kernels))
+        )
+        if not kernels or len(kernels) != len(dilations):
+            raise ValueError("kernels and dilations must be non-empty and equally sized")
+        if any(k <= 0 or k % 2 == 0 for k in kernels):
+            raise ValueError("multi-scale kernels must be positive odd integers")
+        if any(d <= 0 for d in dilations):
+            raise ValueError("dilations must be positive")
+
+        self.norm = _XRDNorm1D(int(channels))
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(
+                        int(channels),
+                        int(channels),
+                        kernel_size=k,
+                        padding=(k // 2) * d,
+                        dilation=d,
+                        groups=int(channels),
+                        bias=False,
+                    ),
+                    nn.BatchNorm1d(int(channels)),
+                    nn.GELU(),
+                )
+                for k, d in zip(kernels, dilations)
+            ]
+        )
+        self.project = nn.Sequential(
+            nn.Conv1d(
+                int(channels) * len(self.branches),
+                int(channels),
+                1,
+                bias=False,
+            ),
+            nn.BatchNorm1d(int(channels)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        hidden = max(16, int(channels) * 2)
+        self.ffn = nn.Sequential(
+            nn.Conv1d(int(channels), hidden, 1),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Conv1d(hidden, int(channels), 1),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.norm(x)
+        local = self.project(torch.cat([branch(z) for branch in self.branches], dim=1))
+        z = x + local
+        return z + self.ffn(self.norm(z))
+
+
+class _XRDConvBranch(nn.Module):
+    """High-resolution local peak-shape branch."""
+
+    def __init__(
+        self,
+        *,
+        stem_channels: int = 64,
+        mid_channels: int = 96,
+        out_channels: int = 128,
+        stage1_blocks: int = 2,
+        stage2_blocks: int = 2,
+        stage3_blocks: int = 2,
+        dropout: float = 0.05,
+        pool_hidden: int = 128,
+    ) -> None:
+        super().__init__()
+        self.stage1 = nn.Sequential(
+            *[
+                _XRDMultiScaleBlock(
+                    int(stem_channels),
+                    kernels=(3, 7, 15, 31),
+                    dropout=dropout,
+                )
+                for _ in range(int(stage1_blocks))
+            ]
+        )
+        self.down1 = _XRDDownsample(int(stem_channels), int(mid_channels))
+        self.stage2 = nn.Sequential(
+            *[
+                _XRDMultiScaleBlock(
+                    int(mid_channels),
+                    kernels=(3, 7, 15),
+                    dilations=(1, 2, 2),
+                    dropout=dropout,
+                )
+                for _ in range(int(stage2_blocks))
+            ]
+        )
+        self.down2 = _XRDDownsample(int(mid_channels), int(out_channels))
+        self.stage3 = nn.Sequential(
+            *[
+                _XRDMultiScaleBlock(
+                    int(out_channels),
+                    kernels=(3, 7, 15),
+                    dilations=(1, 1, 2),
+                    dropout=dropout,
+                )
+                for _ in range(int(stage3_blocks))
+            ]
+        )
+        self.pool_score = nn.Sequential(
+            nn.LayerNorm(int(out_channels)),
+            nn.Linear(int(out_channels), int(pool_hidden)),
+            nn.GELU(),
+            nn.Linear(int(pool_hidden), 1),
+        )
+        self.pool_proj = nn.Linear(int(out_channels), 256)
+        self.pool_dropout = nn.Dropout(float(dropout))
+        self.out_channels = int(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stage1(x)
+        x = self.stage2(self.down1(x))
+        return self.stage3(self.down2(x))
+
+    def pool(self, feature_map: torch.Tensor) -> torch.Tensor:
+        tokens = feature_map.transpose(1, 2)
+        weights = torch.softmax(self.pool_score(tokens).float(), dim=1).to(tokens.dtype)
+        pooled = (tokens * weights).sum(dim=1)
+        return self.pool_proj(self.pool_dropout(pooled))
+
+
+class _XRDMambaBranch(nn.Module):
+    """Dense continuous-spectrum branch with unidirectional Mamba blocks."""
+
+    def __init__(
+        self,
+        *,
+        stem_channels: int = 64,
+        mid_channels: int = 96,
+        out_channels: int = 128,
+        stage1_layers: int = 2,
+        stage2_layers: int = 4,
+        d_state: int = 32,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.05,
+        backend: str = "mamba2_ssm",
+        headdim: int | None = 32,
+        ngroups: int | None = None,
+        chunk_size: int | None = 256,
+        pooling_dropout: float = 0.05,
+    ) -> None:
+        super().__init__()
+        self.down1 = _XRDDownsample(int(stem_channels), int(mid_channels))
+        self.norm1 = _XRDNorm1D(int(mid_channels))
+        self.mixer1 = _MambaSequenceMixer(
+            int(mid_channels),
+            num_layers=int(stage1_layers),
+            d_state=int(d_state),
+            d_conv=int(d_conv),
+            expand=int(expand),
+            dropout=float(dropout),
+            backend=str(backend),
+            headdim=headdim,
+            ngroups=ngroups,
+            chunk_size=chunk_size,
+            bidirectional=False,
+        )
+        self.down2 = _XRDDownsample(int(mid_channels), int(out_channels))
+        self.norm2 = _XRDNorm1D(int(out_channels))
+        self.mixer2 = _MambaSequenceMixer(
+            int(out_channels),
+            num_layers=int(stage2_layers),
+            d_state=int(d_state),
+            d_conv=int(d_conv),
+            expand=int(expand),
+            dropout=float(dropout),
+            backend=str(backend),
+            headdim=headdim,
+            ngroups=ngroups,
+            chunk_size=chunk_size,
+            bidirectional=False,
+        )
+        self.pool_score = nn.Sequential(
+            nn.LayerNorm(int(out_channels)),
+            nn.Linear(int(out_channels), int(out_channels)),
+            nn.GELU(),
+            nn.Linear(int(out_channels), 1),
+        )
+        self.pool_proj = nn.Linear(int(out_channels), 256)
+        self.pool_dropout = nn.Dropout(float(pooling_dropout))
+        self.out_channels = int(out_channels)
+        self.actual_mamba_backend = (
+            self.mixer2.actual_backend
+            if int(stage2_layers) > 0
+            else self.mixer1.actual_backend
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.down1(x)
+        x = self.mixer1(self.norm1(x).transpose(1, 2)).transpose(1, 2)
+        x = self.down2(x)
+        return self.mixer2(self.norm2(x).transpose(1, 2)).transpose(1, 2)
+
+    def pool(self, feature_map: torch.Tensor) -> torch.Tensor:
+        tokens = feature_map.transpose(1, 2)
+        weights = torch.softmax(self.pool_score(tokens).float(), dim=1).to(tokens.dtype)
+        pooled = (tokens * weights).sum(dim=1)
+        return self.pool_proj(self.pool_dropout(pooled))
+
+
+def _xrd_linear_sample(
+    feature_map: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Linearly sample [B, C, T] at floating-point token positions [B, K]."""
+    if feature_map.ndim != 3 or positions.ndim != 2:
+        raise ValueError("feature_map must be [B,C,T] and positions must be [B,K]")
+    bsz, channels, length = feature_map.shape
+    pos = positions.clamp(0.0, max(length - 1, 0))
+    left = pos.floor().long()
+    right = (left + 1).clamp_max(max(length - 1, 0))
+    weight = (pos - left.to(pos.dtype)).unsqueeze(1)
+    left_value = feature_map.gather(
+        2,
+        left.unsqueeze(1).expand(bsz, channels, -1),
+    )
+    right_value = feature_map.gather(
+        2,
+        right.unsqueeze(1).expand(bsz, channels, -1),
+    )
+    return left_value * (1.0 - weight) + right_value * weight
+
+
+def _xrd_local_sample(
+    feature_map: torch.Tensor,
+    positions: torch.Tensor,
+    radius: int,
+) -> torch.Tensor:
+    parts = [
+        _xrd_linear_sample(feature_map, positions + float(offset))
+        for offset in range(-int(radius), int(radius) + 1)
+    ]
+    return torch.stack(parts, dim=0).mean(dim=0)
+
+
+class _XRDRelativeAttentionBlock(nn.Module):
+    """Self-attention block with a learned signed relative-coordinate bias."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        num_heads: int = 8,
+        ffn_dim: int = 512,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
+        self.norm1 = nn.LayerNorm(self.d_model)
+        self.qkv = nn.Linear(self.d_model, self.d_model * 3)
+        self.attn_proj = nn.Linear(self.d_model, self.d_model)
+        self.norm2 = nn.LayerNorm(self.d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.d_model, int(ffn_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(ffn_dim), self.d_model),
+        )
+        self.rel_bias = nn.Sequential(
+            nn.Linear(3, max(32, self.d_model // 2)),
+            nn.GELU(),
+            nn.Linear(max(32, self.d_model // 2), self.num_heads),
+        )
+        self.dropout = float(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, length, _ = x.shape
+        z = self.norm1(x)
+        qkv = self.qkv(z).reshape(
+            bsz,
+            length,
+            3,
+            self.num_heads,
+            self.head_dim,
+        ).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv[0], qkv[1], qkv[2]
+        scores = torch.matmul(query.float(), key.float().transpose(-2, -1))
+        scores = scores / math.sqrt(self.head_dim)
+
+        delta = coords.unsqueeze(2) - coords.unsqueeze(1)
+        rel_features = torch.stack(
+            [
+                delta,
+                delta.abs(),
+                torch.log1p(delta.abs()),
+            ],
+            dim=-1,
+        )
+        bias = self.rel_bias(rel_features).permute(0, 3, 1, 2)
+        scores = scores + bias.float()
+        scores = scores.masked_fill(
+            ~valid[:, None, None, :],
+            torch.finfo(scores.dtype).min,
+        )
+        weights = torch.softmax(scores, dim=-1).to(value.dtype)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)
+        attended = torch.matmul(weights, value)
+        attended = attended.transpose(1, 2).reshape(bsz, length, self.d_model)
+        x = x + F.dropout(self.attn_proj(attended), p=self.dropout, training=self.training)
+        x = x + F.dropout(self.ffn(self.norm2(x)), p=self.dropout, training=self.training)
+        return x.masked_fill(~valid.unsqueeze(-1), 0.0)
+
+
+class _XRDPeakTransformer(nn.Module):
+    """Sparse peak/gap Transformer with CNN/Mamba feature gathering."""
+
+    _FOURIER_FREQS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+
+    def __init__(
+        self,
+        *,
+        signal_length: int,
+        feature_channels: int = 128,
+        num_peaks: int = 128,
+        detector_window: int = 11,
+        prominence_window: int = 65,
+        min_prominence: float = 0.01,
+        d_model: int = 128,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        ffn_dim: int = 512,
+        dropout: float = 0.1,
+        feedback_sigma: float = 3.0,
+    ) -> None:
+        super().__init__()
+        if signal_length <= 1:
+            raise ValueError("signal_length must be greater than 1")
+        if num_peaks <= 0:
+            raise ValueError("num_peaks must be positive")
+        if detector_window < 3 or detector_window % 2 == 0:
+            raise ValueError("detector_window must be an odd integer >= 3")
+        if prominence_window < 3 or prominence_window % 2 == 0:
+            raise ValueError("prominence_window must be an odd integer >= 3")
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.signal_length = int(signal_length)
+        self.num_peaks = int(num_peaks)
+        self.detector_window = int(detector_window)
+        self.prominence_window = int(prominence_window)
+        self.min_prominence = float(min_prominence)
+        self.feedback_sigma = float(feedback_sigma)
+        positions = torch.arange(self.signal_length, dtype=torch.float32)
+        theta2 = 5.0 + 85.0 * positions / (self.signal_length - 1)
+        q = torch.sin(torch.deg2rad(theta2 / 2.0))
+        self.register_buffer("q_norm_grid", q / q[-1])
+
+        peak_meta_dim = 8 + 2 * len(self._FOURIER_FREQS)
+        gap_meta_dim = 5 + 2 * len(self._FOURIER_FREQS)
+        self.peak_embed = nn.Sequential(
+            nn.Linear(peak_meta_dim + 2 * int(feature_channels), int(d_model)),
+            nn.GELU(),
+            nn.Linear(int(d_model), int(d_model)),
+            nn.LayerNorm(int(d_model)),
+        )
+        self.gap_embed = nn.Sequential(
+            nn.Linear(gap_meta_dim, int(d_model)),
+            nn.GELU(),
+            nn.Linear(int(d_model), int(d_model)),
+            nn.LayerNorm(int(d_model)),
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, int(d_model)))
+        self.type_embed = nn.Embedding(3, int(d_model))
+        self.blocks = nn.ModuleList(
+            [
+                _XRDRelativeAttentionBlock(
+                    int(d_model),
+                    num_heads=int(num_heads),
+                    ffn_dim=int(ffn_dim),
+                    dropout=float(dropout),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(int(d_model))
+        self.project = nn.Linear(int(d_model), 256)
+        self.importance = nn.Linear(int(d_model), 1)
+
+    @staticmethod
+    def _gather_signal(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return x.gather(1, indices.clamp(0, x.shape[1] - 1))
+
+    def _extract(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        length = x.shape[1]
+        with torch.no_grad():
+            local_max = F.max_pool1d(
+                x.unsqueeze(1),
+                kernel_size=self.detector_window,
+                stride=1,
+                padding=self.detector_window // 2,
+            ).squeeze(1)
+            baseline = F.avg_pool1d(
+                x.unsqueeze(1),
+                kernel_size=self.prominence_window,
+                stride=1,
+                padding=self.prominence_window // 2,
+            ).squeeze(1)
+            prominence = (x - baseline).clamp_min(0.0)
+            candidates = (x >= local_max) & (
+                prominence >= float(self.min_prominence)
+            )
+            scores = torch.where(candidates, prominence, torch.zeros_like(prominence))
+            values, indices = scores.topk(min(self.num_peaks, length), dim=1)
+            valid = values > 0
+            indices = torch.where(
+                valid,
+                indices,
+                torch.full_like(indices, length - 1),
+            )
+            indices, order = indices.sort(dim=1)
+            valid = valid.gather(1, order)
+        return indices, valid, prominence
+
+    def _make_features(
+        self,
+        x: torch.Tensor,
+        indices: torch.Tensor,
+        valid: torch.Tensor,
+        prominence: torch.Tensor,
+        cnn_map: torch.Tensor,
+        mamba_map: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, length = x.shape
+        k = indices.shape[1]
+        intensity = self._gather_signal(x, indices).clamp_min(0.0)
+        prom = self._gather_signal(prominence, indices).clamp_min(0.0)
+        q_pos = self.q_norm_grid[indices].to(dtype=x.dtype)
+        pos_norm = indices.to(dtype=x.dtype) / max(length - 1, 1)
+        left_gap = torch.zeros_like(q_pos)
+        left_gap[:, 1:] = (q_pos[:, 1:] - q_pos[:, :-1]).clamp_min(0.0)
+        right_gap = torch.zeros_like(q_pos)
+        right_gap[:, :-1] = (q_pos[:, 1:] - q_pos[:, :-1]).clamp_min(0.0)
+        area = F.avg_pool1d(
+            x.unsqueeze(1),
+            kernel_size=11,
+            stride=1,
+            padding=5,
+        ).squeeze(1)
+        area = self._gather_signal(area, indices).clamp_min(0.0)
+        area = area / area.amax(dim=1, keepdim=True).clamp_min(1.0e-6)
+        prominence_order = prom.masked_fill(~valid, -1.0).argsort(
+            dim=1,
+            descending=True,
+        )
+        rank_values = torch.linspace(1.0, 0.0, k, device=x.device, dtype=x.dtype)
+        rank = torch.zeros_like(prom)
+        rank.scatter_(
+            1,
+            prominence_order,
+            rank_values.view(1, -1).expand(bsz, -1),
+        )
+        rank = rank * valid.to(x.dtype)
+        norm = math.log1p(9.0)
+        peak_features = [
+            q_pos,
+            pos_norm,
+            torch.log1p(9.0 * intensity) / norm,
+            torch.log1p(9.0 * prom) / norm,
+            torch.log1p(100.0 * left_gap),
+            torch.log1p(100.0 * right_gap),
+            area,
+            rank,
+        ]
+        for freq in self._FOURIER_FREQS:
+            peak_features.extend(
+                [
+                    torch.sin(2.0 * math.pi * freq * q_pos),
+                    torch.cos(2.0 * math.pi * freq * q_pos),
+                ]
+            )
+        peak_meta = torch.stack(peak_features, dim=-1)
+        dense_positions = pos_norm * max(cnn_map.shape[-1] - 1, 1)
+        cnn_local = _xrd_local_sample(cnn_map, dense_positions, radius=2)
+        mamba_local = _xrd_local_sample(mamba_map, dense_positions, radius=1)
+        peak_input = torch.cat(
+            [
+                peak_meta,
+                cnn_local.transpose(1, 2),
+                mamba_local.transpose(1, 2),
+            ],
+            dim=-1,
+        )
+        peak_tokens = self.peak_embed(peak_input)
+
+        if k > 1:
+            gap_q = 0.5 * (q_pos[:, :-1] + q_pos[:, 1:])
+            gap_delta = (q_pos[:, 1:] - q_pos[:, :-1]).clamp_min(0.0)
+            gap_ratio = torch.log(
+                (intensity[:, :-1] + 1.0e-4)
+                / (intensity[:, 1:] + 1.0e-4)
+            ).clamp(-8.0, 8.0) / 8.0
+            empty_ratio = (
+                (indices[:, 1:] - indices[:, :-1] - 1).clamp_min(0).to(x.dtype)
+                / max(length - 1, 1)
+            )
+            gap_features = [
+                gap_q,
+                gap_delta,
+                torch.log1p(100.0 * gap_delta),
+                gap_ratio,
+                empty_ratio,
+            ]
+            for freq in self._FOURIER_FREQS:
+                gap_features.extend(
+                    [
+                        torch.sin(2.0 * math.pi * freq * gap_q),
+                        torch.cos(2.0 * math.pi * freq * gap_q),
+                    ]
+                )
+            gap_meta = torch.stack(gap_features, dim=-1)
+            gap_tokens = self.gap_embed(gap_meta)
+            gap_valid = valid[:, :-1] & valid[:, 1:]
+        else:
+            gap_tokens = peak_tokens.new_zeros(bsz, 0, peak_tokens.shape[-1])
+            gap_valid = valid.new_zeros(bsz, 0)
+
+        sequence_length = max(2 * k - 1, 1)
+        interleaved = peak_tokens.new_zeros(bsz, sequence_length, peak_tokens.shape[-1])
+        interleaved[:, 0::2] = peak_tokens
+        if k > 1:
+            interleaved[:, 1::2] = gap_tokens
+        interleaved_valid = valid.new_zeros(bsz, sequence_length)
+        interleaved_valid[:, 0::2] = valid
+        if k > 1:
+            interleaved_valid[:, 1::2] = gap_valid
+        interleaved_coords = q_pos.new_zeros(bsz, sequence_length)
+        interleaved_coords[:, 0::2] = q_pos
+        if k > 1:
+            interleaved_coords[:, 1::2] = 0.5 * (q_pos[:, :-1] + q_pos[:, 1:])
+
+        cls = self.cls_token.expand(bsz, -1, -1)
+        sequence = torch.cat([cls, interleaved], dim=1)
+        sequence_valid = torch.cat(
+            [
+                torch.ones(bsz, 1, dtype=torch.bool, device=x.device),
+                interleaved_valid,
+            ],
+            dim=1,
+        )
+        sequence_coords = torch.cat(
+            [q_pos.new_zeros(bsz, 1), interleaved_coords],
+            dim=1,
+        )
+        type_ids = torch.zeros(
+            bsz,
+            sequence_length + 1,
+            dtype=torch.long,
+            device=x.device,
+        )
+        type_ids[:, 1::2] = 1
+        if k > 1:
+            type_ids[:, 2::2] = 2
+        sequence = sequence + self.type_embed(type_ids)
+        return (
+            sequence,
+            sequence_coords,
+            sequence_valid,
+            valid,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cnn_map: torch.Tensor,
+        mamba_map: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x.ndim != 2:
+            raise ValueError(f"expected raw input shape (B,L), got {tuple(x.shape)}")
+        indices, valid, prominence = self._extract(x)
+        sequence, coords, sequence_valid, peak_valid = self._make_features(
+            x,
+            indices,
+            valid,
+            prominence,
+            cnn_map,
+            mamba_map,
+        )
+        for block in self.blocks:
+            sequence = block(sequence, coords, sequence_valid)
+        sequence = self.final_norm(sequence)
+        peak_tokens = sequence[:, 1::2]
+        importance_logits = self.importance(peak_tokens).squeeze(-1)
+        importance_logits = importance_logits.masked_fill(~peak_valid, -1.0e4)
+        importance = torch.softmax(importance_logits.float(), dim=-1).to(x.dtype)
+        importance = importance * peak_valid.to(x.dtype)
+        importance = importance / importance.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+
+        dense_positions = (
+            torch.arange(
+                cnn_map.shape[-1],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            .view(1, 1, -1)
+        )
+        peak_positions = (
+            indices.to(x.dtype).unsqueeze(-1)
+            * max(cnn_map.shape[-1] - 1, 1)
+            / max(x.shape[-1] - 1, 1)
+        )
+        distance = dense_positions - peak_positions
+        kernel = torch.exp(
+            -0.5 * (distance / max(self.feedback_sigma, 1.0e-3)) ** 2
+        )
+        feedback = (importance.unsqueeze(-1) * kernel).sum(dim=1)
+        feedback = feedback / feedback.amax(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        feedback = feedback.unsqueeze(1)
+
+        prom = self._gather_signal(prominence, indices)
+        intensity = self._gather_signal(x, indices).clamp_min(0.0)
+        valid_float = peak_valid.to(x.dtype)
+        count = valid_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+        quality = torch.cat(
+            [
+                valid_float.mean(dim=1, keepdim=True),
+                (prom * valid_float).sum(dim=1, keepdim=True) / count,
+                (prom * valid_float).amax(dim=1, keepdim=True),
+                (intensity * valid_float).sum(dim=1, keepdim=True) / count,
+            ],
+            dim=1,
+        )
+        return self.project(sequence[:, 0]), feedback, quality
+
+
+class XRDCTMClassifier(nn.Module):
+    """Peak-aware CNN-Transformer-Mamba classifier for PXRD space groups."""
+
+    def __init__(
+        self,
+        *,
+        in_dim: int = 10824,
+        num_classes: int = 230,
+        stem_channels: int = 64,
+        cnn: dict | None = None,
+        mamba: dict | None = None,
+        peak: dict | None = None,
+        fusion: dict | None = None,
+        branch_dropout: float = 0.05,
+    ) -> None:
+        super().__init__()
+        if int(num_classes) != 230:
+            raise ValueError("XRDCTMClassifier currently supports 230 space-group classes")
+        self.in_dim = int(in_dim)
+        self.num_classes = int(num_classes)
+        cnn_cfg = dict(cnn or {})
+        mamba_cfg = dict(mamba or {})
+        peak_cfg = dict(peak or {})
+        fusion_cfg = dict(fusion or {})
+        if bool(mamba_cfg.get("bidirectional", False)):
+            raise ValueError("XRDCTMClassifier requires unidirectional Mamba")
+        if not 0.0 <= float(branch_dropout) <= 1.0 / 3.0:
+            raise ValueError("branch_dropout must be in [0, 1/3]")
+
+        self.stem = _XRDInputStem(
+            signal_length=self.in_dim,
+            out_channels=int(stem_channels),
+            factor=int(cnn_cfg.get("stem_factor", 4)),
+        )
+        feature_channels = int(cnn_cfg.get("feature_channels", 128))
+        self.cnn_branch = _XRDConvBranch(
+            stem_channels=int(stem_channels),
+            mid_channels=int(cnn_cfg.get("mid_channels", 96)),
+            out_channels=feature_channels,
+            stage1_blocks=int(cnn_cfg.get("stage1_blocks", 2)),
+            stage2_blocks=int(cnn_cfg.get("stage2_blocks", 2)),
+            stage3_blocks=int(cnn_cfg.get("stage3_blocks", 2)),
+            dropout=float(cnn_cfg.get("dropout", 0.05)),
+            pool_hidden=int(cnn_cfg.get("pool_hidden", 128)),
+        )
+        self.mamba_branch = _XRDMambaBranch(
+            stem_channels=int(stem_channels),
+            mid_channels=int(mamba_cfg.get("mid_channels", 96)),
+            out_channels=feature_channels,
+            stage1_layers=int(mamba_cfg.get("stage1_layers", 2)),
+            stage2_layers=int(mamba_cfg.get("stage2_layers", 4)),
+            d_state=int(mamba_cfg.get("d_state", 32)),
+            d_conv=int(mamba_cfg.get("d_conv", 4)),
+            expand=int(mamba_cfg.get("expand", 2)),
+            dropout=float(mamba_cfg.get("dropout", 0.05)),
+            backend=str(mamba_cfg.get("backend", "mamba2_ssm")),
+            headdim=(
+                int(mamba_cfg["headdim"])
+                if mamba_cfg.get("headdim") is not None
+                else None
+            ),
+            ngroups=(
+                int(mamba_cfg["ngroups"])
+                if mamba_cfg.get("ngroups") is not None
+                else None
+            ),
+            chunk_size=(
+                int(mamba_cfg["chunk_size"])
+                if mamba_cfg.get("chunk_size") is not None
+                else None
+            ),
+            pooling_dropout=float(mamba_cfg.get("pooling_dropout", 0.05)),
+        )
+        self.peak_branch = _XRDPeakTransformer(
+            signal_length=self.in_dim,
+            feature_channels=feature_channels,
+            num_peaks=int(peak_cfg.get("num_peaks", 128)),
+            detector_window=int(peak_cfg.get("detector_window", 11)),
+            prominence_window=int(peak_cfg.get("prominence_window", 65)),
+            min_prominence=float(peak_cfg.get("min_prominence", 0.01)),
+            d_model=int(peak_cfg.get("d_model", 128)),
+            num_layers=int(peak_cfg.get("num_layers", 4)),
+            num_heads=int(peak_cfg.get("num_heads", 8)),
+            ffn_dim=int(peak_cfg.get("ffn_dim", 512)),
+            dropout=float(peak_cfg.get("dropout", 0.1)),
+            feedback_sigma=float(peak_cfg.get("feedback_sigma", 3.0)),
+        )
+        self.cross_scale = nn.Parameter(torch.tensor(0.1))
+        self.m2c_gate = nn.Sequential(
+            nn.LayerNorm(feature_channels),
+            nn.Linear(feature_channels, feature_channels),
+            nn.GELU(),
+            nn.Linear(feature_channels, feature_channels),
+        )
+        self.c2m_gate = nn.Sequential(
+            nn.LayerNorm(feature_channels),
+            nn.Linear(feature_channels, feature_channels),
+            nn.GELU(),
+            nn.Linear(feature_channels, feature_channels),
+        )
+        self.position_gate = nn.Sequential(
+            nn.Conv1d(4, 16, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(16, 1, kernel_size=1),
+        )
+        self.feedback_scale = float(fusion_cfg.get("feedback_scale", 0.1))
+        self.fusion_gate = nn.Sequential(
+            nn.LayerNorm(256 * 3 + 4),
+            nn.Linear(256 * 3 + 4, 256),
+            nn.GELU(),
+            nn.Dropout(float(fusion_cfg.get("dropout", 0.1))),
+            nn.Linear(256, 3),
+        )
+        self.final_proj = nn.Sequential(
+            nn.LayerNorm(256 * 4),
+            nn.Linear(256 * 4, 256),
+            nn.GELU(),
+            nn.Dropout(float(fusion_cfg.get("dropout", 0.1))),
+        )
+        self.head = nn.Linear(256, self.num_classes)
+        self.aux_heads = nn.ModuleDict(
+            {
+                "cnn": nn.Linear(256, self.num_classes),
+                "mamba": nn.Linear(256, self.num_classes),
+                "peak": nn.Linear(256, self.num_classes),
+            }
+        )
+        self.branch_dropout = float(branch_dropout)
+        self.null_features = nn.Parameter(torch.zeros(3, 256))
+        nn.init.normal_(self.null_features, std=0.02)
+        self.actual_mamba_backend = self.mamba_branch.actual_mamba_backend
+
+    def _cross_interaction(
+        self,
+        cnn_map: torch.Tensor,
+        mamba_map: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cnn_map.shape != mamba_map.shape:
+            raise ValueError("CNN and Mamba maps must have identical shapes")
+        cnn_gate = torch.tanh(self.m2c_gate(mamba_map.mean(dim=-1)))
+        mamba_gate = torch.tanh(self.c2m_gate(cnn_map.mean(dim=-1)))
+        scale = self.cross_scale.clamp(0.0, 1.0)
+        cnn_map = cnn_map * (1.0 + scale * cnn_gate.unsqueeze(-1))
+        mamba_map = mamba_map * (1.0 + scale * mamba_gate.unsqueeze(-1))
+        position_input = torch.cat(
+            [
+                cnn_map.mean(dim=1, keepdim=True),
+                cnn_map.amax(dim=1, keepdim=True),
+                mamba_map.mean(dim=1, keepdim=True),
+                mamba_map.amax(dim=1, keepdim=True),
+            ],
+            dim=1,
+        )
+        position = torch.tanh(self.position_gate(position_input))
+        cnn_map = cnn_map * (1.0 + scale * position)
+        mamba_map = mamba_map * (1.0 + scale * position)
+        return cnn_map, mamba_map
+
+    def _apply_branch_dropout(
+        self,
+        features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.training or self.branch_dropout <= 0.0:
+            return features
+        bsz = features[0].shape[0]
+        random = torch.rand(bsz, device=features[0].device)
+        p = self.branch_dropout
+        drop_cnn = random < p
+        drop_mamba = (random >= p) & (random < 2.0 * p)
+        drop_peak = (random >= 2.0 * p) & (random < 3.0 * p)
+        masks = (drop_cnn, drop_mamba, drop_peak)
+        return tuple(
+            torch.where(
+                mask.unsqueeze(-1),
+                self.null_features[index].to(dtype=feature.dtype),
+                feature,
+            )
+            for index, (feature, mask) in enumerate(zip(features, masks))
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        raw = x[:, 0] if x.ndim == 3 and x.shape[1] == 1 else x
+        if raw.ndim != 2:
+            raise ValueError(f"expected raw input shape (B,L), got {tuple(x.shape)}")
+        stem = self.stem(raw)
+        cnn_map = self.cnn_branch(stem)
+        mamba_map = self.mamba_branch(stem)
+        cnn_map, mamba_map = self._cross_interaction(cnn_map, mamba_map)
+        peak_feature, feedback, quality = self.peak_branch(
+            raw,
+            cnn_map,
+            mamba_map,
+        )
+        feedback = self.feedback_scale * torch.tanh(feedback)
+        cnn_map = cnn_map * (1.0 + feedback)
+        mamba_map = mamba_map * (1.0 + feedback)
+        z_cnn = self.cnn_branch.pool(cnn_map)
+        z_mamba = self.mamba_branch.pool(mamba_map)
+        z_peak = peak_feature
+        aux_features = (z_cnn, z_mamba, z_peak)
+        fused_features = self._apply_branch_dropout(aux_features)
+        z_cnn_f, z_mamba_f, z_peak_f = fused_features
+        gate_input = torch.cat([z_cnn_f, z_mamba_f, z_peak_f, quality], dim=-1)
+        alpha = torch.softmax(self.fusion_gate(gate_input), dim=-1)
+        fused = (
+            alpha[:, 0:1] * z_cnn_f
+            + alpha[:, 1:2] * z_mamba_f
+            + alpha[:, 2:3] * z_peak_f
+        )
+        pairwise = torch.cat(
+            [
+                fused,
+                z_cnn_f * z_mamba_f,
+                z_cnn_f * z_peak_f,
+                z_mamba_f * z_peak_f,
+            ],
+            dim=-1,
+        )
+        final_feature = self.final_proj(pairwise)
+        return {
+            "logits": self.head(final_feature),
+            "aux_logits": {
+                "cnn": self.aux_heads["cnn"](z_cnn),
+                "mamba": self.aux_heads["mamba"](z_mamba),
+                "peak": self.aux_heads["peak"](z_peak),
+            },
+            "gate_weights": alpha,
+            "quality": quality,
+        }
 
 
 class BiGRUPatchClassifier(nn.Module):
@@ -2354,6 +3531,7 @@ __all__ = [
     "ResNet1D",
     "ConvNeXt1D",
     "DualPlaneMambaClassifier",
+    "XRDCTMClassifier",
     "KANHead",
     "BiGRUPatchClassifier",
     "PatchTSTClassifier",
