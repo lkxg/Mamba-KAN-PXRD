@@ -63,6 +63,8 @@ Evaluate an old checkpoint by passing its path directly to `scripts/evaluate.py`
 | `mobile/mx11_physaug.yaml` | — | Symmetry-preserving PXRD augmentation on mx03 |
 | `mobile/mx12_la_physaug.yaml` | — | PeakSet gated fusion + logit-adjusted CE (augmentation disabled in the initial control) |
 | `mobile/mx13_xrd_ctm.yaml` | — | Full clean XRD-CTM with CNN, unidirectional Mamba, and peak/gap Transformer |
+| `mobile/mx14_peakset_ls.yaml` | — | PeakSet gated fusion with label-smoothed CE |
+| `mobile/mx15_xrd_ctm_ls.yaml` | — | XRD-CTM with label-smoothed CE and auxiliary branch losses |
 
 Run selected configs explicitly:
 
